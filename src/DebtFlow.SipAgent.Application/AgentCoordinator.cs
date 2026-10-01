@@ -30,6 +30,8 @@ public sealed class AgentCoordinator : IAsyncDisposable
     private string? _agentStateCode;
     private bool _portalConnected;
     private bool _clearCredentialsAfterCall;
+    private string? _collectionId;
+    private string? _collectionBindingId;
     private long _ownerLeaseGeneration;
     private long _registrationGeneration;
     private int _registrationRetryAttempt;
@@ -235,6 +237,7 @@ public sealed class AgentCoordinator : IAsyncDisposable
     {
         EnsureOperational();
         SipConfiguration configuration = ValidateConfigure(command);
+        (string? collectionId, string? collectionBindingId) = ValidateCollectionBinding(command);
         if (_call is { State: not CallState.Ended })
         {
             throw new AgentCommandException("call_invalid_state");
@@ -249,6 +252,8 @@ public sealed class AgentCoordinator : IAsyncDisposable
         _registrationRetryAttempt = 0;
         _registrationGeneration++;
         await _sipRuntime.ConfigureAsync(configuration, cancellationToken);
+        _collectionId = collectionId;
+        _collectionBindingId = collectionBindingId;
         _registrationState = RegistrationState.Unregistered;
         await PublishRealtimeAsync(
             "registration.state_changed",
@@ -282,6 +287,8 @@ public sealed class AgentCoordinator : IAsyncDisposable
         _registrationGeneration++;
         await _sipRuntime.StopRegistrationAsync(cancellationToken);
         _registrationState = RegistrationState.Unconfigured;
+        _collectionId = null;
+        _collectionBindingId = null;
         await PublishRealtimeAsync(
             "registration.state_changed",
             new { state = "unconfigured", reason = "stopped" },
@@ -291,10 +298,20 @@ public sealed class AgentCoordinator : IAsyncDisposable
     private async Task StartCallCoreAsync(CallStartCommand command, CancellationToken cancellationToken)
     {
         ProtocolCodec.ValidateUuid(command.CallId, "callId");
+        bool hasLegacyContext = !string.IsNullOrWhiteSpace(command.ContextToken) && command.ContextToken.Length <= 2048;
+        bool hasCallContext = IsObjectId(command.CallContextId, "phonectx_");
+        bool hasBinding = _collectionId != null && _collectionBindingId != null;
         if (string.IsNullOrWhiteSpace(command.Destination) || command.Destination.Length > 128 ||
-            string.IsNullOrWhiteSpace(command.ContextToken) || command.ContextToken.Length > 2048)
+            (!hasLegacyContext && !hasCallContext) ||
+            command.ContextToken?.Length > 2048 ||
+            command.CallContextId is not null && !hasCallContext)
         {
             throw new AgentCommandException("invalid_message");
+        }
+
+        if (hasCallContext && !hasBinding)
+        {
+            throw new AgentCommandException("collection_binding_required");
         }
 
         if (_registrationState != RegistrationState.Registered)
@@ -314,7 +331,10 @@ public sealed class AgentCoordinator : IAsyncDisposable
             command.CallId,
             command.CommandId,
             _clock.UtcNow,
-            SensitiveValueMasker.MaskRemoteParty(command.Destination));
+            SensitiveValueMasker.MaskRemoteParty(command.Destination),
+            _collectionId,
+            _collectionBindingId,
+            command.CallContextId);
         try
         {
             await EmitCallEventAsync(
@@ -630,6 +650,12 @@ public sealed class AgentCoordinator : IAsyncDisposable
             return;
         }
 
+        if (_collectionId is null || _collectionBindingId is null)
+        {
+            await _sipRuntime.RejectUnavailableAsync(cancellationToken);
+            return;
+        }
+
         try
         {
             await EnsureCapacityForNewCallAsync(cancellationToken);
@@ -645,7 +671,12 @@ public sealed class AgentCoordinator : IAsyncDisposable
             return;
         }
 
-        _call = CallReducer.CreateInbound(_ids.NewId(), _clock.UtcNow, SensitiveValueMasker.MaskRemoteParty(caller));
+        _call = CallReducer.CreateInbound(
+            _ids.NewId(),
+            _clock.UtcNow,
+            SensitiveValueMasker.MaskRemoteParty(caller),
+            _collectionId,
+            _collectionBindingId);
         try
         {
             await EmitCallEventAsync(
@@ -774,7 +805,10 @@ public sealed class AgentCoordinator : IAsyncDisposable
                     eventType,
                     _clock.UtcNow,
                     ToWire(call.State),
-                    JsonSerializer.Serialize(data, ProtocolJson.Options)),
+                    JsonSerializer.Serialize(data, ProtocolJson.Options),
+                    call.CollectionId,
+                    call.CollectionBindingId,
+                    call.CallContextId),
                 call,
                 string.Equals(eventType, "call.ended", StringComparison.Ordinal),
                 cancellationToken);
@@ -1032,6 +1066,31 @@ public sealed class AgentCoordinator : IAsyncDisposable
             command.Username.Trim(),
             command.Password);
     }
+
+    private static (string? CollectionId, string? CollectionBindingId) ValidateCollectionBinding(
+        ConfigureCommand command)
+    {
+        bool hasCollection = !string.IsNullOrWhiteSpace(command.CollectionId);
+        bool hasBinding = !string.IsNullOrWhiteSpace(command.CollectionBindingId);
+        if (!hasCollection && !hasBinding)
+        {
+            return (null, null);
+        }
+
+        if (!hasCollection || !hasBinding ||
+            command.CollectionId!.Length > 60 || command.CollectionId != command.CollectionId.Trim() ||
+            command.CollectionId.Any(char.IsControl) ||
+            !IsObjectId(command.CollectionBindingId, "phonebind_"))
+        {
+            throw new AgentCommandException("invalid_message");
+        }
+
+        return (command.CollectionId, command.CollectionBindingId);
+    }
+
+    private static bool IsObjectId(string? value, string prefix) =>
+        value is not null && value.StartsWith(prefix, StringComparison.Ordinal) &&
+        Guid.TryParseExact(value[prefix.Length..], "N", out _);
 
     private static bool IsValidDtmf(char value) =>
         value is >= '0' and <= '9' or '*' or '#' or 'A' or 'B' or 'C' or 'D' or 'a' or 'b' or 'c' or 'd';

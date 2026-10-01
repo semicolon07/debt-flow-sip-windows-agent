@@ -41,7 +41,10 @@ public sealed record DurableEventDraft(
     string EventType,
     DateTimeOffset OccurredAtUtc,
     string? State,
-    string DataJson);
+    string DataJson,
+    string? CollectionId = null,
+    string? CollectionBindingId = null,
+    string? CallContextId = null);
 
 public sealed record StoredDurableEvent(
     long Sequence,
@@ -53,7 +56,10 @@ public sealed record StoredDurableEvent(
     string EventType,
     DateTimeOffset OccurredAtUtc,
     string? State,
-    string DataJson)
+    string DataJson,
+    string? CollectionId = null,
+    string? CollectionBindingId = null,
+    string? CallContextId = null)
 {
     public DurableEventPayload ToPayload()
     {
@@ -68,7 +74,10 @@ public sealed record StoredDurableEvent(
             CommandId,
             OccurredAtUtc,
             State,
-            document.RootElement.Clone());
+            document.RootElement.Clone(),
+            CollectionId,
+            CollectionBindingId,
+            CallContextId);
     }
 }
 

@@ -32,13 +32,16 @@ public sealed record ConfigureCommand(
     string Host,
     int Port,
     string Username,
-    string Password);
+    string Password,
+    string? CollectionId = null,
+    string? CollectionBindingId = null);
 
 public sealed record CallStartCommand(
     string CommandId,
     string CallId,
     string Destination,
-    string ContextToken);
+    string? ContextToken = null,
+    string? CallContextId = null);
 
 public sealed record CallCommand(string CommandId, string CallId);
 
@@ -84,7 +87,10 @@ public sealed record DurableEventPayload(
     string? CommandId,
     DateTimeOffset OccurredAtUtc,
     string? State,
-    JsonElement Data);
+    JsonElement Data,
+    string? CollectionId = null,
+    string? CollectionBindingId = null,
+    string? CallContextId = null);
 
 public sealed record RealtimeEventPayload(
     string Delivery,

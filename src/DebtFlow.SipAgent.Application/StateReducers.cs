@@ -51,7 +51,10 @@ public sealed record CallSessionState(
     DateTimeOffset? EndedAtUtc,
     CallOutcome? Outcome,
     string? EndReason,
-    string MaskedRemoteParty);
+    string MaskedRemoteParty,
+    string? CollectionId = null,
+    string? CollectionBindingId = null,
+    string? CallContextId = null);
 
 public enum CallSignalType
 {
@@ -95,14 +98,21 @@ public static class CallReducer
         string callId,
         string commandId,
         DateTimeOffset occurredAtUtc,
-        string maskedDestination) =>
-        new(callId, commandId, CallDirection.Outbound, CallState.Created, occurredAtUtc, null, null, null, null, maskedDestination);
+        string maskedDestination,
+        string? collectionId = null,
+        string? collectionBindingId = null,
+        string? callContextId = null) =>
+        new(callId, commandId, CallDirection.Outbound, CallState.Created, occurredAtUtc, null, null, null, null,
+            maskedDestination, collectionId, collectionBindingId, callContextId);
 
     public static CallSessionState CreateInbound(
         string callId,
         DateTimeOffset occurredAtUtc,
-        string maskedCaller) =>
-        new(callId, null, CallDirection.Inbound, CallState.Created, occurredAtUtc, null, null, null, null, maskedCaller);
+        string maskedCaller,
+        string? collectionId = null,
+        string? collectionBindingId = null) =>
+        new(callId, null, CallDirection.Inbound, CallState.Created, occurredAtUtc, null, null, null, null,
+            maskedCaller, collectionId, collectionBindingId, null);
 
     public static CallTransition Apply(CallSessionState current, CallSignal signal)
     {

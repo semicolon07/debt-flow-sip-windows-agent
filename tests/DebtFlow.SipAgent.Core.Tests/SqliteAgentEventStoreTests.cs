@@ -110,6 +110,57 @@ public sealed class SqliteAgentEventStoreTests
     }
 
     [Fact]
+    public async Task Initialize_MigratesEmptyV2DatabaseToCollectionBindingSchema()
+    {
+        string directory = CreateTemporaryDirectory();
+        string path = Path.Combine(directory, "agent.db");
+        try
+        {
+            await CreateVersionTwoDatabaseAsync(path, includePendingEvent: false);
+
+            await using var store = new SqliteAgentEventStore(path);
+            await store.InitializeAsync(CancellationToken.None);
+            StoredDurableEvent stored = await store.AppendAsync(
+                CreateDraft() with
+                {
+                    CollectionId = "collection-test",
+                    CollectionBindingId = $"phonebind_{Guid.NewGuid():N}",
+                    CallContextId = $"phonectx_{Guid.NewGuid():N}"
+                },
+                CancellationToken.None);
+
+            Assert.Equal("collection-test", stored.CollectionId);
+            Assert.NotNull(stored.CollectionBindingId);
+            Assert.NotNull(stored.CallContextId);
+        }
+        finally
+        {
+            Directory.Delete(directory, true);
+        }
+    }
+
+    [Fact]
+    public async Task Initialize_V2DatabaseWithPendingEvent_FailsClosedForBindingMigration()
+    {
+        string directory = CreateTemporaryDirectory();
+        string path = Path.Combine(directory, "agent.db");
+        try
+        {
+            await CreateVersionTwoDatabaseAsync(path, includePendingEvent: true);
+
+            await using var store = new SqliteAgentEventStore(path);
+            AgentStoreException exception = await Assert.ThrowsAsync<AgentStoreException>(
+                () => store.InitializeAsync(CancellationToken.None));
+
+            Assert.Equal("collection_binding_migration_required", exception.ErrorCode);
+        }
+        finally
+        {
+            Directory.Delete(directory, true);
+        }
+    }
+
+    [Fact]
     public async Task Initialize_RejectsNewerSchemaWithoutReplacingDatabase()
     {
         string directory = CreateTemporaryDirectory();
@@ -333,6 +384,67 @@ public sealed class SqliteAgentEventStoreTests
                 ('command-v1', 'call.start', 'hash', '{"errorCode":"command_outcome_unknown"}', '2026-10-01T00:00:00.0000000+00:00');
             PRAGMA user_version=1;
             """;
+        await command.ExecuteNonQueryAsync();
+    }
+
+    private static async Task CreateVersionTwoDatabaseAsync(string path, bool includePendingEvent)
+    {
+        await using var connection = new SqliteConnection($"Data Source={path}");
+        await connection.OpenAsync();
+        await using SqliteCommand command = connection.CreateCommand();
+        command.CommandText =
+            """
+            CREATE TABLE AgentMetadata (
+                MetadataKey TEXT NOT NULL PRIMARY KEY,
+                MetadataValue TEXT NOT NULL
+            );
+            CREATE TABLE DurableEvents (
+                Sequence INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+                EventId TEXT NOT NULL UNIQUE,
+                AgentSessionId TEXT NOT NULL,
+                CallId TEXT NOT NULL,
+                CommandId TEXT NULL,
+                EventType TEXT NOT NULL,
+                OccurredAtUtc TEXT NOT NULL,
+                CallState TEXT NULL,
+                DataJson TEXT NOT NULL
+            );
+            CREATE TABLE ProcessedCommands (
+                CommandId TEXT NOT NULL PRIMARY KEY,
+                CommandType TEXT NOT NULL,
+                RequestHash TEXT NOT NULL,
+                ResultJson TEXT NOT NULL,
+                ProcessedAtUtc TEXT NOT NULL,
+                ExecutionState TEXT NOT NULL
+            );
+            CREATE TABLE ActiveCallJournal (
+                JournalId INTEGER NOT NULL PRIMARY KEY CHECK (JournalId = 1),
+                CallId TEXT NOT NULL,
+                CommandId TEXT NULL,
+                Direction TEXT NOT NULL,
+                CallState TEXT NOT NULL,
+                StartedAtUtc TEXT NOT NULL,
+                AnsweredAtUtc TEXT NULL,
+                EndedAtUtc TEXT NULL,
+                Outcome TEXT NULL,
+                EndReason TEXT NULL,
+                MaskedRemoteParty TEXT NOT NULL
+            );
+            CREATE INDEX IX_ProcessedCommands_ProcessedAtUtc ON ProcessedCommands (ProcessedAtUtc);
+            PRAGMA user_version=2;
+            """;
+        if (includePendingEvent)
+        {
+            command.CommandText +=
+                """
+                INSERT INTO DurableEvents
+                    (EventId, AgentSessionId, CallId, CommandId, EventType, OccurredAtUtc, CallState, DataJson)
+                VALUES
+                    ('event-v2', 'session-v2', 'call-v2', NULL, 'call.created',
+                     '2026-10-01T00:00:00.0000000+00:00', 'created', '{}');
+                """;
+        }
+
         await command.ExecuteNonQueryAsync();
     }
 

@@ -135,6 +135,9 @@ public sealed class LocalWebSocketServerTests
             Assert.Equal(
                 "1.0.0",
                 ProtocolCodec.DeserializePayload<WelcomePayload>(welcome.Payload).AgentVersion);
+            Assert.Contains(
+                "event.collection_binding.v1",
+                ProtocolCodec.DeserializePayload<WelcomePayload>(welcome.Payload).Capabilities);
             Assert.Equal("snapshot", snapshot.Kind);
             Assert.Equal("agent.snapshot", snapshot.Type);
 

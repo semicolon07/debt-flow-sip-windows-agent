@@ -7,6 +7,51 @@ namespace DebtFlow.SipAgent.Core.Tests;
 public sealed class AgentCoordinatorTests
 {
     [Fact]
+    public async Task StartCall_WithCollectionBinding_PersistsRoutingAndCallContext()
+    {
+        await using CoordinatorFixture fixture = await CoordinatorFixture.CreateAsync();
+        await fixture.RegisterAsync();
+        string callId = NewId();
+        string callContextId = $"phonectx_{Guid.NewGuid():N}";
+
+        await fixture.Coordinator.StartCallAsync(
+            new CallStartCommand(NewId(), callId, "0812345678", CallContextId: callContextId),
+            CancellationToken.None);
+
+        IReadOnlyList<StoredDurableEvent> events = await fixture.Store.LoadPendingAsync(
+            0,
+            100,
+            CancellationToken.None);
+        StoredDurableEvent created = Assert.Single(events, value => value.EventType == "call.created");
+        Assert.Equal("collection-test", created.CollectionId);
+        Assert.StartsWith("phonebind_", created.CollectionBindingId, StringComparison.Ordinal);
+        Assert.Equal(callContextId, created.CallContextId);
+
+        CallSessionState active = Assert.IsType<CallSessionState>(
+            await fixture.Store.LoadActiveCallAsync(CancellationToken.None));
+        Assert.Equal(created.CollectionBindingId, active.CollectionBindingId);
+        Assert.Equal(callContextId, active.CallContextId);
+    }
+
+    [Fact]
+    public async Task IncomingCall_WithoutCollectionBinding_IsRejectedWithoutDurableEvent()
+    {
+        await using CoordinatorFixture fixture = await CoordinatorFixture.CreateAsync();
+        await fixture.Coordinator.ConfigureAsync(
+            new ConfigureCommand(NewId(), "192.0.2.10", 5060, "user", "password"),
+            CancellationToken.None);
+        await fixture.Coordinator.StartRegistrationAsync(CancellationToken.None);
+        await fixture.Runtime.EmitAsync(new SipSignal(SipSignalType.RegistrationRegistered));
+        await fixture.Coordinator.PortalConnectedAsync(CancellationToken.None);
+
+        await fixture.Runtime.EmitAsync(new SipSignal(SipSignalType.IncomingCall, Caller: "0812345678"));
+
+        Assert.Equal(1, fixture.Runtime.RejectUnavailableCount);
+        Assert.Empty((await fixture.Coordinator.GetSnapshotAsync(CancellationToken.None)).ActiveCalls);
+        Assert.Equal(0, await fixture.Store.CountPendingAsync(CancellationToken.None));
+    }
+
+    [Fact]
     public async Task StartRegistration_WhenAlreadyRegistered_IsRejectedWithoutRestart()
     {
         await using CoordinatorFixture fixture = await CoordinatorFixture.CreateAsync();
@@ -87,7 +132,8 @@ public sealed class AgentCoordinatorTests
         try
         {
             await coordinator.ConfigureAsync(
-                new ConfigureCommand(NewId(), "192.0.2.10", 5060, "user", "password"),
+                new ConfigureCommand(NewId(), "192.0.2.10", 5060, "user", "password",
+                    "collection-test", BindingId()),
                 CancellationToken.None);
             await coordinator.StartRegistrationAsync(CancellationToken.None);
             await runtime.EmitAsync(new SipSignal(SipSignalType.RegistrationRegistered));
@@ -357,7 +403,8 @@ public sealed class AgentCoordinatorTests
         try
         {
             await coordinator.ConfigureAsync(
-                new ConfigureCommand(NewId(), "192.0.2.10", 5060, "user", "password"),
+                new ConfigureCommand(NewId(), "192.0.2.10", 5060, "user", "password",
+                    "collection-test", BindingId()),
                 CancellationToken.None);
             await coordinator.StartRegistrationAsync(CancellationToken.None);
             await runtime.EmitAsync(new SipSignal(SipSignalType.RegistrationRegistered));
@@ -486,7 +533,8 @@ public sealed class AgentCoordinatorTests
         try
         {
             await coordinator.ConfigureAsync(
-                new ConfigureCommand(NewId(), "192.0.2.10", 5060, "user", "password"),
+                new ConfigureCommand(NewId(), "192.0.2.10", 5060, "user", "password",
+                    "collection-test", BindingId()),
                 CancellationToken.None);
             await coordinator.StartRegistrationAsync(CancellationToken.None);
             await runtime.EmitAsync(new SipSignal(SipSignalType.RegistrationRegistered));
@@ -830,7 +878,8 @@ public sealed class AgentCoordinatorTests
         public async Task RegisterAsync()
         {
             await Coordinator.ConfigureAsync(
-                new ConfigureCommand(NewId(), "192.0.2.10", 5060, "user", "password"),
+                new ConfigureCommand(NewId(), "192.0.2.10", 5060, "user", "password",
+                    "collection-test", BindingId()),
                 CancellationToken.None);
             await Coordinator.StartRegistrationAsync(CancellationToken.None);
             await Runtime.EmitAsync(new SipSignal(SipSignalType.RegistrationRegistered));
@@ -843,6 +892,8 @@ public sealed class AgentCoordinatorTests
             Directory.Delete(_directory, true);
         }
     }
+
+    private static string BindingId() => $"phonebind_{Guid.NewGuid():N}";
 
     private sealed class FakeSipRuntime : ISipRuntime
     {

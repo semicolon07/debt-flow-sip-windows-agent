@@ -12,7 +12,7 @@ public sealed record EventStoreLimits(long MaximumPendingEvents, long MaximumSto
 
 public sealed class SqliteAgentEventStore : IAgentEventStore
 {
-    private const int CurrentSchemaVersion = 2;
+    private const int CurrentSchemaVersion = 3;
     private readonly string _databasePath;
     private readonly EventStoreLimits _limits;
     private readonly SemaphoreSlim _gate = new(1, 1);
@@ -129,7 +129,7 @@ public sealed class SqliteAgentEventStore : IAgentEventStore
             command.CommandText =
                 """
                 SELECT Sequence, EventId, AgentSessionId, CallId, CommandId, EventType,
-                       OccurredAtUtc, CallState, DataJson
+                       OccurredAtUtc, CallState, DataJson, CollectionId, CollectionBindingId, CallContextId
                 FROM DurableEvents
                 WHERE Sequence > $afterSequence
                 ORDER BY Sequence
@@ -187,7 +187,8 @@ public sealed class SqliteAgentEventStore : IAgentEventStore
             command.CommandText =
                 """
                 SELECT CallId, CommandId, Direction, CallState, StartedAtUtc, AnsweredAtUtc,
-                       EndedAtUtc, Outcome, EndReason, MaskedRemoteParty
+                       EndedAtUtc, Outcome, EndReason, MaskedRemoteParty,
+                       CollectionId, CollectionBindingId, CallContextId
                 FROM ActiveCallJournal
                 WHERE JournalId = 1;
                 """;
@@ -224,7 +225,10 @@ public sealed class SqliteAgentEventStore : IAgentEventStore
                 reader.IsDBNull(6) ? null : ParseTimestamp(reader.GetString(6)),
                 outcome,
                 reader.IsDBNull(8) ? null : reader.GetString(8),
-                reader.GetString(9));
+                reader.GetString(9),
+                reader.IsDBNull(10) ? null : reader.GetString(10),
+                reader.IsDBNull(11) ? null : reader.GetString(11),
+                reader.IsDBNull(12) ? null : reader.GetString(12));
         }
         finally
         {
@@ -492,7 +496,10 @@ public sealed class SqliteAgentEventStore : IAgentEventStore
                 draft.EventType,
                 draft.OccurredAtUtc,
                 draft.State,
-                draft.DataJson);
+                draft.DataJson,
+                draft.CollectionId,
+                draft.CollectionBindingId,
+                draft.CallContextId);
         }
         finally
         {
@@ -511,9 +518,11 @@ public sealed class SqliteAgentEventStore : IAgentEventStore
         command.CommandText =
             """
             INSERT INTO DurableEvents
-                (EventId, AgentSessionId, CallId, CommandId, EventType, OccurredAtUtc, CallState, DataJson)
+                (EventId, AgentSessionId, CallId, CommandId, EventType, OccurredAtUtc, CallState, DataJson,
+                 CollectionId, CollectionBindingId, CallContextId)
             VALUES
-                ($eventId, $agentSessionId, $callId, $commandId, $eventType, $occurredAtUtc, $callState, $dataJson);
+                ($eventId, $agentSessionId, $callId, $commandId, $eventType, $occurredAtUtc, $callState, $dataJson,
+                 $collectionId, $collectionBindingId, $callContextId);
             SELECT last_insert_rowid();
             """;
         command.Parameters.AddWithValue("$eventId", draft.EventId);
@@ -524,6 +533,9 @@ public sealed class SqliteAgentEventStore : IAgentEventStore
         command.Parameters.AddWithValue("$occurredAtUtc", FormatTimestamp(draft.OccurredAtUtc));
         command.Parameters.AddWithValue("$callState", (object?)draft.State ?? DBNull.Value);
         command.Parameters.AddWithValue("$dataJson", draft.DataJson);
+        command.Parameters.AddWithValue("$collectionId", (object?)draft.CollectionId ?? DBNull.Value);
+        command.Parameters.AddWithValue("$collectionBindingId", (object?)draft.CollectionBindingId ?? DBNull.Value);
+        command.Parameters.AddWithValue("$callContextId", (object?)draft.CallContextId ?? DBNull.Value);
         return Convert.ToInt64(await command.ExecuteScalarAsync(cancellationToken), CultureInfo.InvariantCulture);
     }
 
@@ -539,10 +551,10 @@ public sealed class SqliteAgentEventStore : IAgentEventStore
             """
             INSERT INTO ActiveCallJournal
                 (JournalId, CallId, CommandId, Direction, CallState, StartedAtUtc, AnsweredAtUtc,
-                 EndedAtUtc, Outcome, EndReason, MaskedRemoteParty)
+                 EndedAtUtc, Outcome, EndReason, MaskedRemoteParty, CollectionId, CollectionBindingId, CallContextId)
             VALUES
                 (1, $callId, $commandId, $direction, $callState, $startedAtUtc, $answeredAtUtc,
-                 $endedAtUtc, $outcome, $endReason, $maskedRemoteParty)
+                 $endedAtUtc, $outcome, $endReason, $maskedRemoteParty, $collectionId, $collectionBindingId, $callContextId)
             ON CONFLICT(JournalId) DO UPDATE SET
                 CallId = excluded.CallId,
                 CommandId = excluded.CommandId,
@@ -553,7 +565,10 @@ public sealed class SqliteAgentEventStore : IAgentEventStore
                 EndedAtUtc = excluded.EndedAtUtc,
                 Outcome = excluded.Outcome,
                 EndReason = excluded.EndReason,
-                MaskedRemoteParty = excluded.MaskedRemoteParty;
+                MaskedRemoteParty = excluded.MaskedRemoteParty,
+                CollectionId = excluded.CollectionId,
+                CollectionBindingId = excluded.CollectionBindingId,
+                CallContextId = excluded.CallContextId;
             """;
         command.Parameters.AddWithValue("$callId", call.CallId);
         command.Parameters.AddWithValue("$commandId", (object?)call.CommandId ?? DBNull.Value);
@@ -565,6 +580,9 @@ public sealed class SqliteAgentEventStore : IAgentEventStore
         command.Parameters.AddWithValue("$outcome", call.Outcome?.ToString() ?? (object)DBNull.Value);
         command.Parameters.AddWithValue("$endReason", (object?)call.EndReason ?? DBNull.Value);
         command.Parameters.AddWithValue("$maskedRemoteParty", call.MaskedRemoteParty);
+        command.Parameters.AddWithValue("$collectionId", (object?)call.CollectionId ?? DBNull.Value);
+        command.Parameters.AddWithValue("$collectionBindingId", (object?)call.CollectionBindingId ?? DBNull.Value);
+        command.Parameters.AddWithValue("$callContextId", (object?)call.CallContextId ?? DBNull.Value);
         await command.ExecuteNonQueryAsync(cancellationToken);
     }
 
@@ -605,9 +623,19 @@ public sealed class SqliteAgentEventStore : IAgentEventStore
         {
             await ExecuteMigrationCommandAsync(connection, transaction, CreateSchemaSql, cancellationToken);
         }
-        else if (version == 1)
+        else
         {
-            await ExecuteMigrationCommandAsync(connection, transaction, UpgradeV1ToV2Sql, cancellationToken);
+            if (version == 1)
+            {
+                await ExecuteMigrationCommandAsync(connection, transaction, UpgradeV1ToV2Sql, cancellationToken);
+                version = 2;
+            }
+
+            if (version == 2)
+            {
+                await EnsureCollectionBindingMigrationSafeAsync(connection, transaction, cancellationToken);
+                await ExecuteMigrationCommandAsync(connection, transaction, UpgradeV2ToV3Sql, cancellationToken);
+            }
         }
 
         await ExecuteMigrationCommandAsync(
@@ -616,6 +644,24 @@ public sealed class SqliteAgentEventStore : IAgentEventStore
             $"PRAGMA user_version={CurrentSchemaVersion};",
             cancellationToken);
         await transaction.CommitAsync(cancellationToken);
+    }
+
+    private static async Task EnsureCollectionBindingMigrationSafeAsync(
+        SqliteConnection connection,
+        SqliteTransaction transaction,
+        CancellationToken cancellationToken)
+    {
+        await using SqliteCommand command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText =
+            "SELECT (SELECT COUNT(*) FROM DurableEvents) + (SELECT COUNT(*) FROM ActiveCallJournal);";
+        long rows = Convert.ToInt64(
+            await command.ExecuteScalarAsync(cancellationToken),
+            CultureInfo.InvariantCulture);
+        if (rows != 0)
+        {
+            throw new AgentStoreException("collection_binding_migration_required");
+        }
     }
 
     private static async Task ExecuteMigrationCommandAsync(
@@ -730,7 +776,10 @@ public sealed class SqliteAgentEventStore : IAgentEventStore
             reader.GetString(5),
             ParseTimestamp(reader.GetString(6)),
             reader.IsDBNull(7) ? null : reader.GetString(7),
-            reader.GetString(8));
+            reader.GetString(8),
+            reader.IsDBNull(9) ? null : reader.GetString(9),
+            reader.IsDBNull(10) ? null : reader.GetString(10),
+            reader.IsDBNull(11) ? null : reader.GetString(11));
 
     private static Exception NormalizeStoreException(Exception exception)
     {
@@ -783,7 +832,10 @@ public sealed class SqliteAgentEventStore : IAgentEventStore
             EventType TEXT NOT NULL,
             OccurredAtUtc TEXT NOT NULL,
             CallState TEXT NULL,
-            DataJson TEXT NOT NULL
+            DataJson TEXT NOT NULL,
+            CollectionId TEXT NULL,
+            CollectionBindingId TEXT NULL,
+            CallContextId TEXT NULL
         );
         CREATE TABLE ProcessedCommands (
             CommandId TEXT NOT NULL PRIMARY KEY,
@@ -804,7 +856,10 @@ public sealed class SqliteAgentEventStore : IAgentEventStore
             EndedAtUtc TEXT NULL,
             Outcome TEXT NULL,
             EndReason TEXT NULL,
-            MaskedRemoteParty TEXT NOT NULL
+            MaskedRemoteParty TEXT NOT NULL,
+            CollectionId TEXT NULL,
+            CollectionBindingId TEXT NULL,
+            CallContextId TEXT NULL
         );
         CREATE INDEX IX_ProcessedCommands_ProcessedAtUtc ON ProcessedCommands (ProcessedAtUtc);
         """;
@@ -830,5 +885,15 @@ public sealed class SqliteAgentEventStore : IAgentEventStore
             MaskedRemoteParty TEXT NOT NULL
         );
         CREATE INDEX IX_ProcessedCommands_ProcessedAtUtc ON ProcessedCommands (ProcessedAtUtc);
+        """;
+
+    private const string UpgradeV2ToV3Sql =
+        """
+        ALTER TABLE DurableEvents ADD COLUMN CollectionId TEXT NULL;
+        ALTER TABLE DurableEvents ADD COLUMN CollectionBindingId TEXT NULL;
+        ALTER TABLE DurableEvents ADD COLUMN CallContextId TEXT NULL;
+        ALTER TABLE ActiveCallJournal ADD COLUMN CollectionId TEXT NULL;
+        ALTER TABLE ActiveCallJournal ADD COLUMN CollectionBindingId TEXT NULL;
+        ALTER TABLE ActiveCallJournal ADD COLUMN CallContextId TEXT NULL;
         """;
 }
