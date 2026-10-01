@@ -23,4 +23,13 @@ public sealed class SipEndpointFormatterTests
                 SipEndpointFormatter.FormatRegistrar(new SipConfiguration(host, port, "user", "password")));
         }
     }
+
+    [Fact]
+    public void FormatRegistrar_AppendsTcpTransportWithoutAddingDefaultPort()
+    {
+        var configuration = new SipConfiguration("192.0.2.10", 5060, "user", "password");
+
+        Assert.Equal("192.0.2.10;transport=tcp", SipEndpointFormatter.FormatRegistrar(configuration, true));
+        Assert.Equal("sip:1001@192.0.2.10;transport=tcp", SipEndpointFormatter.FormatDestination(configuration, "1001", true));
+    }
 }

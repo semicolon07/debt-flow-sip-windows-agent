@@ -1,4 +1,3 @@
-using System.Collections.Concurrent;
 using DebtFlow.SipAgent.Application;
 using DebtFlow.SipAgent.Protocol;
 
@@ -6,7 +5,12 @@ namespace DebtFlow.SipAgent.Host;
 
 public sealed class UnavailableAgentEventStore : IAgentEventStore
 {
-    private readonly ConcurrentDictionary<string, ProcessedCommand> _commands = new(StringComparer.Ordinal);
+    private readonly string _failureCode;
+
+    public UnavailableAgentEventStore(string failureCode = "outbox_unavailable")
+    {
+        _failureCode = failureCode;
+    }
 
     public string AgentInstanceId { get; } = ProtocolCodec.NewId();
     public long LastSequence => 0;
@@ -15,30 +19,46 @@ public sealed class UnavailableAgentEventStore : IAgentEventStore
     public Task InitializeAsync(CancellationToken cancellationToken) => Task.CompletedTask;
 
     public Task<StoredDurableEvent> AppendAsync(DurableEventDraft draft, CancellationToken cancellationToken) =>
-        Task.FromException<StoredDurableEvent>(new InvalidOperationException("outbox_unavailable"));
+        Task.FromException<StoredDurableEvent>(new AgentStoreException(_failureCode));
+
+    public Task<StoredDurableEvent> AppendCallEventAsync(
+        DurableEventDraft draft,
+        CallSessionState callState,
+        bool terminal,
+        CancellationToken cancellationToken) =>
+        Task.FromException<StoredDurableEvent>(new AgentStoreException(_failureCode));
 
     public Task<IReadOnlyList<StoredDurableEvent>> LoadPendingAsync(
         long afterSequence,
         int maximumCount,
         CancellationToken cancellationToken) =>
-        Task.FromResult<IReadOnlyList<StoredDurableEvent>>([]);
+        Task.FromException<IReadOnlyList<StoredDurableEvent>>(new AgentStoreException(_failureCode));
 
-    public Task<long> CountPendingAsync(CancellationToken cancellationToken) => Task.FromResult(0L);
+    public Task<long> CountPendingAsync(CancellationToken cancellationToken) =>
+        Task.FromException<long>(new AgentStoreException(_failureCode));
+
+    public Task<EventStoreHealth> GetHealthAsync(CancellationToken cancellationToken) =>
+        Task.FromException<EventStoreHealth>(new AgentStoreException(_failureCode));
+
+    public Task<CallSessionState?> LoadActiveCallAsync(CancellationToken cancellationToken) =>
+        Task.FromException<CallSessionState?>(new AgentStoreException(_failureCode));
 
     public Task AcknowledgeThroughAsync(long sequence, CancellationToken cancellationToken) =>
-        Task.FromException(new InvalidOperationException("outbox_unavailable"));
+        Task.FromException(new AgentStoreException(_failureCode));
 
-    public Task<ProcessedCommand?> FindCommandAsync(string commandId, CancellationToken cancellationToken)
-    {
-        _commands.TryGetValue(commandId, out ProcessedCommand? command);
-        return Task.FromResult(command);
-    }
+    public Task<ProcessedCommand?> FindCommandAsync(string commandId, CancellationToken cancellationToken) =>
+        Task.FromException<ProcessedCommand?>(new AgentStoreException(_failureCode));
 
-    public Task SaveCommandAsync(ProcessedCommand command, CancellationToken cancellationToken)
-    {
-        _commands[command.CommandId] = command;
-        return Task.CompletedTask;
-    }
+    public Task SaveCommandAsync(ProcessedCommand command, CancellationToken cancellationToken) =>
+        Task.FromException(new AgentStoreException(_failureCode));
+
+    public Task PruneCommandsAsync(
+        DateTimeOffset olderThanUtc,
+        int maximumRetained,
+        CancellationToken cancellationToken) => Task.FromException(new AgentStoreException(_failureCode));
+
+    public Task CheckpointAsync(CancellationToken cancellationToken) =>
+        Task.FromException(new AgentStoreException(_failureCode));
 
     public ValueTask DisposeAsync() => ValueTask.CompletedTask;
 }

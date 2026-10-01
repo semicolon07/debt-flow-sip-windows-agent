@@ -71,7 +71,8 @@ public sealed record AgentSnapshotPayload(
     string AudioState,
     IReadOnlyList<ActiveCallSnapshot> ActiveCalls,
     long PendingEventCount,
-    long LastSequence);
+    long LastSequence,
+    string? AgentStateCode = null);
 
 public sealed record DurableEventPayload(
     string Delivery,

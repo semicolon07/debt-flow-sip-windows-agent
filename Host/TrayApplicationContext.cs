@@ -2,6 +2,7 @@ using System.Diagnostics;
 using System.Drawing;
 using Microsoft.Extensions.Logging;
 using Microsoft.Win32;
+using NAudio.Wave;
 using DebtFlow.SipAgent.Application;
 using DebtFlow.SipAgent.Protocol;
 
@@ -15,6 +16,8 @@ public sealed class TrayApplicationContext : ApplicationContext
     private readonly SingleInstanceCoordinator _singleInstance;
     private readonly AgentRuntimeOptions _options;
     private readonly ILogger<TrayApplicationContext> _logger;
+    private readonly IAgentEventStore _eventStore;
+    private readonly DiagnosticBundleExporter _diagnosticExporter;
     private readonly string _logDirectory;
     private readonly NotifyIcon _notifyIcon;
     private readonly ToolStripMenuItem _agentStatus;
@@ -36,6 +39,8 @@ public sealed class TrayApplicationContext : ApplicationContext
         SingleInstanceCoordinator singleInstance,
         AgentRuntimeOptions options,
         ILogger<TrayApplicationContext> logger,
+        IAgentEventStore eventStore,
+        DiagnosticBundleExporter diagnosticExporter,
         string logDirectory,
         bool startupRegistrationFailed)
     {
@@ -45,6 +50,8 @@ public sealed class TrayApplicationContext : ApplicationContext
         _singleInstance = singleInstance;
         _options = options;
         _logger = logger;
+        _eventStore = eventStore;
+        _diagnosticExporter = diagnosticExporter;
         _logDirectory = logDirectory;
         _uiContext = SynchronizationContext.Current ?? new WindowsFormsSynchronizationContext();
 
@@ -62,6 +69,8 @@ public sealed class TrayApplicationContext : ApplicationContext
 
         var openLogs = new ToolStripMenuItem(TrayText.Get("OpenLogs"));
         openLogs.Click += (_, _) => OpenLogDirectory();
+        var exportDiagnostics = new ToolStripMenuItem(TrayText.Get("ExportDiagnostics"));
+        exportDiagnostics.Click += async (_, _) => await ExportDiagnosticsAsync();
         var exit = new ToolStripMenuItem(TrayText.Get("Exit"));
         exit.Click += async (_, _) => await ExitAsync(confirmActiveCall: true);
 
@@ -74,6 +83,7 @@ public sealed class TrayApplicationContext : ApplicationContext
             _audioStatus,
             new ToolStripSeparator(),
             openLogs,
+            exportDiagnostics,
             _startupItem,
             new ToolStripSeparator(),
             exit
@@ -135,7 +145,10 @@ public sealed class TrayApplicationContext : ApplicationContext
             AgentSnapshotPayload snapshot = await _coordinator.GetSnapshotAsync(CancellationToken.None);
             string agentState = _options.IsOperational ? snapshot.AgentState : "degraded";
             string localizedAgentState = TrayText.State(agentState);
-            _agentStatus.Text = TrayText.Format("AgentStatus", localizedAgentState);
+            string agentStatus = snapshot.AgentStateCode == null
+                ? localizedAgentState
+                : $"{localizedAgentState} ({snapshot.AgentStateCode})";
+            _agentStatus.Text = TrayText.Format("AgentStatus", agentStatus);
             _portalStatus.Text = TrayText.Format(
                 "PortalStatus",
                 _webSocketServer.IsClientConnected ? TrayText.Get("Connected") : TrayText.Get("Disconnected"));
@@ -235,6 +248,40 @@ public sealed class TrayApplicationContext : ApplicationContext
     {
         Directory.CreateDirectory(_logDirectory);
         Process.Start(new ProcessStartInfo(_logDirectory) { UseShellExecute = true });
+    }
+
+    private async Task ExportDiagnosticsAsync()
+    {
+        try
+        {
+            AgentSnapshotPayload snapshot = await _coordinator.GetSnapshotAsync(CancellationToken.None);
+            EventStoreHealth health = await _eventStore.GetHealthAsync(CancellationToken.None);
+            string outputPath = Path.Combine(
+                AgentStoragePaths.DiagnosticDirectory,
+                $"debt-flow-sip-agent-diagnostics-{DateTime.UtcNow:yyyyMMdd-HHmmss}.zip");
+            string exported = await _diagnosticExporter.ExportAsync(
+                outputPath,
+                snapshot,
+                health,
+                WaveIn.DeviceCount,
+                WaveOut.DeviceCount,
+                _options.IsOperational,
+                CancellationToken.None);
+            MessageBox.Show(
+                TrayText.Format("DiagnosticExported", exported),
+                TrayText.Get("AppName"),
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Information);
+        }
+        catch (Exception exception) when (exception is not OperationCanceledException)
+        {
+            _logger.LogWarning("Diagnostic export failed with {ErrorType}", exception.GetType().Name);
+            MessageBox.Show(
+                TrayText.Get("DiagnosticExportFailed"),
+                TrayText.Get("ActionRequired"),
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Warning);
+        }
     }
 
     private void Notify(string code, string message)

@@ -1,14 +1,20 @@
 [CmdletBinding()]
 param(
-    [string]$OutputRoot = (Join-Path $PSScriptRoot "..\artifacts\p1-windows")
+    [ValidateSet("p1", "p2")]
+    [string]$Phase = "p1",
+    [string]$OutputRoot = ""
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
+if ([string]::IsNullOrWhiteSpace($OutputRoot)) {
+    $OutputRoot = Join-Path $PSScriptRoot "..\artifacts\$Phase-windows"
+}
+
 if (-not [System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform(
         [System.Runtime.InteropServices.OSPlatform]::Windows)) {
-    throw "p1_windows_verification_requires_windows"
+    throw "${Phase}_windows_verification_requires_windows"
 }
 
 $repositoryRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
@@ -34,7 +40,7 @@ $logDirectory = Join-Path $runRoot "logs"
 $testDirectory = Join-Path $runRoot "test-results"
 $publishDirectory = Join-Path $runRoot "win-x64"
 $zipPath = Join-Path $runRoot "debt-flow-sip-agent-win-x64.zip"
-$evidencePath = Join-Path $runRoot "p1-windows-evidence.json"
+$evidencePath = Join-Path $runRoot "$Phase-windows-evidence.json"
 
 New-Item -ItemType Directory -Force -Path $logDirectory, $testDirectory, $publishDirectory | Out-Null
 
@@ -204,7 +210,8 @@ try {
             (Get-CounterValue $counters "aborted")
     }
 
-    if ($testTotal -lt 67 -or $testPassed -ne $testTotal -or $testFailed -ne 0) {
+    $minimumTestCount = if ($Phase -eq "p2") { 81 } else { 67 }
+    if ($testTotal -lt $minimumTestCount -or $testPassed -ne $testTotal -or $testFailed -ne 0) {
         throw "test_evidence_invalid:total=$testTotal passed=$testPassed failed=$testFailed"
     }
 
@@ -219,6 +226,7 @@ try {
 
     [ordered]@{
         schemaVersion = 1
+        phase = $Phase
         generatedAtUtc = (Get-Date).ToUniversalTime().ToString("O")
         operatingSystem = [Environment]::OSVersion.VersionString
         processArchitecture = [System.Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture.ToString()
@@ -248,7 +256,7 @@ try {
         }
     } | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $evidencePath -Encoding UTF8
 
-    Write-Host "P1 Windows automated verification passed."
+    Write-Host "$($Phase.ToUpperInvariant()) Windows automated verification passed."
     Write-Host "Evidence: $evidencePath"
     Write-Host "Artifact: $zipPath"
 }

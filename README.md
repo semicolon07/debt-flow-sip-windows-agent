@@ -1,19 +1,19 @@
 # Debt Flow SIP Windows Agent
 
 Per-user SIP/audio tray agent สำหรับ Debt Flow Portal บน Windows 10 1809 ขึ้นไป.
-สถานะปัจจุบันคือ **P1 source implemented — Windows/PBX verification pending**
+สถานะปัจจุบันคือ **P2 source implemented — Windows/PBX acceptance pending**
 
 ## Runtime
 
 - .NET 10 LTS, self-contained `win-x64`
 - WinForms tray + .NET Generic Host
 - Kestrel loopback WebSocket V1: `ws://localhost:8443/agent/v1`
-- SIPSorcery 10.0.16 ผ่าน UDP; TCP certification อยู่ P2
-- SQLite outbox: `%LOCALAPPDATA%\DebtFlow\SipAgent\agent-v1.db`
+- SIPSorcery 10.0.16: UDP first และ automatic TCP fallback เมื่อเกิด transport-level temporary failure
+- SQLite schema v2 outbox/call journal: `%LOCALAPPDATA%\DebtFlow\SipAgent\agent-v1.db`
 - JSONL logs: `%LOCALAPPDATA%\DebtFlow\SipAgent\Logs`, 10 MB ต่อไฟล์/7 rolling files
 - หนึ่ง Agent ต่อ Windows user, หนึ่ง Portal controller และหนึ่ง active call
 
-Tray แสดง Agent, Portal, SIP, Call และ Audio status พร้อม Open log folder,
+Tray แสดง Agent, Portal, SIP, Call และ Audio status พร้อม Open log folder, safe diagnostic export,
 Start with Windows และ Exit. SIP host/account/password รับจาก Portal ผ่าน WebSocket เท่านั้น
 และไม่ถูกบันทึกใน config, registry, SQLite หรือ log
 
@@ -46,11 +46,12 @@ Administrator เพื่อสร้างหรือแก้ไข configur
 Windows:
 
 ```powershell
-./scripts/verify-p1-windows.ps1
+./scripts/verify-p2-windows.ps1
 ```
 
-Script นี้รัน locked restore, Release build, tests ทั้ง solution, vulnerability gate,
-self-contained publish, ZIP integrity/checksum และสร้าง `p1-windows-evidence.json` ใน `artifacts/p1-windows/<run-id>`.
+Script นี้รัน locked restore, Release build, tests ทั้ง solution (ขั้นต่ำ 81 cases ตาม source ปัจจุบัน),
+vulnerability gate, self-contained publish, ZIP integrity/checksum และสร้าง `p2-windows-evidence.json`
+ใน `artifacts/p2-windows/<run-id>`. P1 verifier เดิมยังใช้ได้และ default เป็น P1 evidence.
 
 macOS/Linux ตรวจ core และ cross-build Windows source ได้ แต่รัน WinForms/Kestrel host tests ไม่ได้:
 
@@ -86,15 +87,25 @@ CI เรียก script เดียวกันและอัปโหลด
 - Exit ระหว่างสายต้องยืนยัน จากนั้น hangup/unregister/flush ภายใน 10 วินาที
 - listener bind loopback, exact Origin, reject query string, one owner, 64 KiB และ 60 messages/10 seconds
 - durable `call.*` ถูกเขียน SQLite ก่อน publish และ replay จนได้รับ contiguous ACK
-- outbox runtime failure ทำ Agent degraded/fail closed; shutdown ยัง hang up/unregister แบบ best effort
+- active-call journal ทำให้ process restart ปิด lifecycle เดิมด้วย `agent_restarted` เพียงครั้งเดียว
+- command journal มี `executing/completed/failed`; command ที่ crash ค้างจะไม่ dial ซ้ำจาก commandId เดิม
+- outbox warning 80%, block สายใหม่ 90%, hard ceiling 10,000 pending events หรือ DB+WAL 100 MiB
+- registration retry ใช้ exponential full jitter 2–60 วินาที, cancel ด้วย generation และ reset หลัง registered 5 นาที
+- audio default-device change ถูก debounce; device loss ระหว่างสายแสดง degraded โดยไม่ตัด SIP call
+- outbox runtime failure ทำ Agent degraded/fail closed; shutdown checkpoint/hangup/unregister แบบ best effort
 - structured logger เก็บเฉพาะ template/safe properties และ redacts sensitive values
+- diagnostic ZIP มี safe summary และ bounded sanitized logs; ไม่รวม DB/config/credential/raw Origin
 
-`AcceptRtpFromAny=true` ยังคงไว้เพื่อรักษา PoC behavior และเป็น P2 security review gate
+`AcceptRtpFromAny=true` ยังคงไว้เพื่อรักษา PBX compatibility และเป็น P2 acceptance residual:
+ต้องทดสอบ direct/NAT PBX matrix ก่อนปิด P2; Portal ไม่มี command สำหรับเปลี่ยนนโยบายนี้
 
-## Remaining gates
+## Verification record และ next phase
 
-- ใช้ [P1 Windows/PBX verification checklist](docs/manual-verification/p1-windows-pbx-smoke.md) เป็นหลักฐานกลาง
-- รัน Windows host tests และ tray/startup/single-instance QA บน Windows 10 1809+/Windows 11
-- รัน combined PBX smoke: registration, outbound/inbound, DTMF, audio และ reconnect/replay/ACK
-- P2: TCP certification, retry/backoff, device reselection, outbox capacity/corruption และ soak
+- Owner ยืนยันเมื่อ 01/10/2026 ว่า Agent ทำงานปกติบน Windows กับ PBX Sandbox และปิด P1
+- ใช้ [P1 Windows/PBX verification checklist](docs/manual-verification/p1-windows-pbx-smoke.md)
+  เป็น regression source ต่อไป; repository ไม่สมมติ granular case evidence ที่ไม่ได้รับ
+- P2 source implementation และ macOS cross-validation บันทึกใน
+  [P2 result](docs/plan-results/2026-10-01-p2-hardening-result.md)
+- การปิด P2 ยังรอ [P2 Windows/PBX checklist](docs/manual-verification/p2-windows-pbx-soak.md):
+  Windows host tests, UDP/TCP matrix, device change, diagnostic privacy review และ 2 ชั่วโมง/50 calls soak
 - phase หลัง: Portal/Web API/Collection DB call-history, installer, signing และ staged rollout

@@ -14,13 +14,14 @@ public sealed class AgentStorageTests
 
         try
         {
-            var (store, available) = await AgentEventStoreFactory.CreateAsync(
+            var (store, available, failureCode) = await AgentEventStoreFactory.CreateAsync(
                 Path.Combine(blockingFile, "agent.db"),
                 CancellationToken.None);
             await using (store)
             {
                 Assert.False(available);
-                await Assert.ThrowsAsync<InvalidOperationException>(
+                Assert.Equal("outbox_unavailable", failureCode);
+                await Assert.ThrowsAsync<DebtFlow.SipAgent.Application.AgentStoreException>(
                     () => store.AppendAsync(
                         new(
                             Guid.NewGuid().ToString("D"),

@@ -15,12 +15,15 @@ public sealed class AgentCoordinator : IAsyncDisposable
     private readonly IAgentClock _clock;
     private readonly IAgentIdGenerator _ids;
     private readonly IAgentDelay _delay;
+    private readonly IAgentDelay _retryDelay;
+    private readonly IRegistrationRetryPolicy _retryPolicy;
     private readonly TimeSpan _ownerDisconnectGrace;
     private readonly Channel<CoordinatorWorkItem> _work;
     private readonly CancellationTokenSource _lifetime = new();
     private readonly Task _processor;
     private readonly string _agentSessionId;
     private Task _ownerLeaseExpiration = Task.CompletedTask;
+    private Task _registrationRetry = Task.CompletedTask;
     private RegistrationState _registrationState = RegistrationState.Unconfigured;
     private CallSessionState? _call;
     private string _agentState;
@@ -28,6 +31,9 @@ public sealed class AgentCoordinator : IAsyncDisposable
     private bool _portalConnected;
     private bool _clearCredentialsAfterCall;
     private long _ownerLeaseGeneration;
+    private long _registrationGeneration;
+    private int _registrationRetryAttempt;
+    private bool _registrationRequested;
     private int _disposeStarted;
 
     public AgentCoordinator(
@@ -39,7 +45,9 @@ public sealed class AgentCoordinator : IAsyncDisposable
         bool durableStoreAvailable = true,
         IAgentDelay? delay = null,
         TimeSpan? ownerDisconnectGrace = null,
-        string? initialDegradedCode = null)
+        string? initialDegradedCode = null,
+        IAgentDelay? retryDelay = null,
+        IRegistrationRetryPolicy? retryPolicy = null)
     {
         _sipRuntime = sipRuntime;
         _eventStore = eventStore;
@@ -47,10 +55,14 @@ public sealed class AgentCoordinator : IAsyncDisposable
         _clock = clock;
         _ids = ids;
         _delay = delay ?? new SystemAgentDelay();
+        _retryDelay = retryDelay ?? new SystemAgentDelay();
+        _retryPolicy = retryPolicy ?? new JitteredRegistrationRetryPolicy();
         _ownerDisconnectGrace = ownerDisconnectGrace ?? TimeSpan.FromSeconds(60);
         _agentSessionId = ids.NewId();
         _agentState = durableStoreAvailable && initialDegradedCode == null ? "ready" : "degraded";
-        _agentStateCode = durableStoreAvailable ? initialDegradedCode : "outbox_unavailable";
+        _agentStateCode = durableStoreAvailable
+            ? initialDegradedCode
+            : initialDegradedCode ?? "outbox_unavailable";
         _work = Channel.CreateBounded<CoordinatorWorkItem>(new BoundedChannelOptions(QueueCapacity)
         {
             SingleReader = true,
@@ -64,6 +76,9 @@ public sealed class AgentCoordinator : IAsyncDisposable
 
     public string AgentSessionId => _agentSessionId;
     public string AgentInstanceId => _eventStore.AgentInstanceId;
+
+    public Task InitializeAsync(CancellationToken cancellationToken) =>
+        EnqueueAsync(InitializeCoreAsync, cancellationToken);
 
     public Task ConfigureAsync(ConfigureCommand command, CancellationToken cancellationToken) =>
         EnqueueAsync(token => ConfigureCoreAsync(command, token), cancellationToken);
@@ -110,6 +125,9 @@ public sealed class AgentCoordinator : IAsyncDisposable
     public Task MarkDegradedAsync(string code, CancellationToken cancellationToken) =>
         EnqueueAsync(token => MarkDegradedCoreAsync(code, token), cancellationToken);
 
+    public Task RefreshStorageHealthAsync(CancellationToken cancellationToken) =>
+        EnqueueAsync(RefreshStorageHealthCoreAsync, cancellationToken);
+
     public async ValueTask DisposeAsync()
     {
         if (Interlocked.Exchange(ref _disposeStarted, 1) != 0)
@@ -134,6 +152,85 @@ public sealed class AgentCoordinator : IAsyncDisposable
         _lifetime.Dispose();
     }
 
+    private async Task InitializeCoreAsync(CancellationToken cancellationToken)
+    {
+        try
+        {
+            CallSessionState? recovered = await _eventStore.LoadActiveCallAsync(cancellationToken);
+            if (recovered != null)
+            {
+                _call = recovered;
+                if (recovered.State == CallState.Ended)
+                {
+                    await EmitEndedEventAsync(
+                        recovered,
+                        recovered.Outcome ?? CallOutcome.Failed,
+                        recovered.EndReason ?? "agent_restarted",
+                        cancellationToken);
+                }
+                else
+                {
+                    await EndCallCoreAsync(CallOutcome.Failed, "agent_restarted", cancellationToken);
+                }
+            }
+
+            await _eventStore.PruneCommandsAsync(
+                _clock.UtcNow.AddDays(-30),
+                50_000,
+                cancellationToken);
+            await RefreshStorageHealthCoreAsync(cancellationToken);
+        }
+        catch (AgentCommandException exception)
+        {
+            await MarkDegradedCoreAsync(exception.ErrorCode, CancellationToken.None);
+        }
+        catch (AgentStoreException exception)
+        {
+            await MarkDegradedCoreAsync(exception.ErrorCode, CancellationToken.None);
+        }
+        catch (Exception exception) when (exception is not OperationCanceledException)
+        {
+            await MarkDegradedCoreAsync("outbox_unavailable", CancellationToken.None);
+        }
+    }
+
+    private async Task RefreshStorageHealthCoreAsync(CancellationToken cancellationToken)
+    {
+        EventStoreHealth health = await _eventStore.GetHealthAsync(cancellationToken);
+        if (health.CapacityState is EventStoreCapacityState.Critical or EventStoreCapacityState.Full)
+        {
+            await MarkDegradedCoreAsync(
+                health.CapacityState == EventStoreCapacityState.Full
+                    ? "outbox_capacity_exceeded"
+                    : "outbox_capacity_critical",
+                cancellationToken);
+            if ((_call is null or { State: CallState.Ended }) &&
+                _registrationState != RegistrationState.Unconfigured)
+            {
+                await StopRegistrationCoreAsync(cancellationToken);
+            }
+
+            return;
+        }
+
+        if (_agentState == "degraded" && IsCapacityCode(_agentStateCode))
+        {
+            _agentState = "ready";
+            _agentStateCode = null;
+            await PublishRealtimeAsync(
+                "agent.state_changed",
+                new { state = "ready", code = health.CapacityState == EventStoreCapacityState.Warning ? "outbox_capacity_warning" : null },
+                cancellationToken);
+        }
+        else if (health.CapacityState == EventStoreCapacityState.Warning)
+        {
+            await PublishRealtimeAsync(
+                "agent.storage_state_changed",
+                new { state = "warning", code = "outbox_capacity_warning" },
+                cancellationToken);
+        }
+    }
+
     private async Task ConfigureCoreAsync(ConfigureCommand command, CancellationToken cancellationToken)
     {
         EnsureOperational();
@@ -148,6 +245,9 @@ public sealed class AgentCoordinator : IAsyncDisposable
             await _sipRuntime.StopRegistrationAsync(cancellationToken);
         }
 
+        _registrationRequested = false;
+        _registrationRetryAttempt = 0;
+        _registrationGeneration++;
         await _sipRuntime.ConfigureAsync(configuration, cancellationToken);
         _registrationState = RegistrationState.Unregistered;
         await PublishRealtimeAsync(
@@ -169,13 +269,17 @@ public sealed class AgentCoordinator : IAsyncDisposable
             throw new AgentCommandException("registration_unavailable");
         }
 
-        _registrationState = RegistrationState.Registering;
-        await PublishRealtimeAsync("registration.state_changed", new { state = "registering" }, cancellationToken);
-        await _sipRuntime.StartRegistrationAsync(cancellationToken);
+        _registrationRequested = true;
+        _registrationRetryAttempt = 0;
+        long generation = ++_registrationGeneration;
+        await StartRegistrationAttemptCoreAsync(generation, cancellationToken);
     }
 
     private async Task StopRegistrationCoreAsync(CancellationToken cancellationToken)
     {
+        _registrationRequested = false;
+        _registrationRetryAttempt = 0;
+        _registrationGeneration++;
         await _sipRuntime.StopRegistrationAsync(cancellationToken);
         _registrationState = RegistrationState.Unconfigured;
         await PublishRealtimeAsync(
@@ -203,6 +307,8 @@ public sealed class AgentCoordinator : IAsyncDisposable
         {
             throw new AgentCommandException("call_invalid_state");
         }
+
+        await EnsureCapacityForNewCallAsync(cancellationToken);
 
         _call = CallReducer.CreateOutbound(
             command.CallId,
@@ -311,7 +417,8 @@ public sealed class AgentCoordinator : IAsyncDisposable
             _sipRuntime.AudioState,
             calls,
             pendingEventCount,
-            _eventStore.LastSequence);
+            _eventStore.LastSequence,
+            _agentStateCode);
     }
 
     private Task PortalConnectedCoreAsync(CancellationToken cancellationToken)
@@ -395,6 +502,13 @@ public sealed class AgentCoordinator : IAsyncDisposable
 
         _portalConnected = false;
         _ownerLeaseGeneration++;
+        try
+        {
+            await _eventStore.CheckpointAsync(cancellationToken);
+        }
+        catch (Exception exception) when (exception is not OperationCanceledException)
+        {
+        }
     }
 
     private async Task MarkDegradedCoreAsync(string code, CancellationToken cancellationToken)
@@ -451,6 +565,20 @@ public sealed class AgentCoordinator : IAsyncDisposable
                     "registration.state_changed",
                     new { state = ToWire(_registrationState), code = signal.SafeCode },
                     cancellationToken);
+                if (signal.Type == SipSignalType.RegistrationRegistered)
+                {
+                    long generation = ++_registrationGeneration;
+                    Volatile.Write(
+                        ref _registrationRetry,
+                        ResetRegistrationRetryAfterStablePeriodAsync(generation));
+                }
+                else if (signal.Type == SipSignalType.RegistrationFailed &&
+                         signal.Retryable &&
+                         _registrationRequested &&
+                         _agentState == "ready")
+                {
+                    await ScheduleRegistrationRetryCoreAsync(signal.SafeCode, cancellationToken);
+                }
                 break;
             case SipSignalType.IncomingCall:
                 await StartIncomingCallCoreAsync(signal.Caller, cancellationToken);
@@ -483,6 +611,12 @@ public sealed class AgentCoordinator : IAsyncDisposable
                     cancellationToken);
                 await EmitForCurrentCallCoreAsync("call.media_degraded", new { code = signal.SafeCode ?? "audio_error" }, cancellationToken);
                 break;
+            case SipSignalType.AudioInventoryChanged:
+                await PublishRealtimeAsync(
+                    "audio.state_changed",
+                    new { state = _sipRuntime.AudioState, code = signal.SafeCode ?? "audio_devices_changed" },
+                    cancellationToken);
+                break;
             case SipSignalType.DtmfReceived:
                 await EmitForCurrentCallCoreAsync("call.dtmf_received", new { received = true }, cancellationToken);
                 break;
@@ -493,6 +627,21 @@ public sealed class AgentCoordinator : IAsyncDisposable
     {
         if (_call is { State: not CallState.Ended })
         {
+            return;
+        }
+
+        try
+        {
+            await EnsureCapacityForNewCallAsync(cancellationToken);
+        }
+        catch (AgentCommandException exception) when (IsCapacityCode(exception.ErrorCode))
+        {
+            await _sipRuntime.RejectUnavailableAsync(cancellationToken);
+            if (_registrationState != RegistrationState.Unconfigured)
+            {
+                await StopRegistrationCoreAsync(cancellationToken);
+            }
+
             return;
         }
 
@@ -566,6 +715,25 @@ public sealed class AgentCoordinator : IAsyncDisposable
             ended,
             new { outcome = ToWire(outcome), endReason = reason },
             cancellationToken);
+        await EmitEndedEventAsync(ended, outcome, reason, cancellationToken);
+        await RefreshStorageHealthCoreAsync(cancellationToken);
+
+        if (_clearCredentialsAfterCall && !_portalConnected)
+        {
+            _clearCredentialsAfterCall = false;
+            if (_registrationState != RegistrationState.Unconfigured)
+            {
+                await StopRegistrationCoreAsync(cancellationToken);
+            }
+        }
+    }
+
+    private async Task EmitEndedEventAsync(
+        CallSessionState ended,
+        CallOutcome outcome,
+        string reason,
+        CancellationToken cancellationToken)
+    {
         long? talkDurationMs = ended.AnsweredAtUtc.HasValue
             ? Math.Max(0, (long)(ended.EndedAtUtc!.Value - ended.AnsweredAtUtc.Value).TotalMilliseconds)
             : null;
@@ -582,12 +750,6 @@ public sealed class AgentCoordinator : IAsyncDisposable
                 totalDurationMs
             },
             cancellationToken);
-
-        if (_clearCredentialsAfterCall && !_portalConnected)
-        {
-            _clearCredentialsAfterCall = false;
-            await StopRegistrationCoreAsync(cancellationToken);
-        }
     }
 
     private Task EmitForCurrentCallCoreAsync(string eventType, object data, CancellationToken cancellationToken) =>
@@ -603,7 +765,7 @@ public sealed class AgentCoordinator : IAsyncDisposable
     {
         try
         {
-            StoredDurableEvent stored = await _eventStore.AppendAsync(
+            StoredDurableEvent stored = await _eventStore.AppendCallEventAsync(
                 new DurableEventDraft(
                     _ids.NewId(),
                     _agentSessionId,
@@ -613,8 +775,15 @@ public sealed class AgentCoordinator : IAsyncDisposable
                     _clock.UtcNow,
                     ToWire(call.State),
                     JsonSerializer.Serialize(data, ProtocolJson.Options)),
+                call,
+                string.Equals(eventType, "call.ended", StringComparison.Ordinal),
                 cancellationToken);
             await _publisher.PublishDurableAsync(stored, cancellationToken);
+        }
+        catch (AgentStoreException exception)
+        {
+            await MarkDegradedCoreAsync(exception.ErrorCode, CancellationToken.None);
+            throw new AgentCommandException(exception.ErrorCode);
         }
         catch (Exception exception) when (exception is not OperationCanceledException and not AgentCommandException)
         {
@@ -636,6 +805,139 @@ public sealed class AgentCoordinator : IAsyncDisposable
                 _clock.UtcNow,
                 element),
             cancellationToken);
+    }
+
+    private async Task EnsureCapacityForNewCallAsync(CancellationToken cancellationToken)
+    {
+        EventStoreHealth health;
+        try
+        {
+            health = await _eventStore.GetHealthAsync(cancellationToken);
+        }
+        catch (AgentStoreException exception)
+        {
+            await MarkDegradedCoreAsync(exception.ErrorCode, CancellationToken.None);
+            throw new AgentCommandException(exception.ErrorCode);
+        }
+        catch (Exception exception) when (exception is not OperationCanceledException)
+        {
+            await MarkDegradedCoreAsync("outbox_unavailable", CancellationToken.None);
+            throw new AgentCommandException("outbox_unavailable");
+        }
+
+        if (health.CapacityState is EventStoreCapacityState.Critical or EventStoreCapacityState.Full)
+        {
+            string code = health.CapacityState == EventStoreCapacityState.Full
+                ? "outbox_capacity_exceeded"
+                : "outbox_capacity_critical";
+            await MarkDegradedCoreAsync(code, CancellationToken.None);
+            if ((_call is null or { State: CallState.Ended }) &&
+                _registrationState != RegistrationState.Unconfigured)
+            {
+                await StopRegistrationCoreAsync(cancellationToken);
+            }
+
+            throw new AgentCommandException(code);
+        }
+
+        if (health.CapacityState == EventStoreCapacityState.Warning)
+        {
+            await PublishRealtimeAsync(
+                "agent.storage_state_changed",
+                new { state = "warning", code = "outbox_capacity_warning" },
+                cancellationToken);
+        }
+    }
+
+    private async Task StartRegistrationAttemptCoreAsync(long generation, CancellationToken cancellationToken)
+    {
+        if (!_registrationRequested || generation != _registrationGeneration)
+        {
+            return;
+        }
+
+        _registrationState = RegistrationState.Registering;
+        await PublishRealtimeAsync("registration.state_changed", new { state = "registering" }, cancellationToken);
+        try
+        {
+            await _sipRuntime.StartRegistrationAsync(cancellationToken);
+        }
+        catch (Exception exception) when (exception is not OperationCanceledException)
+        {
+            _registrationState = RegistrationState.Failed;
+            await PublishRealtimeAsync(
+                "registration.state_changed",
+                new { state = "failed", code = "registration_transport_failure" },
+                cancellationToken);
+            await ScheduleRegistrationRetryCoreAsync("registration_transport_failure", cancellationToken);
+        }
+    }
+
+    private async Task ScheduleRegistrationRetryCoreAsync(string? code, CancellationToken cancellationToken)
+    {
+        if (!_registrationRequested || _agentState != "ready")
+        {
+            return;
+        }
+
+        int attempt = ++_registrationRetryAttempt;
+        TimeSpan retryAfter = _retryPolicy.GetDelay(attempt);
+        long generation = ++_registrationGeneration;
+        _registrationState = RegistrationState.Retrying;
+        await PublishRealtimeAsync(
+            "registration.state_changed",
+            new
+            {
+                state = "retrying",
+                code = code ?? "registration_retry_scheduled",
+                attempt,
+                retryAfterMs = (long)retryAfter.TotalMilliseconds
+            },
+            cancellationToken);
+        Volatile.Write(ref _registrationRetry, RetryRegistrationAfterDelayAsync(generation, retryAfter));
+    }
+
+    private async Task RetryRegistrationAfterDelayAsync(long generation, TimeSpan delay)
+    {
+        try
+        {
+            await _retryDelay.DelayAsync(delay, _lifetime.Token);
+            await EnqueueAsync(
+                token => StartRegistrationAttemptCoreAsync(generation, token),
+                _lifetime.Token);
+        }
+        catch (OperationCanceledException) when (_lifetime.IsCancellationRequested)
+        {
+        }
+        catch (ChannelClosedException)
+        {
+        }
+    }
+
+    private async Task ResetRegistrationRetryAfterStablePeriodAsync(long generation)
+    {
+        try
+        {
+            await _retryDelay.DelayAsync(TimeSpan.FromMinutes(5), _lifetime.Token);
+            await EnqueueAsync(
+                token =>
+                {
+                    token.ThrowIfCancellationRequested();
+                    if (generation == _registrationGeneration && _registrationState == RegistrationState.Registered)
+                    {
+                        _registrationRetryAttempt = 0;
+                    }
+
+                    return Task.CompletedTask;
+                },
+                _lifetime.Token);
+        }
+        catch (OperationCanceledException) when (_lifetime.IsCancellationRequested)
+        {
+        }
+        catch (ChannelClosedException)
+        {
+        }
     }
 
     private async Task ExpireOwnerLeaseAsync(long generation)
@@ -690,6 +992,9 @@ public sealed class AgentCoordinator : IAsyncDisposable
             throw new AgentCommandException(_agentStateCode ?? "agent_unavailable");
         }
     }
+
+    private static bool IsCapacityCode(string? code) =>
+        code is "outbox_capacity_critical" or "outbox_capacity_exceeded";
 
     private CallSessionState EnsureCurrentCall(string callId, CallDirection? direction = null)
     {

@@ -27,6 +27,7 @@ public sealed class V1CommandDispatcher(
             try
             {
                 await eventStore.AcknowledgeThroughAsync(ack.AcknowledgedThroughSequence, cancellationToken);
+                await coordinator.RefreshStorageHealthAsync(cancellationToken);
                 return ProtocolCodec.Serialize(
                     "command_result",
                     "events.ack.result",
@@ -36,6 +37,11 @@ public sealed class V1CommandDispatcher(
                 exception.Message is "ack_sequence_not_emitted" or "ack_sequence_gap")
             {
                 return Error(envelope.MessageId, exception.Message, false);
+            }
+            catch (AgentStoreException exception)
+            {
+                await coordinator.MarkDegradedAsync(exception.ErrorCode, CancellationToken.None);
+                return Error(envelope.MessageId, exception.ErrorCode, true);
             }
             catch (Exception exception) when (exception is not OperationCanceledException)
             {
@@ -68,6 +74,11 @@ public sealed class V1CommandDispatcher(
         {
             existing = await eventStore.FindCommandAsync(commandId, cancellationToken);
         }
+        catch (AgentStoreException exception)
+        {
+            await coordinator.MarkDegradedAsync(exception.ErrorCode, CancellationToken.None);
+            return Result(commandId, envelope.Type, false, exception.ErrorCode);
+        }
         catch (Exception exception) when (exception is not OperationCanceledException)
         {
             await coordinator.MarkDegradedAsync("outbox_unavailable", CancellationToken.None);
@@ -93,8 +104,14 @@ public sealed class V1CommandDispatcher(
                     envelope.Type,
                     requestHash,
                     System.Text.Encoding.UTF8.GetString(provisional),
-                    clock.UtcNow),
+                    clock.UtcNow,
+                    "executing"),
                 cancellationToken);
+        }
+        catch (AgentStoreException exception)
+        {
+            await coordinator.MarkDegradedAsync(exception.ErrorCode, CancellationToken.None);
+            return Result(commandId, envelope.Type, false, exception.ErrorCode);
         }
         catch (Exception exception) when (exception is not OperationCanceledException)
         {
@@ -103,22 +120,27 @@ public sealed class V1CommandDispatcher(
         }
 
         byte[] result;
+        string executionState;
         try
         {
             await ExecuteAsync(envelope, cancellationToken);
             result = Result(commandId, envelope.Type, true, null);
+            executionState = "completed";
         }
         catch (AgentCommandException exception)
         {
             result = Result(commandId, envelope.Type, false, exception.ErrorCode);
+            executionState = "failed";
         }
         catch (ProtocolException exception)
         {
             result = Result(commandId, envelope.Type, false, exception.Code);
+            executionState = "failed";
         }
         catch
         {
             result = Result(commandId, envelope.Type, false, "internal_error");
+            executionState = "failed";
         }
 
         try
@@ -129,8 +151,14 @@ public sealed class V1CommandDispatcher(
                     envelope.Type,
                     requestHash,
                     System.Text.Encoding.UTF8.GetString(result),
-                    clock.UtcNow),
+                    clock.UtcNow,
+                    executionState),
                 cancellationToken);
+        }
+        catch (AgentStoreException exception)
+        {
+            await coordinator.MarkDegradedAsync(exception.ErrorCode, CancellationToken.None);
+            return Result(commandId, envelope.Type, false, "command_outcome_unknown");
         }
         catch (Exception exception) when (exception is not OperationCanceledException)
         {

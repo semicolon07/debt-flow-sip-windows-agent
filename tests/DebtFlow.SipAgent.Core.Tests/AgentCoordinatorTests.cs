@@ -541,6 +541,247 @@ public sealed class AgentCoordinatorTests
         }
     }
 
+    [Fact]
+    public async Task Configure_WhenDurableStoreHasSpecificFailure_PreservesSafeFailureCode()
+    {
+        string directory = Path.Combine(Path.GetTempPath(), $"sip-agent-corrupt-configure-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(directory);
+        var store = new SqliteAgentEventStore(Path.Combine(directory, "agent.db"));
+        await store.InitializeAsync(CancellationToken.None);
+        var runtime = new FakeSipRuntime();
+        await using var coordinator = new AgentCoordinator(
+            runtime,
+            store,
+            new NullPublisher(),
+            new FixedClock(),
+            new GuidAgentIdGenerator(),
+            durableStoreAvailable: false,
+            initialDegradedCode: "outbox_corrupt");
+
+        try
+        {
+            AgentCommandException exception = await Assert.ThrowsAsync<AgentCommandException>(
+                () => coordinator.ConfigureAsync(
+                    new ConfigureCommand(NewId(), "192.0.2.10", 5060, "user", "password"),
+                    CancellationToken.None));
+
+            Assert.Equal("outbox_corrupt", exception.ErrorCode);
+            Assert.Equal(0, runtime.ConfigureCount);
+            Assert.Equal(
+                "outbox_corrupt",
+                (await coordinator.GetSnapshotAsync(CancellationToken.None)).AgentStateCode);
+        }
+        finally
+        {
+            await coordinator.DisposeAsync();
+            await store.DisposeAsync();
+            Directory.Delete(directory, true);
+        }
+    }
+
+    [Fact]
+    public async Task RegistrationRetry_RunsSingleSerializedAttemptAfterRetryableFailure()
+    {
+        var retryDelay = new ControlledDelay();
+        var retryPolicy = new FixedRetryPolicy(TimeSpan.FromSeconds(7));
+        await using CoordinatorFixture fixture = await CoordinatorFixture.CreateAsync(
+            retryDelay: retryDelay,
+            retryPolicy: retryPolicy);
+        await fixture.Coordinator.ConfigureAsync(
+            new ConfigureCommand(NewId(), "192.0.2.10", 5060, "user", "password"),
+            CancellationToken.None);
+        await fixture.Coordinator.StartRegistrationAsync(CancellationToken.None);
+
+        await fixture.Runtime.EmitAsync(new SipSignal(
+            SipSignalType.RegistrationFailed,
+            SafeCode: "registration_transport_failure",
+            Retryable: true));
+
+        Assert.Equal("retrying", (await fixture.Coordinator.GetSnapshotAsync(CancellationToken.None)).RegistrationState);
+        Assert.Equal(TimeSpan.FromSeconds(7), await retryDelay.WaitUntilRequestedAsync());
+        Assert.Equal([1], retryPolicy.Attempts);
+        retryDelay.Release();
+        await WaitUntilAsync(() => fixture.Runtime.StartRegistrationCount == 2);
+        Assert.Equal("registering", (await fixture.Coordinator.GetSnapshotAsync(CancellationToken.None)).RegistrationState);
+    }
+
+    [Fact]
+    public async Task RegistrationRetry_IsInvalidatedByReconfigure()
+    {
+        var retryDelay = new ControlledDelay();
+        await using CoordinatorFixture fixture = await CoordinatorFixture.CreateAsync(
+            retryDelay: retryDelay,
+            retryPolicy: new FixedRetryPolicy(TimeSpan.FromSeconds(2)));
+        await fixture.Coordinator.ConfigureAsync(
+            new ConfigureCommand(NewId(), "192.0.2.10", 5060, "user", "password"),
+            CancellationToken.None);
+        await fixture.Coordinator.StartRegistrationAsync(CancellationToken.None);
+        await fixture.Runtime.EmitAsync(new SipSignal(
+            SipSignalType.RegistrationFailed,
+            SafeCode: "registration_transport_failure",
+            Retryable: true));
+        await retryDelay.WaitUntilRequestedAsync();
+
+        await fixture.Coordinator.ConfigureAsync(
+            new ConfigureCommand(NewId(), "192.0.2.11", 5060, "user2", "password2"),
+            CancellationToken.None);
+        retryDelay.Release();
+        await Task.Delay(25);
+
+        Assert.Equal(1, fixture.Runtime.StartRegistrationCount);
+        Assert.Equal("unregistered", (await fixture.Coordinator.GetSnapshotAsync(CancellationToken.None)).RegistrationState);
+    }
+
+    [Fact]
+    public async Task Initialize_ReconcilesRecoveredCallExactlyOnce()
+    {
+        string directory = Path.Combine(Path.GetTempPath(), $"sip-agent-recovery-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(directory);
+        var store = new SqliteAgentEventStore(Path.Combine(directory, "agent.db"));
+        await store.InitializeAsync(CancellationToken.None);
+        string callId = NewId();
+        var active = new CallSessionState(
+            callId,
+            NewId(),
+            CallDirection.Outbound,
+            CallState.Ringing,
+            new DateTimeOffset(2026, 10, 1, 0, 0, 0, TimeSpan.Zero),
+            null,
+            null,
+            null,
+            null,
+            "***5678");
+        await store.AppendCallEventAsync(
+            new DurableEventDraft(NewId(), NewId(), callId, active.CommandId, "call.created", active.StartedAtUtc, "ringing", "{}"),
+            active,
+            false,
+            CancellationToken.None);
+
+        try
+        {
+            await using (var first = new AgentCoordinator(
+                             new FakeSipRuntime(),
+                             store,
+                             new NullPublisher(),
+                             new FixedClock(),
+                             new GuidAgentIdGenerator()))
+            {
+                await first.InitializeAsync(CancellationToken.None);
+            }
+
+            Assert.Null(await store.LoadActiveCallAsync(CancellationToken.None));
+            IReadOnlyList<StoredDurableEvent> afterFirst = await store.LoadPendingAsync(0, 100, CancellationToken.None);
+            Assert.Single(afterFirst, item => item.EventType == "call.ended");
+            Assert.Contains("agent_restarted", afterFirst.Single(item => item.EventType == "call.ended").DataJson);
+
+            await using (var second = new AgentCoordinator(
+                             new FakeSipRuntime(),
+                             store,
+                             new NullPublisher(),
+                             new FixedClock(),
+                             new GuidAgentIdGenerator()))
+            {
+                await second.InitializeAsync(CancellationToken.None);
+            }
+
+            IReadOnlyList<StoredDurableEvent> afterSecond = await store.LoadPendingAsync(0, 100, CancellationToken.None);
+            Assert.Single(afterSecond, item => item.EventType == "call.ended");
+        }
+        finally
+        {
+            await store.DisposeAsync();
+            Directory.Delete(directory, true);
+        }
+    }
+
+    [Fact]
+    public async Task StartCall_WhenOutboxBecomesCritical_IsBlockedBeforeSipSideEffect()
+    {
+        string directory = Path.Combine(Path.GetTempPath(), $"sip-agent-capacity-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(directory);
+        var store = new SqliteAgentEventStore(
+            Path.Combine(directory, "agent.db"),
+            new EventStoreLimits(10, 1024L * 1024 * 1024));
+        await store.InitializeAsync(CancellationToken.None);
+        for (int index = 0; index < 8; index++)
+        {
+            await store.AppendAsync(
+                new DurableEventDraft(NewId(), NewId(), NewId(), null, "test.event", DateTimeOffset.UtcNow, null, "{}"),
+                CancellationToken.None);
+        }
+
+        var runtime = new FakeSipRuntime();
+        await using var coordinator = new AgentCoordinator(
+            runtime,
+            store,
+            new NullPublisher(),
+            new FixedClock(),
+            new GuidAgentIdGenerator());
+        try
+        {
+            await coordinator.ConfigureAsync(
+                new ConfigureCommand(NewId(), "192.0.2.10", 5060, "user", "password"),
+                CancellationToken.None);
+            await coordinator.StartRegistrationAsync(CancellationToken.None);
+            await runtime.EmitAsync(new SipSignal(SipSignalType.RegistrationRegistered));
+            await store.AppendAsync(
+                new DurableEventDraft(NewId(), NewId(), NewId(), null, "test.event", DateTimeOffset.UtcNow, null, "{}"),
+                CancellationToken.None);
+
+            AgentCommandException exception = await Assert.ThrowsAsync<AgentCommandException>(
+                () => coordinator.StartCallAsync(
+                    new CallStartCommand(NewId(), NewId(), "1001", "context"),
+                    CancellationToken.None));
+            Assert.Equal("outbox_capacity_critical", exception.ErrorCode);
+            Assert.Equal(0, runtime.StartCallCount);
+        }
+        finally
+        {
+            await coordinator.DisposeAsync();
+            await store.DisposeAsync();
+            Directory.Delete(directory, true);
+        }
+    }
+
+    [Fact]
+    public async Task FakeLifecycle_OneThousandSequentialCalls_HasOneTerminalEventPerCall()
+    {
+        await using CoordinatorFixture fixture = await CoordinatorFixture.CreateAsync();
+        await fixture.RegisterAsync();
+
+        for (int index = 0; index < 1_000; index++)
+        {
+            await fixture.Coordinator.StartCallAsync(
+                new CallStartCommand(NewId(), NewId(), "1001", "soak"),
+                CancellationToken.None);
+            await fixture.Runtime.EmitAsync(new SipSignal(SipSignalType.CallConnected, 200));
+            await fixture.Runtime.EmitAsync(new SipSignal(SipSignalType.CallRemoteEnded));
+            await fixture.Runtime.EmitAsync(new SipSignal(SipSignalType.CallRemoteEnded));
+        }
+
+        await WaitUntilAsync(() => fixture.Runtime.StartCallCount == 1_000);
+        Assert.Equal(5_000, await fixture.Store.CountPendingAsync(CancellationToken.None));
+        int terminalCount = 0;
+        long afterSequence = 0;
+        while (true)
+        {
+            IReadOnlyList<StoredDurableEvent> batch = await fixture.Store.LoadPendingAsync(
+                afterSequence,
+                1_000,
+                CancellationToken.None);
+            if (batch.Count == 0)
+            {
+                break;
+            }
+
+            terminalCount += batch.Count(item => item.EventType == "call.ended");
+            afterSequence = batch[^1].Sequence;
+        }
+
+        Assert.Equal(1_000, terminalCount);
+        Assert.Empty((await fixture.Coordinator.GetSnapshotAsync(CancellationToken.None)).ActiveCalls);
+    }
+
     private static string NewId() => Guid.NewGuid().ToString("D").ToLowerInvariant();
 
     private sealed class CoordinatorFixture : IAsyncDisposable
@@ -563,7 +804,10 @@ public sealed class AgentCoordinatorTests
         public FakeSipRuntime Runtime { get; }
         public AgentCoordinator Coordinator { get; }
 
-        public static async Task<CoordinatorFixture> CreateAsync(IAgentDelay? delay = null)
+        public static async Task<CoordinatorFixture> CreateAsync(
+            IAgentDelay? delay = null,
+            IAgentDelay? retryDelay = null,
+            IRegistrationRetryPolicy? retryPolicy = null)
         {
             string directory = Path.Combine(Path.GetTempPath(), $"sip-agent-coordinator-{Guid.NewGuid():N}");
             Directory.CreateDirectory(directory);
@@ -577,7 +821,9 @@ public sealed class AgentCoordinatorTests
                 new FixedClock(),
                 new GuidAgentIdGenerator(),
                 delay: delay,
-                ownerDisconnectGrace: TimeSpan.FromSeconds(60));
+                ownerDisconnectGrace: TimeSpan.FromSeconds(60),
+                retryDelay: retryDelay,
+                retryPolicy: retryPolicy);
             return new CoordinatorFixture(directory, store, runtime, coordinator);
         }
 
@@ -684,6 +930,18 @@ public sealed class AgentCoordinatorTests
                 : inner.AppendAsync(draft, cancellationToken);
         }
 
+        public Task<StoredDurableEvent> AppendCallEventAsync(
+            DurableEventDraft draft,
+            CallSessionState callState,
+            bool terminal,
+            CancellationToken cancellationToken)
+        {
+            int attempt = Interlocked.Increment(ref _appendAttempts);
+            return FailAppends || attempt == FailOnAppendAttempt
+                ? Task.FromException<StoredDurableEvent>(new IOException("simulated_outbox_failure"))
+                : inner.AppendCallEventAsync(draft, callState, terminal, cancellationToken);
+        }
+
         public Task<IReadOnlyList<StoredDurableEvent>> LoadPendingAsync(
             long afterSequence,
             int maximumCount,
@@ -693,6 +951,12 @@ public sealed class AgentCoordinatorTests
         public Task<long> CountPendingAsync(CancellationToken cancellationToken) =>
             inner.CountPendingAsync(cancellationToken);
 
+        public Task<EventStoreHealth> GetHealthAsync(CancellationToken cancellationToken) =>
+            inner.GetHealthAsync(cancellationToken);
+
+        public Task<CallSessionState?> LoadActiveCallAsync(CancellationToken cancellationToken) =>
+            inner.LoadActiveCallAsync(cancellationToken);
+
         public Task AcknowledgeThroughAsync(long sequence, CancellationToken cancellationToken) =>
             inner.AcknowledgeThroughAsync(sequence, cancellationToken);
 
@@ -701,6 +965,15 @@ public sealed class AgentCoordinatorTests
 
         public Task SaveCommandAsync(ProcessedCommand command, CancellationToken cancellationToken) =>
             inner.SaveCommandAsync(command, cancellationToken);
+
+        public Task PruneCommandsAsync(
+            DateTimeOffset olderThanUtc,
+            int maximumRetained,
+            CancellationToken cancellationToken) =>
+            inner.PruneCommandsAsync(olderThanUtc, maximumRetained, cancellationToken);
+
+        public Task CheckpointAsync(CancellationToken cancellationToken) =>
+            inner.CheckpointAsync(cancellationToken);
 
         public ValueTask DisposeAsync() => inner.DisposeAsync();
     }
@@ -755,17 +1028,28 @@ public sealed class AgentCoordinatorTests
 
     private sealed class ControlledDelay : IAgentDelay
     {
-        private readonly TaskCompletionSource _requested = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private readonly TaskCompletionSource<TimeSpan> _requested = new(TaskCreationOptions.RunContinuationsAsynchronously);
         private readonly TaskCompletionSource _released = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
         public async Task DelayAsync(TimeSpan delay, CancellationToken cancellationToken)
         {
-            _requested.TrySetResult();
+            _requested.TrySetResult(delay);
             await _released.Task.WaitAsync(cancellationToken);
         }
 
-        public Task WaitUntilRequestedAsync() => _requested.Task;
+        public Task<TimeSpan> WaitUntilRequestedAsync() => _requested.Task;
         public void Release() => _released.TrySetResult();
+    }
+
+    private sealed class FixedRetryPolicy(TimeSpan delay) : IRegistrationRetryPolicy
+    {
+        public List<int> Attempts { get; } = [];
+
+        public TimeSpan GetDelay(int attempt)
+        {
+            Attempts.Add(attempt);
+            return delay;
+        }
     }
 
     private static async Task WaitUntilAsync(Func<bool> condition)

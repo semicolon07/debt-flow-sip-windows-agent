@@ -2,12 +2,11 @@
 
 วันที่: 01/10/2026
 
-สถานะ: **Source implementation complete — Windows/PBX verification pending**
+สถานะ: **P1 complete by owner acceptance — superseded by P2 source implementation**
 
-Progress snapshot: **source implementation 100%; full P1 completion gate 70%**.
-ตัวเลข full gate ให้น้ำหนัก source 60 จุด (ผ่านครบ), automated evidence 20 จุด
-(cross-platform 10 ผ่าน, Windows execution 10 pending), non-admin Windows QA 10 จุด pending
-และ combined PBX/audio smoke 10 จุด pending. เป็น evidence rubric ไม่ใช่เวลาโดยประมาณ
+Acceptance record: Owner ยืนยันเมื่อ 01/10/2026 ว่า Agent ทำงานปกติบน Windows กับ PBX Sandbox
+และปิด P1. Source/cross-platform evidence ด้านล่างคงไว้ครบ; granular Windows case/TRX,
+environment matrix และ redacted screenshots ที่ไม่ได้ส่งเข้า repository จะไม่ถูกสมมติขึ้น.
 
 ## Implemented
 
@@ -63,10 +62,11 @@ Windows host testsมี config/redaction และ live Kestrel handshake/welco
 typed second-client rejection, rate limit และ 64 KiB message-size boundary cases แต่ environment นี้ไม่มี
 `Microsoft.WindowsDesktop.App` runtime จึงยังไม่ได้ execute test assembly
 
-## Requirement-by-requirement completion audit
+## Requirement-by-requirement source audit before owner acceptance
 
-`Source proved` หมายถึง source/cross-platform evidence ผ่านเท่านั้น ไม่แทน Windows/PBX acceptance.
-แถวที่มี `Pending` อย่างน้อยหนึ่งรายการทำให้ full P1 gate ยังไม่ complete
+ตารางนี้เป็น audit snapshot ก่อน owner acceptance และคง wording เดิมไว้เพื่อเห็นช่องว่างของ
+repository evidence. Owner acceptance ด้านบนเป็น phase-closure authority; ช่อง evidence ที่ไม่ได้แนบ
+จะถูกนำกลับมาเป็น regression target ใน P2/P5 โดยไม่แต่งผลย้อนหลัง.
 
 | Confirmed P1 requirement | Current evidence | Audit status | Evidence still required |
 | --- | --- | --- | --- |
@@ -89,7 +89,7 @@ typed second-client rejection, rate limit และ 64 KiB message-size boundary
 | self-contained multi-file `win-x64` ZIP | publish + 461-entry integrity/SHA-256 | Source proved | Windows-native verifier evidence JSON |
 | SIP/audio continuity | adapter cross-build + fake lifecycle tests | Source proved | PBX, microphone/speaker และ DTMF matrix |
 
-## Pending completion gate
+## Regression evidence carried into P2/P5
 
 - execute Windows host tests บน Windows CI/session
 - tray/status/localization/startup/single-instance/exit QA แบบ non-admin
@@ -98,4 +98,5 @@ typed second-client rejection, rate limit และ 64 KiB message-size boundary
 - บันทึกทุก case ID/environment/artifact hash และ redacted evidence ด้วย
   [Windows/PBX result template](../manual-verification/p1-windows-pbx-result-template.md)
 
-P1 ห้ามเปลี่ยนเป็น complete จน evidence ข้างต้นผ่านจริง
+P1 ถูกปิดโดย owner acceptance แล้วเมื่อ 01/10/2026. รายการข้างต้นไม่ reopen P1 แต่ยังเป็น
+หลักฐานที่ควรเก็บให้ครบก่อน signed installer และ production rollout ใน P5.

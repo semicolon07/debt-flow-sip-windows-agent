@@ -77,7 +77,27 @@ public sealed record ProcessedCommand(
     string CommandType,
     string RequestHash,
     string ResultJson,
-    DateTimeOffset ProcessedAtUtc);
+    DateTimeOffset ProcessedAtUtc,
+    string ExecutionState = "completed");
+
+public enum EventStoreCapacityState
+{
+    Healthy,
+    Warning,
+    Critical,
+    Full
+}
+
+public sealed record EventStoreHealth(
+    long PendingEventCount,
+    long StorageBytes,
+    EventStoreCapacityState CapacityState);
+
+public sealed class AgentStoreException(string errorCode, Exception? innerException = null)
+    : Exception(errorCode, innerException)
+{
+    public string ErrorCode { get; } = errorCode;
+}
 
 public interface IAgentEventStore : IAsyncDisposable
 {
@@ -86,14 +106,23 @@ public interface IAgentEventStore : IAsyncDisposable
     long LastAcknowledgedSequence { get; }
     Task InitializeAsync(CancellationToken cancellationToken);
     Task<StoredDurableEvent> AppendAsync(DurableEventDraft draft, CancellationToken cancellationToken);
+    Task<StoredDurableEvent> AppendCallEventAsync(
+        DurableEventDraft draft,
+        CallSessionState callState,
+        bool terminal,
+        CancellationToken cancellationToken);
     Task<IReadOnlyList<StoredDurableEvent>> LoadPendingAsync(
         long afterSequence,
         int maximumCount,
         CancellationToken cancellationToken);
     Task<long> CountPendingAsync(CancellationToken cancellationToken);
+    Task<EventStoreHealth> GetHealthAsync(CancellationToken cancellationToken);
+    Task<CallSessionState?> LoadActiveCallAsync(CancellationToken cancellationToken);
     Task AcknowledgeThroughAsync(long sequence, CancellationToken cancellationToken);
     Task<ProcessedCommand?> FindCommandAsync(string commandId, CancellationToken cancellationToken);
     Task SaveCommandAsync(ProcessedCommand command, CancellationToken cancellationToken);
+    Task PruneCommandsAsync(DateTimeOffset olderThanUtc, int maximumRetained, CancellationToken cancellationToken);
+    Task CheckpointAsync(CancellationToken cancellationToken);
 }
 
 public interface IAgentEventPublisher
@@ -117,6 +146,21 @@ public interface ISipRuntime : IAsyncDisposable
     Task SendDtmfAsync(char digit, CancellationToken cancellationToken);
 }
 
+public interface IRegistrationRetryPolicy
+{
+    TimeSpan GetDelay(int attempt);
+}
+
+public sealed class JitteredRegistrationRetryPolicy : IRegistrationRetryPolicy
+{
+    public TimeSpan GetDelay(int attempt)
+    {
+        int exponent = Math.Clamp(attempt - 1, 0, 5);
+        double maximumSeconds = Math.Min(60, 2 * Math.Pow(2, exponent));
+        return TimeSpan.FromMilliseconds(Math.Max(100, maximumSeconds * 1000 * Random.Shared.NextDouble()));
+    }
+}
+
 public sealed record SipConfiguration(string Host, int Port, string Username, string Password);
 
 public enum SipSignalType
@@ -134,6 +178,7 @@ public enum SipSignalType
     IncomingCancelled,
     MediaReady,
     MediaDegraded,
+    AudioInventoryChanged,
     DtmfReceived
 }
 
@@ -142,4 +187,5 @@ public sealed record SipSignal(
     int? SipStatusCode = null,
     string? SafeCode = null,
     string? Caller = null,
-    string? Codec = null);
+    string? Codec = null,
+    bool Retryable = false);

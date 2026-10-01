@@ -1,5 +1,6 @@
 using System.Net;
 using Microsoft.Extensions.Logging;
+using NAudio.CoreAudioApi;
 using NAudio.Wave;
 using SIPSorcery.Media;
 using SIPSorcery.Net;
@@ -13,15 +14,24 @@ namespace DebtFlow.SipAgent.Host;
 
 public sealed class SipRuntime : ISipRuntime
 {
+    private static readonly TimeSpan OutboundCallTimeout = TimeSpan.FromSeconds(60);
+    private static readonly TimeSpan AnswerTimeout = TimeSpan.FromSeconds(30);
     private readonly ILogger<SipRuntime> _logger;
     private readonly SIPTransport _transport;
     private readonly SIPUserAgent _userAgent;
+    private readonly SemaphoreSlim _mediaGate = new(1, 1);
+    private readonly object _audioNotificationGate = new();
+    private readonly MMDeviceEnumerator? _audioDeviceEnumerator;
+    private readonly MMDeviceNotificationClient? _audioNotificationClient;
     private SIPRegistrationUserAgent? _registrationAgent;
     private SIPServerUserAgent? _pendingIncomingCall;
     private WindowsAudioEndPoint? _audioEndPoint;
     private VoIPMediaSession? _mediaSession;
     private AudioExtrasSource? _fallbackAudioSource;
     private SipConfiguration? _configuration;
+    private CancellationTokenSource? _audioNotificationDebounce;
+    private bool _useTcp;
+    private int _registrationGeneration;
     private bool _disposed;
 
     public SipRuntime(ILogger<SipRuntime> logger)
@@ -29,9 +39,25 @@ public sealed class SipRuntime : ISipRuntime
         _logger = logger;
         _transport = new SIPTransport();
         _transport.AddSIPChannel(new SIPUDPChannel(new IPEndPoint(IPAddress.Any, 0)));
+        _transport.AddSIPChannel(new SIPTCPChannel(new IPEndPoint(IPAddress.Any, 0)));
         _userAgent = new SIPUserAgent(_transport, null, true);
         WireUserAgentEvents();
-        AudioState = WaveIn.DeviceCount > 0 && WaveOut.DeviceCount > 0 ? "ready" : "degraded";
+        AudioState = GetAudioState();
+        try
+        {
+            _audioDeviceEnumerator = new MMDeviceEnumerator();
+            _audioNotificationClient = _audioDeviceEnumerator.CreateNotificationClient(false);
+            _audioNotificationClient.DeviceStateChanged += (_, _) => ScheduleAudioInventoryRefresh();
+            _audioNotificationClient.DeviceAdded += (_, _) => ScheduleAudioInventoryRefresh();
+            _audioNotificationClient.DeviceRemoved += (_, _) => ScheduleAudioInventoryRefresh();
+            _audioNotificationClient.DefaultDeviceChanged += (_, _) => ScheduleAudioInventoryRefresh();
+        }
+        catch (Exception exception)
+        {
+            _logger.LogWarning(
+                "Audio device notifications are unavailable because of {ErrorType}",
+                exception.GetType().Name);
+        }
         _logger.LogInformation(
             "Audio inventory: captureDevices={CaptureCount}, playbackDevices={PlaybackCount}",
             WaveIn.DeviceCount,
@@ -47,6 +73,8 @@ public sealed class SipRuntime : ISipRuntime
         ObjectDisposedException.ThrowIf(_disposed, this);
         cancellationToken.ThrowIfCancellationRequested();
         _configuration = configuration;
+        _useTcp = false;
+        _registrationGeneration++;
         return Task.CompletedTask;
     }
 
@@ -56,21 +84,46 @@ public sealed class SipRuntime : ISipRuntime
         cancellationToken.ThrowIfCancellationRequested();
         SipConfiguration configuration = RequireConfiguration();
         _registrationAgent?.Stop();
-        _registrationAgent = new SIPRegistrationUserAgent(
+        int generation = ++_registrationGeneration;
+        var registrationAgent = new SIPRegistrationUserAgent(
             _transport,
             configuration.Username,
             configuration.Password,
-            SipEndpointFormatter.FormatRegistrar(configuration),
+            SipEndpointFormatter.FormatRegistrar(configuration, _useTcp),
             180);
+        _registrationAgent = registrationAgent;
 
-        _registrationAgent.RegistrationFailed += async (_, _, _) =>
-            await EmitAsync(new SipSignal(SipSignalType.RegistrationFailed, SafeCode: "registration_failed"));
-        _registrationAgent.RegistrationTemporaryFailure += async (_, _, _) =>
-            await EmitAsync(new SipSignal(SipSignalType.RegistrationFailed, SafeCode: "registration_temporary_failure"));
-        _registrationAgent.RegistrationRemoved += async (_, _) =>
-            await EmitAsync(new SipSignal(SipSignalType.RegistrationUnregistered, SafeCode: "registration_removed"));
-        _registrationAgent.RegistrationSuccessful += async (_, _) =>
-            await EmitAsync(new SipSignal(SipSignalType.RegistrationRegistered));
+        registrationAgent.RegistrationFailed += async (_, _, _) =>
+            await EmitRegistrationSignalAsync(
+                generation,
+                new SipSignal(SipSignalType.RegistrationFailed, SafeCode: "registration_failed"));
+        registrationAgent.RegistrationTemporaryFailure += async (_, _, _) =>
+        {
+            if (generation == _registrationGeneration && !_useTcp)
+            {
+                _useTcp = true;
+                _logger.LogInformation("SIP registration transport changed to {Transport}", "tcp");
+            }
+
+            await EmitRegistrationSignalAsync(
+                generation,
+                new SipSignal(
+                    SipSignalType.RegistrationFailed,
+                    SafeCode: "registration_transport_failure",
+                    Retryable: true));
+        };
+        registrationAgent.RegistrationRemoved += async (_, _) =>
+            await EmitRegistrationSignalAsync(
+                generation,
+                new SipSignal(
+                    SipSignalType.RegistrationFailed,
+                    SafeCode: "registration_transport_lost",
+                    Retryable: true));
+        registrationAgent.RegistrationSuccessful += async (_, _) =>
+        {
+            _logger.LogInformation("SIP registration succeeded over {Transport}", _useTcp ? "tcp" : "udp");
+            await EmitRegistrationSignalAsync(generation, new SipSignal(SipSignalType.RegistrationRegistered));
+        };
 
         _ = EmitAsync(new SipSignal(SipSignalType.RegistrationRegistering));
         _registrationAgent.Start();
@@ -80,6 +133,7 @@ public sealed class SipRuntime : ISipRuntime
     public Task StopRegistrationAsync(CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
+        _registrationGeneration++;
         _registrationAgent?.Stop();
         _registrationAgent = null;
         _configuration = null;
@@ -91,13 +145,31 @@ public sealed class SipRuntime : ISipRuntime
         ObjectDisposedException.ThrowIf(_disposed, this);
         SipConfiguration configuration = RequireConfiguration();
         VoIPMediaSession mediaSession = CreateMediaSession();
-        string destinationUri = $"sip:{destination}@{SipEndpointFormatter.FormatRegistrar(configuration)}";
+        string destinationUri = SipEndpointFormatter.FormatDestination(configuration, destination, _useTcp);
 
-        bool result = await _userAgent.Call(
-            destinationUri,
-            configuration.Username,
-            configuration.Password,
-            mediaSession);
+        bool result;
+        try
+        {
+            result = await _userAgent.Call(
+                    destinationUri,
+                    configuration.Username,
+                    configuration.Password,
+                    mediaSession)
+                .WaitAsync(OutboundCallTimeout, cancellationToken);
+        }
+        catch (TimeoutException)
+        {
+            _userAgent.Cancel();
+            await CleanupMediaAsync();
+            await EmitAsync(new SipSignal(SipSignalType.CallFailed, SafeCode: "call_timeout"));
+            return;
+        }
+        catch (OperationCanceledException)
+        {
+            _userAgent.Cancel();
+            await CleanupMediaAsync();
+            throw;
+        }
 
         if (result)
         {
@@ -117,7 +189,18 @@ public sealed class SipRuntime : ISipRuntime
         SIPServerUserAgent incoming = _pendingIncomingCall
             ?? throw new InvalidOperationException("No incoming call is pending.");
         _pendingIncomingCall = null;
-        bool answered = await _userAgent.Answer(incoming, CreateMediaSession());
+        bool answered;
+        try
+        {
+            answered = await _userAgent.Answer(incoming, CreateMediaSession())
+                .WaitAsync(AnswerTimeout, cancellationToken);
+        }
+        catch (TimeoutException)
+        {
+            await CleanupMediaAsync();
+            await EmitAsync(new SipSignal(SipSignalType.CallFailed, SafeCode: "answer_timeout"));
+            return;
+        }
         await EmitAsync(answered
             ? new SipSignal(SipSignalType.CallConnected)
             : new SipSignal(SipSignalType.CallFailed, SafeCode: "answer_failed"));
@@ -188,6 +271,7 @@ public sealed class SipRuntime : ISipRuntime
         }
 
         _disposed = true;
+        _registrationGeneration++;
         _registrationAgent?.Stop();
         if (_userAgent.IsCallActive)
         {
@@ -195,8 +279,17 @@ public sealed class SipRuntime : ISipRuntime
         }
 
         await CleanupMediaAsync();
+        lock (_audioNotificationGate)
+        {
+            _audioNotificationDebounce?.Cancel();
+            _audioNotificationDebounce?.Dispose();
+            _audioNotificationDebounce = null;
+        }
+        _audioNotificationClient?.Dispose();
+        _audioDeviceEnumerator?.Dispose();
         _transport.Shutdown();
         _configuration = null;
+        _mediaGate.Dispose();
     }
 
     private void WireUserAgentEvents()
@@ -331,9 +424,14 @@ public sealed class SipRuntime : ISipRuntime
 
     private async Task CleanupMediaAsync()
     {
+        await _mediaGate.WaitAsync();
+        VoIPMediaSession? mediaSession = _mediaSession;
+        _mediaSession = null;
+        _fallbackAudioSource = null;
+        _audioEndPoint = null;
         try
         {
-            _mediaSession?.Close("call ended");
+            mediaSession?.Close("call ended");
         }
         catch (Exception exception)
         {
@@ -341,13 +439,74 @@ public sealed class SipRuntime : ISipRuntime
         }
         finally
         {
-            _mediaSession = null;
-            _fallbackAudioSource = null;
-            _audioEndPoint = null;
+            try
+            {
+                mediaSession?.Dispose();
+            }
+            catch (Exception exception)
+            {
+                _logger.LogWarning("Media disposal failed with {ErrorType}", exception.GetType().Name);
+            }
+
+            _mediaGate.Release();
+        }
+    }
+
+    private void ScheduleAudioInventoryRefresh()
+    {
+        if (_disposed)
+        {
+            return;
         }
 
-        await Task.CompletedTask;
+        CancellationToken token;
+        lock (_audioNotificationGate)
+        {
+            _audioNotificationDebounce?.Cancel();
+            _audioNotificationDebounce?.Dispose();
+            _audioNotificationDebounce = new CancellationTokenSource();
+            token = _audioNotificationDebounce.Token;
+        }
+
+        _ = RefreshAudioInventoryAfterDebounceAsync(token);
     }
+
+    private async Task RefreshAudioInventoryAfterDebounceAsync(CancellationToken cancellationToken)
+    {
+        try
+        {
+            await Task.Delay(TimeSpan.FromMilliseconds(500), cancellationToken);
+            string previous = AudioState;
+            AudioState = GetAudioState();
+            _logger.LogInformation(
+                "Audio inventory changed: captureDevices={CaptureCount}, playbackDevices={PlaybackCount}, state={State}",
+                WaveIn.DeviceCount,
+                WaveOut.DeviceCount,
+                AudioState);
+            await EmitAsync(new SipSignal(SipSignalType.AudioInventoryChanged, SafeCode: "audio_devices_changed"));
+            if (AudioState == "degraded" && previous != AudioState && _userAgent.IsCallActive)
+            {
+                await EmitAsync(new SipSignal(SipSignalType.MediaDegraded, SafeCode: "audio_device_removed"));
+            }
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+        }
+        catch (Exception exception)
+        {
+            _logger.LogWarning(
+                "Audio inventory refresh failed because of {ErrorType}",
+                exception.GetType().Name);
+        }
+    }
+
+    private Task EmitRegistrationSignalAsync(int generation, SipSignal signal) =>
+        generation == _registrationGeneration && !_disposed
+            ? EmitAsync(signal)
+            : Task.CompletedTask;
+
+    private static string GetAudioState() =>
+        WaveIn.DeviceCount > 0 && WaveOut.DeviceCount > 0 ? "ready" : "degraded";
 
     private async Task EmitAsync(SipSignal signal)
     {

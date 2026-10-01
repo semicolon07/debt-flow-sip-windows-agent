@@ -14,6 +14,9 @@
   <data name="Disconnected" xml:space="preserve"><value>ไม่ได้เชื่อมต่อ</value></data>
   <data name="Idle" xml:space="preserve"><value>ว่าง</value></data>
   <data name="OpenLogs" xml:space="preserve"><value>เปิดโฟลเดอร์ Log</value></data>
+  <data name="ExportDiagnostics" xml:space="preserve"><value>ส่งออกข้อมูลวิเคราะห์ที่ปกปิดข้อมูลแล้ว</value></data>
+  <data name="DiagnosticExported" xml:space="preserve"><value>ส่งออกชุดข้อมูลวิเคราะห์แล้วที่: {0}</value></data>
+  <data name="DiagnosticExportFailed" xml:space="preserve"><value>ไม่สามารถส่งออกชุดข้อมูลวิเคราะห์ได้</value></data>
   <data name="StartWithWindows" xml:space="preserve"><value>เปิดพร้อม Windows</value></data>
   <data name="Exit" xml:space="preserve"><value>ออก</value></data>
   <data name="ExitTitle" xml:space="preserve"><value>ออกจาก SIP Agent</value></data>

@@ -15,12 +15,13 @@ public sealed class SafeJsonLoggerProviderTests
             ILogger logger = provider.CreateLogger("test");
 
             logger.LogInformation(
-                "Operation used {Password}, {Username}, {ContextToken}, {Destination}, {DtmfDigit} and safe {Code}",
+                "Operation used {Password}, {Username}, {ContextToken}, {Destination}, {DtmfDigit}, {Origin} and safe {Code}",
                 "secret-value",
                 "sip-user-42",
                 "opaque-context-token",
                 "0812345678",
                 "9",
+                "https://portal.customer.example",
                 "registration_failed");
             logger.Log(
                 LogLevel.Warning,
@@ -41,6 +42,7 @@ public sealed class SafeJsonLoggerProviderTests
             Assert.DoesNotContain("plain-secret", content, StringComparison.Ordinal);
             Assert.DoesNotContain("0899999999", content, StringComparison.Ordinal);
             Assert.DoesNotContain("another-secret", content, StringComparison.Ordinal);
+            Assert.DoesNotContain("portal.customer.example", content, StringComparison.Ordinal);
             Assert.DoesNotContain("Raw library state", content, StringComparison.Ordinal);
             Assert.DoesNotContain("\"9\"", content, StringComparison.Ordinal);
             Assert.Contains("[REDACTED]", content, StringComparison.Ordinal);

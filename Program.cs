@@ -87,7 +87,7 @@ public static class Program
         singleInstance.StartActivationServer();
         string logDirectory = AgentStoragePaths.LogDirectory;
         var logProvider = new SafeJsonLoggerProvider(logDirectory, options.ConsoleMode);
-        (IAgentEventStore eventStore, bool durableStoreAvailable) = await AgentEventStoreFactory.CreateAsync(
+        (IAgentEventStore eventStore, bool durableStoreAvailable, string? storageFailureCode) = await AgentEventStoreFactory.CreateAsync(
             AgentStoragePaths.DatabasePath,
             CancellationToken.None);
 
@@ -108,6 +108,7 @@ public static class Program
         builder.Services.AddSingleton(options);
         builder.Services.AddSingleton<IStartupRegistrationManager, StartupRegistrationManager>();
         builder.Services.AddSingleton<IAgentEventStore>(eventStore);
+        builder.Services.AddSingleton(new DiagnosticBundleExporter(logDirectory));
         builder.Services.AddSingleton<WebSocketEventPublisher>();
         builder.Services.AddSingleton<IAgentEventPublisher>(provider => provider.GetRequiredService<WebSocketEventPublisher>());
         builder.Services.AddSingleton<IAgentClock, SystemAgentClock>();
@@ -124,7 +125,7 @@ public static class Program
             durableStoreAvailable,
             provider.GetRequiredService<IAgentDelay>(),
             AgentRuntimeOptions.OwnerDisconnectGrace,
-            options.ConfigurationError));
+            storageFailureCode ?? options.ConfigurationError));
         builder.Services.AddSingleton<V1CommandDispatcher>();
         builder.Services.AddSingleton<LocalWebSocketServer>();
 
@@ -138,7 +139,8 @@ public static class Program
         });
         SIPSorcery.LogFactory.Set(sipLoggerFactory);
 
-        _ = app.Services.GetRequiredService<AgentCoordinator>();
+        AgentCoordinator coordinator = app.Services.GetRequiredService<AgentCoordinator>();
+        await coordinator.InitializeAsync(CancellationToken.None);
         LocalWebSocketServer webSocketServer = app.Services.GetRequiredService<LocalWebSocketServer>();
         app.UseWebSockets(new WebSocketOptions { KeepAliveInterval = Protocol.ProtocolConstants.HeartbeatInterval });
         app.Map("/agent/v1", webSocketServer.HandleAsync);
@@ -154,7 +156,9 @@ public static class Program
             options.AllowedOrigins.Count);
         if (!durableStoreAvailable)
         {
-            logger.LogError("Durable event store is unavailable; registration and calls are blocked");
+            logger.LogError(
+                "Durable event store is unavailable with code {Code}; registration and calls are blocked",
+                storageFailureCode ?? "outbox_unavailable");
         }
 
         if (options.ConfigurationError != null)
@@ -206,13 +210,15 @@ public static class Program
                 singleInstance,
                 options,
                 app.Services.GetRequiredService<ILogger<TrayApplicationContext>>(),
+                eventStore,
+                app.Services.GetRequiredService<DiagnosticBundleExporter>(),
                 logDirectory,
                 startupRegistrationFailed);
             System.Windows.Forms.Application.Run(tray);
         }
 
         using var shutdown = new CancellationTokenSource(TimeSpan.FromSeconds(10));
-        await app.Services.GetRequiredService<AgentCoordinator>().ShutdownAsync(shutdown.Token);
+        await coordinator.ShutdownAsync(shutdown.Token);
         await app.StopAsync(shutdown.Token);
         logger.LogInformation("Debt Flow SIP Agent stopped");
         return 0;

@@ -14,14 +14,6 @@ public sealed class SafeJsonLoggerProvider : ILoggerProvider
     private readonly bool _writeConsole;
     private StreamWriter? _writer;
     private string? _currentPath;
-    private static readonly Regex SensitiveAssignment = new(
-        @"(?i)\b(password|authorization|username|credential|secret|token|destination|caller|remoteParty|dtmf|digit|sdp|sipHeader)\b\s*[:=]?\s*[^\s,;]+",
-        RegexOptions.CultureInvariant,
-        TimeSpan.FromMilliseconds(100));
-    private static readonly Regex LongNumber = new(
-        @"(?<!\d)\d{7,}(?!\d)",
-        RegexOptions.CultureInvariant,
-        TimeSpan.FromMilliseconds(100));
 
     public SafeJsonLoggerProvider(string directory, bool writeConsole)
     {
@@ -65,7 +57,7 @@ public sealed class SafeJsonLoggerProvider : ILoggerProvider
                 json.WriteNumber("eventId", eventId.Id);
             }
 
-            json.WriteString("messageTemplate", SanitizeText(template));
+            json.WriteString("messageTemplate", SafeLogSanitizer.Sanitize(template));
             if (exception != null)
             {
                 json.WriteString("exceptionType", exception.GetType().Name);
@@ -172,7 +164,7 @@ public sealed class SafeJsonLoggerProvider : ILoggerProvider
         }
         else
         {
-            json.WriteString(safeKey, SanitizeText(Convert.ToString(value, System.Globalization.CultureInfo.InvariantCulture) ?? string.Empty));
+            json.WriteString(safeKey, SafeLogSanitizer.Sanitize(Convert.ToString(value, System.Globalization.CultureInfo.InvariantCulture) ?? string.Empty));
         }
     }
 
@@ -191,14 +183,8 @@ public sealed class SafeJsonLoggerProvider : ILoggerProvider
                normalized.Contains("dtmf", StringComparison.Ordinal) ||
                normalized.Contains("digit", StringComparison.Ordinal) ||
                normalized.Contains("sdp", StringComparison.Ordinal) ||
-               normalized.Contains("sipheader", StringComparison.Ordinal);
-    }
-
-    private static string SanitizeText(string value)
-    {
-        string bounded = value.Length <= 1024 ? value : value[..1024];
-        string assignmentsRemoved = SensitiveAssignment.Replace(bounded, "$1=[REDACTED]");
-        return LongNumber.Replace(assignmentsRemoved, "[REDACTED]");
+               normalized.Contains("sipheader", StringComparison.Ordinal) ||
+               normalized.Contains("origin", StringComparison.Ordinal);
     }
 
     private sealed class SafeJsonLogger(SafeJsonLoggerProvider owner, string category) : ILogger
@@ -218,5 +204,29 @@ public sealed class SafeJsonLoggerProvider : ILoggerProvider
                 owner.Write(category, logLevel, eventId, state, exception);
             }
         }
+    }
+}
+
+public static class SafeLogSanitizer
+{
+    private static readonly Regex SensitiveAssignment = new(
+        @"(?i)\b(password|authorization|username|credential|secret|token|destination|caller|remoteParty|dtmf|digit|sdp|sipHeader)\b\s*[:=]?\s*[^\s,;]+",
+        RegexOptions.CultureInvariant,
+        TimeSpan.FromMilliseconds(100));
+    private static readonly Regex LongNumber = new(
+        @"(?<!\d)\d{7,}(?!\d)",
+        RegexOptions.CultureInvariant,
+        TimeSpan.FromMilliseconds(100));
+    private static readonly Regex WebOrigin = new(
+        @"(?i)https?://[^\s\"",]+",
+        RegexOptions.CultureInvariant,
+        TimeSpan.FromMilliseconds(100));
+
+    public static string Sanitize(string value)
+    {
+        string bounded = value.Length <= 4096 ? value : value[..4096];
+        string assignmentsRemoved = SensitiveAssignment.Replace(bounded, "$1=[REDACTED]");
+        string originsRemoved = WebOrigin.Replace(assignmentsRemoved, "[ORIGIN_REDACTED]");
+        return LongNumber.Replace(originsRemoved, "[REDACTED]");
     }
 }

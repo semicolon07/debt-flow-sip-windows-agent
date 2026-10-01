@@ -2,7 +2,7 @@
 
 วันที่: 01/10/2026
 
-สถานะ: **Source implementation complete — Windows/PBX smoke pending**
+สถานะ: **Historical source audit — superseded for phase acceptance by P1 owner closure on 01/10/2026**
 
 ## Implemented
 

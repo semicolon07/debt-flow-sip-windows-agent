@@ -9,6 +9,7 @@ public static class AgentStoragePaths
     public static string ConfigurationPath => Path.Combine(RootDirectory, "agentsettings.json");
     public static string DatabasePath => Path.Combine(RootDirectory, "agent-v1.db");
     public static string LogDirectory => Path.Combine(RootDirectory, "Logs");
+    public static string DiagnosticDirectory => Path.Combine(RootDirectory, "Diagnostics");
 
     private static string ResolveLocalApplicationData()
     {
@@ -24,7 +25,7 @@ public static class AgentStoragePaths
 
 public static class AgentEventStoreFactory
 {
-    public static async Task<(IAgentEventStore Store, bool Available)> CreateAsync(
+    public static async Task<(IAgentEventStore Store, bool Available, string? FailureCode)> CreateAsync(
         string databasePath,
         CancellationToken cancellationToken)
     {
@@ -32,12 +33,17 @@ public static class AgentEventStoreFactory
         try
         {
             await store.InitializeAsync(cancellationToken);
-            return (store, true);
+            return (store, true, null);
+        }
+        catch (AgentStoreException exception)
+        {
+            await store.DisposeAsync();
+            return (new UnavailableAgentEventStore(exception.ErrorCode), false, exception.ErrorCode);
         }
         catch (Exception exception) when (exception is not OperationCanceledException)
         {
             await store.DisposeAsync();
-            return (new UnavailableAgentEventStore(), false);
+            return (new UnavailableAgentEventStore("outbox_unavailable"), false, "outbox_unavailable");
         }
     }
 }

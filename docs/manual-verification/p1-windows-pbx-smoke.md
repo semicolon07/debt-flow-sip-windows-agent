@@ -1,5 +1,9 @@
 # P1 Windows/PBX verification checklist
 
+สถานะ phase: **P1 complete by owner acceptance on 01/10/2026** หลังยืนยันว่า Agent ทำงานปกติ
+บน Windows กับ PBX Sandbox. ไม่มี granular result attachment ถูกส่งเข้า repository จึงไม่เติม
+PASS/FAIL ราย case โดยสมมติ; checklist นี้คงไว้เป็น regression source สำหรับ P2 และ release gate.
+
 ใช้กับ self-contained `win-x64` artifact บน Windows 10 1809+ และ Windows 11 โดยใช้ test PBX account เท่านั้น.
 ห้ามใส่ password, เบอร์เต็ม, SDP หรือ SIP headers ใน screenshot/result document
 
