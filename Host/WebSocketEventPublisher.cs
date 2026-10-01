@@ -1,65 +1,281 @@
 using System.Net.WebSockets;
+using System.Threading.Channels;
 using DebtFlow.SipAgent.Application;
 using DebtFlow.SipAgent.Protocol;
 
 namespace DebtFlow.SipAgent.Host;
 
-public sealed class WebSocketEventPublisher : IAgentEventPublisher
+public sealed class WebSocketEventPublisher : IAgentEventPublisher, IAsyncDisposable
 {
-    private readonly SemaphoreSlim _sendGate = new(1, 1);
-    private WebSocket? _socket;
+    private const int OutboundCapacity = 256;
+    private Session? _session;
 
-    public bool TryAttach(WebSocket socket) => Interlocked.CompareExchange(ref _socket, socket, null) == null;
+    public bool IsConnected => Volatile.Read(ref _session) != null;
 
-    public void Detach(WebSocket socket)
+    public bool TryAttach(WebSocket socket, CancellationToken applicationToken)
     {
-        Interlocked.CompareExchange(ref _socket, null, socket);
+        var session = new Session(socket, applicationToken);
+        if (Interlocked.CompareExchange(ref _session, session, null) == null)
+        {
+            session.Start();
+            return true;
+        }
+
+        session.DisposeAsync().AsTask().GetAwaiter().GetResult();
+        return false;
+    }
+
+    public async Task DetachAsync(WebSocket socket)
+    {
+        Session? current = Volatile.Read(ref _session);
+        if (current == null || !ReferenceEquals(current.Socket, socket))
+        {
+            return;
+        }
+
+        if (Interlocked.CompareExchange(ref _session, null, current) == current)
+        {
+            await current.DisposeAsync();
+        }
     }
 
     public Task PublishDurableAsync(StoredDurableEvent storedEvent, CancellationToken cancellationToken) =>
         SendAsync(
             ProtocolCodec.Serialize("event", storedEvent.EventType, storedEvent.ToPayload()),
-            cancellationToken);
+            cancellationToken,
+            deferUntilActive: true,
+            durableSequence: storedEvent.Sequence);
 
     public Task PublishRealtimeAsync(
         string eventType,
         RealtimeEventPayload payload,
         CancellationToken cancellationToken) =>
-        SendAsync(ProtocolCodec.Serialize("event", eventType, payload), cancellationToken);
+        SendAsync(
+            ProtocolCodec.Serialize("event", eventType, payload),
+            cancellationToken,
+            deferUntilActive: true);
 
-    public Task SendControlAsync<T>(
-        string kind,
-        string type,
-        T payload,
-        CancellationToken cancellationToken) =>
+    public Task SendReplayAsync(StoredDurableEvent storedEvent, CancellationToken cancellationToken) =>
+        SendAsync(
+            ProtocolCodec.Serialize("event", storedEvent.EventType, storedEvent.ToPayload()),
+            cancellationToken,
+            waitForDelivery: true);
+
+    public Task SendControlAsync<T>(string kind, string type, T payload, CancellationToken cancellationToken) =>
         SendAsync(ProtocolCodec.Serialize(kind, type, payload), cancellationToken);
 
-    public async Task SendRawAsync(byte[] message, CancellationToken cancellationToken) =>
-        await SendAsync(message, cancellationToken);
+    public Task SendControlAndWaitAsync<T>(string kind, string type, T payload, CancellationToken cancellationToken) =>
+        SendAsync(ProtocolCodec.Serialize(kind, type, payload), cancellationToken, waitForDelivery: true);
 
-    private async Task SendAsync(byte[] message, CancellationToken cancellationToken)
+    public Task SendRawAsync(byte[] message, CancellationToken cancellationToken) => SendAsync(message, cancellationToken);
+
+    public void Activate(WebSocket socket, long replayedThroughSequence)
     {
-        WebSocket? socket = Volatile.Read(ref _socket);
-        if (socket is not { State: WebSocketState.Open })
+        Session? current = Volatile.Read(ref _session);
+        if (current != null && ReferenceEquals(current.Socket, socket))
         {
-            return;
+            current.Activate(replayedThroughSequence);
+        }
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        Session? current = Interlocked.Exchange(ref _session, null);
+        if (current != null)
+        {
+            await current.DisposeAsync();
+        }
+    }
+
+    private Task SendAsync(
+        byte[] message,
+        CancellationToken cancellationToken,
+        bool waitForDelivery = false,
+        bool deferUntilActive = false,
+        long? durableSequence = null)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        Session? session = Volatile.Read(ref _session);
+        if (session == null)
+        {
+            return Task.CompletedTask;
         }
 
-        await _sendGate.WaitAsync(cancellationToken);
-        try
+        var outbound = new OutboundMessage(
+            message,
+            waitForDelivery ? new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously) : null,
+            durableSequence);
+        if (!session.TryEnqueue(outbound, deferUntilActive))
         {
-            if (socket.State == WebSocketState.Open)
+            session.Abort();
+            return waitForDelivery
+                ? Task.FromException(new WebSocketException("outbound_queue_full"))
+                : Task.CompletedTask;
+        }
+
+        return outbound.Completion?.Task.WaitAsync(cancellationToken) ?? Task.CompletedTask;
+    }
+
+    private sealed record OutboundMessage(byte[] Payload, TaskCompletionSource? Completion, long? DurableSequence);
+
+    private sealed class Session : IAsyncDisposable
+    {
+        private readonly CancellationTokenSource _shutdown;
+        private readonly object _stateGate = new();
+        private readonly Queue<OutboundMessage> _deferred = new();
+        private bool _active;
+        private Task? _writerTask;
+
+        public Session(WebSocket socket, CancellationToken applicationToken)
+        {
+            Socket = socket;
+            _shutdown = CancellationTokenSource.CreateLinkedTokenSource(applicationToken);
+            Outbound = Channel.CreateBounded<OutboundMessage>(new BoundedChannelOptions(OutboundCapacity)
             {
-                await socket.SendAsync(message, WebSocketMessageType.Text, true, cancellationToken);
+                SingleReader = true,
+                SingleWriter = false,
+                FullMode = BoundedChannelFullMode.Wait,
+                AllowSynchronousContinuations = false
+            });
+        }
+
+        public WebSocket Socket { get; }
+        public Channel<OutboundMessage> Outbound { get; }
+
+        public void Start() => _writerTask = WriteLoopAsync();
+
+        public bool TryEnqueue(OutboundMessage message, bool deferUntilActive)
+        {
+            lock (_stateGate)
+            {
+                if (deferUntilActive && !_active)
+                {
+                    if (_deferred.Count >= OutboundCapacity)
+                    {
+                        return false;
+                    }
+
+                    _deferred.Enqueue(message);
+                    return true;
+                }
+
+                return Outbound.Writer.TryWrite(message);
             }
         }
-        catch (WebSocketException)
+
+        public void Activate(long replayedThroughSequence)
         {
-            // The receive loop owns disconnect handling. Durable events remain in the outbox.
+            bool overflow = false;
+            lock (_stateGate)
+            {
+                if (_active)
+                {
+                    return;
+                }
+
+                _active = true;
+                while (_deferred.TryDequeue(out OutboundMessage? message))
+                {
+                    if (message.DurableSequence <= replayedThroughSequence)
+                    {
+                        message.Completion?.TrySetResult();
+                        continue;
+                    }
+
+                    if (!Outbound.Writer.TryWrite(message))
+                    {
+                        message.Completion?.TrySetException(new WebSocketException("outbound_queue_full"));
+                        overflow = true;
+                        break;
+                    }
+                }
+
+                while (overflow && _deferred.TryDequeue(out OutboundMessage? pending))
+                {
+                    pending.Completion?.TrySetException(new WebSocketException("outbound_queue_full"));
+                }
+            }
+
+            if (overflow)
+            {
+                Abort();
+            }
         }
-        finally
+
+        public void Abort()
         {
-            _sendGate.Release();
+            _shutdown.Cancel();
+            Socket.Abort();
+        }
+
+        public async ValueTask DisposeAsync()
+        {
+            lock (_stateGate)
+            {
+                while (_deferred.TryDequeue(out OutboundMessage? pending))
+                {
+                    pending.Completion?.TrySetCanceled();
+                }
+            }
+
+            Outbound.Writer.TryComplete();
+            _shutdown.Cancel();
+            if (_writerTask != null)
+            {
+                try
+                {
+                    await _writerTask;
+                }
+                catch (OperationCanceledException)
+                {
+                }
+                catch (WebSocketException)
+                {
+                }
+                catch (ObjectDisposedException)
+                {
+                }
+            }
+
+            _shutdown.Dispose();
+        }
+
+        private async Task WriteLoopAsync()
+        {
+            try
+            {
+                await foreach (OutboundMessage message in Outbound.Reader.ReadAllAsync(_shutdown.Token))
+                {
+                    if (Socket.State != WebSocketState.Open)
+                    {
+                        message.Completion?.TrySetException(new WebSocketException("socket_not_open"));
+                        return;
+                    }
+
+                    try
+                    {
+                        await Socket.SendAsync(message.Payload, WebSocketMessageType.Text, true, _shutdown.Token);
+                        message.Completion?.TrySetResult();
+                    }
+                    catch (OperationCanceledException exception)
+                    {
+                        message.Completion?.TrySetCanceled(exception.CancellationToken);
+                        throw;
+                    }
+                    catch (Exception exception) when (exception is WebSocketException or ObjectDisposedException)
+                    {
+                        message.Completion?.TrySetException(exception);
+                        throw;
+                    }
+                }
+            }
+            finally
+            {
+                while (Outbound.Reader.TryRead(out OutboundMessage? pending))
+                {
+                    pending.Completion?.TrySetCanceled();
+                }
+            }
         }
     }
 }

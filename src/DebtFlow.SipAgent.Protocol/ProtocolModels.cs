@@ -7,6 +7,8 @@ public static class ProtocolConstants
 {
     public const int Version = 1;
     public const int MaximumMessageBytes = 64 * 1024;
+    public const int MaximumMessagesPerWindow = 60;
+    public static readonly TimeSpan MessageRateWindow = TimeSpan.FromSeconds(10);
     public static readonly TimeSpan HeartbeatInterval = TimeSpan.FromSeconds(15);
     public static readonly TimeSpan ClientTimeout = TimeSpan.FromSeconds(45);
 }
@@ -20,6 +22,8 @@ public sealed record ProtocolEnvelope(
     JsonElement Payload);
 
 public sealed record HelloPayload(string PortalVersion, IReadOnlyList<int> SupportedProtocolVersions);
+
+public sealed record EmptyPayload;
 
 public sealed record CommandHeader(string CommandId);
 
@@ -96,6 +100,7 @@ public static class ProtocolJson
         DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
         PropertyNameCaseInsensitive = false,
         UnmappedMemberHandling = JsonUnmappedMemberHandling.Disallow,
+        RespectRequiredConstructorParameters = true,
         WriteIndented = false
     };
 }

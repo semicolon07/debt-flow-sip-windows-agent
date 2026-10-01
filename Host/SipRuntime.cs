@@ -60,7 +60,7 @@ public sealed class SipRuntime : ISipRuntime
             _transport,
             configuration.Username,
             configuration.Password,
-            Registrar(configuration),
+            SipEndpointFormatter.FormatRegistrar(configuration),
             180);
 
         _registrationAgent.RegistrationFailed += async (_, _, _) =>
@@ -83,7 +83,7 @@ public sealed class SipRuntime : ISipRuntime
         _registrationAgent?.Stop();
         _registrationAgent = null;
         _configuration = null;
-        return EmitAsync(new SipSignal(SipSignalType.RegistrationUnregistered, SafeCode: "registration_stopped"));
+        return Task.CompletedTask;
     }
 
     public async Task StartCallAsync(string destination, CancellationToken cancellationToken)
@@ -91,7 +91,7 @@ public sealed class SipRuntime : ISipRuntime
         ObjectDisposedException.ThrowIf(_disposed, this);
         SipConfiguration configuration = RequireConfiguration();
         VoIPMediaSession mediaSession = CreateMediaSession();
-        string destinationUri = $"sip:{destination}@{Registrar(configuration)}";
+        string destinationUri = $"sip:{destination}@{SipEndpointFormatter.FormatRegistrar(configuration)}";
 
         bool result = await _userAgent.Call(
             destinationUri,
@@ -129,6 +129,16 @@ public sealed class SipRuntime : ISipRuntime
         SIPServerUserAgent incoming = _pendingIncomingCall
             ?? throw new InvalidOperationException("No incoming call is pending.");
         incoming.Reject(SIPResponseStatusCodesEnum.BusyHere, "Rejected");
+        _pendingIncomingCall = null;
+        return Task.CompletedTask;
+    }
+
+    public Task RejectUnavailableAsync(CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        SIPServerUserAgent incoming = _pendingIncomingCall
+            ?? throw new InvalidOperationException("No incoming call is pending.");
+        incoming.Reject(SIPResponseStatusCodesEnum.TemporarilyUnavailable, "Temporarily unavailable");
         _pendingIncomingCall = null;
         return Task.CompletedTask;
     }
@@ -339,15 +349,28 @@ public sealed class SipRuntime : ISipRuntime
         await Task.CompletedTask;
     }
 
-    private Task EmitAsync(SipSignal signal)
+    private async Task EmitAsync(SipSignal signal)
     {
         Func<SipSignal, Task>? handler = Signal;
-        return handler == null ? Task.CompletedTask : handler(signal);
+        if (handler == null)
+        {
+            return;
+        }
+
+        try
+        {
+            await handler(signal);
+        }
+        catch (Exception exception)
+        {
+            _logger.LogWarning(
+                "SIP signal {SignalType} could not be processed because of {ErrorType}",
+                signal.Type,
+                exception.GetType().Name);
+        }
     }
 
     private SipConfiguration RequireConfiguration() =>
         _configuration ?? throw new InvalidOperationException("SIP runtime is not configured.");
 
-    private static string Registrar(SipConfiguration configuration) =>
-        configuration.Port == 5060 ? configuration.Host : $"{configuration.Host}:{configuration.Port}";
 }

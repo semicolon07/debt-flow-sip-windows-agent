@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="utf-8"?>
+<root>
+  <resheader name="resmimetype"><value>text/microsoft-resx</value></resheader>
+  <resheader name="version"><value>2.0</value></resheader>
+  <resheader name="reader"><value>System.Resources.ResXResourceReader, System.Windows.Forms</value></resheader>
+  <resheader name="writer"><value>System.Resources.ResXResourceWriter, System.Windows.Forms</value></resheader>
+  <data name="AppName" xml:space="preserve"><value>Debt Flow SIP Agent</value></data>
+  <data name="AgentStatus" xml:space="preserve"><value>Agent: {0}</value></data>
+  <data name="PortalStatus" xml:space="preserve"><value>Portal: {0}</value></data>
+  <data name="RegistrationStatus" xml:space="preserve"><value>SIP: {0}</value></data>
+  <data name="CallStatus" xml:space="preserve"><value>สายโทร: {0}</value></data>
+  <data name="AudioStatus" xml:space="preserve"><value>เสียง: {0}</value></data>
+  <data name="Connected" xml:space="preserve"><value>เชื่อมต่อแล้ว</value></data>
+  <data name="Disconnected" xml:space="preserve"><value>ไม่ได้เชื่อมต่อ</value></data>
+  <data name="Idle" xml:space="preserve"><value>ว่าง</value></data>
+  <data name="OpenLogs" xml:space="preserve"><value>เปิดโฟลเดอร์ Log</value></data>
+  <data name="StartWithWindows" xml:space="preserve"><value>เปิดพร้อม Windows</value></data>
+  <data name="Exit" xml:space="preserve"><value>ออก</value></data>
+  <data name="ExitTitle" xml:space="preserve"><value>ออกจาก SIP Agent</value></data>
+  <data name="ExitActiveCall" xml:space="preserve"><value>กำลังมีสายสนทนา ต้องการวางสายและออกหรือไม่</value></data>
+  <data name="ActionRequired" xml:space="preserve"><value>ต้องดำเนินการ</value></data>
+  <data name="SecondInstance" xml:space="preserve"><value>SIP Agent เปิดอยู่แล้วสำหรับผู้ใช้ Windows คนนี้</value></data>
+  <data name="StartupFailed" xml:space="preserve"><value>ไม่สามารถแก้ไขการเปิดพร้อม Windows ได้</value></data>
+  <data name="ConfigurationInvalid" xml:space="preserve"><value>ยังไม่มีหรือตั้งค่า Portal Origin ไม่ถูกต้อง</value></data>
+  <data name="RegistrationFailed" xml:space="preserve"><value>ลงทะเบียน SIP ไม่สำเร็จ กรุณาเปิด Portal เพื่อลองใหม่หรือตรวจสอบการตั้งค่า</value></data>
+  <data name="PortUnavailable" xml:space="preserve"><value>พอร์ตภายในเครื่องของ SIP Agent ไม่พร้อมใช้งาน</value></data>
+  <data name="AgentStartFailed" xml:space="preserve"><value>ไม่สามารถเปิด SIP Agent ได้ กรุณาตรวจสอบ Log หรือติดต่อผู้ดูแลระบบ</value></data>
+  <data name="StateStarting" xml:space="preserve"><value>กำลังเริ่ม</value></data>
+  <data name="StateReady" xml:space="preserve"><value>พร้อมใช้งาน</value></data>
+  <data name="StateDegraded" xml:space="preserve"><value>ต้องดำเนินการ</value></data>
+  <data name="StateStopping" xml:space="preserve"><value>กำลังหยุด</value></data>
+  <data name="StateUnconfigured" xml:space="preserve"><value>ยังไม่ได้ตั้งค่า</value></data>
+  <data name="StateUnregistered" xml:space="preserve"><value>ยังไม่ได้ลงทะเบียน</value></data>
+  <data name="StateRegistering" xml:space="preserve"><value>กำลังลงทะเบียน</value></data>
+  <data name="StateRegistered" xml:space="preserve"><value>ลงทะเบียนแล้ว</value></data>
+  <data name="StateUnregistering" xml:space="preserve"><value>กำลังยกเลิกการลงทะเบียน</value></data>
+  <data name="StateRetrying" xml:space="preserve"><value>กำลังลองใหม่</value></data>
+  <data name="StateFailed" xml:space="preserve"><value>ไม่สำเร็จ</value></data>
+  <data name="StateCalling" xml:space="preserve"><value>กำลังโทร</value></data>
+  <data name="StateDialing" xml:space="preserve"><value>กำลังโทร</value></data>
+  <data name="StateTrying" xml:space="preserve"><value>กำลังเชื่อมต่อสาย</value></data>
+  <data name="StateRinging" xml:space="preserve"><value>กำลังเรียก</value></data>
+  <data name="StateIncoming" xml:space="preserve"><value>สายเข้า</value></data>
+  <data name="StateAnswering" xml:space="preserve"><value>กำลังรับสาย</value></data>
+  <data name="StateConnected" xml:space="preserve"><value>เชื่อมต่อสายแล้ว</value></data>
+  <data name="StateEnding" xml:space="preserve"><value>กำลังวางสาย</value></data>
+  <data name="StateEnded" xml:space="preserve"><value>สิ้นสุดแล้ว</value></data>
+  <data name="StateUnknown" xml:space="preserve"><value>ไม่ทราบสถานะ</value></data>
+</root>

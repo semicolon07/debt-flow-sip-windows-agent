@@ -1,133 +1,221 @@
+using System.Net;
+using Microsoft.AspNetCore.Builder;
+using Microsoft.AspNetCore.Hosting;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using SIPSorcery;
 using DebtFlow.SipAgent.Application;
-using DebtFlow.SipAgent.Host;
-using DebtFlow.SipAgent.Persistence;
 
-using var shutdown = new CancellationTokenSource();
-Console.CancelKeyPress += (_, eventArgs) =>
-{
-    eventArgs.Cancel = true;
-    shutdown.Cancel();
-};
+namespace DebtFlow.SipAgent.Host;
 
-using ILoggerFactory loggerFactory = LoggerFactory.Create(builder =>
+public static class Program
 {
-    builder.SetMinimumLevel(LogLevel.Information);
-    builder.AddSimpleConsole(options =>
+    [STAThread]
+    public static int Main(string[] args)
     {
-        options.SingleLine = true;
-        options.TimestampFormat = "yyyy-MM-ddTHH:mm:ss.fffZ ";
-        options.UseUtcTimestamp = true;
-    });
-});
-
-using ILoggerFactory sipLoggerFactory = LoggerFactory.Create(builder =>
-{
-    builder.SetMinimumLevel(LogLevel.Warning);
-    builder.AddProvider(new ForwardingLoggerProvider(loggerFactory));
-});
-SIPSorcery.LogFactory.Set(sipLoggerFactory);
-
-ILogger logger = loggerFactory.CreateLogger("DebtFlow.SipAgent");
-string databasePath = ResolveDatabasePath();
-IReadOnlySet<string> allowedOrigins = ResolveAllowedOrigins(args);
-
-logger.LogInformation("Starting Debt Flow SIP Agent protocol V1");
-logger.LogInformation("Allowed WebSocket origins: {OriginCount}", allowedOrigins.Count);
-
-IAgentEventStore eventStore = await CreateEventStoreAsync(databasePath, logger, shutdown.Token);
-await using IAgentEventStore eventStoreLifetime = eventStore;
-bool durableStoreAvailable = eventStore is SqliteAgentEventStore;
-var publisher = new WebSocketEventPublisher();
-await using var sipRuntime = new SipRuntime(loggerFactory.CreateLogger<SipRuntime>());
-await using var coordinator = new AgentCoordinator(
-    sipRuntime,
-    eventStore,
-    publisher,
-    new SystemAgentClock(),
-    new GuidAgentIdGenerator(),
-    durableStoreAvailable);
-var dispatcher = new V1CommandDispatcher(coordinator, eventStore, new SystemAgentClock());
-await using var server = new LocalWebSocketServer(
-    coordinator,
-    eventStore,
-    publisher,
-    dispatcher,
-    loggerFactory.CreateLogger<LocalWebSocketServer>(),
-    allowedOrigins);
-
-try
-{
-    await server.RunAsync(shutdown.Token);
-}
-catch (OperationCanceledException) when (shutdown.IsCancellationRequested)
-{
-}
-
-logger.LogInformation("Debt Flow SIP Agent stopped");
-
-static string ResolveDatabasePath()
-{
-    string root = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
-    if (string.IsNullOrWhiteSpace(root))
-    {
-        throw new InvalidOperationException("Local application data directory is unavailable.");
-    }
-
-    return Path.Combine(root, "DebtFlow", "SipAgent", "agent-v1.db");
-}
-
-static IReadOnlySet<string> ResolveAllowedOrigins(string[] arguments)
-{
-    var configured = new HashSet<string>(StringComparer.Ordinal)
-    {
-        "http://localhost:8765",
-        "http://127.0.0.1:8765"
-    };
-
-    for (int index = 0; index < arguments.Length; index++)
-    {
-        if (!string.Equals(arguments[index], "--allowed-origin", StringComparison.Ordinal) || index + 1 >= arguments.Length)
+        AgentRuntimeOptions options;
+        try
         {
-            continue;
+            options = AgentRuntimeOptions.Load(args);
+        }
+        catch (AgentConfigurationException exception)
+        {
+            bool consoleRequested = args.Contains("--console", StringComparer.Ordinal);
+            if (consoleRequested)
+            {
+                ConsoleSession.EnsureAttached();
+                Console.Error.WriteLine(exception.Code);
+            }
+            else
+            {
+                MessageBox.Show(exception.Code, "Debt Flow SIP Agent", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+
+            return 2;
         }
 
-        if (Uri.TryCreate(arguments[++index], UriKind.Absolute, out Uri? origin) &&
-            (origin.Scheme == Uri.UriSchemeHttp || origin.Scheme == Uri.UriSchemeHttps))
+        if (options.ConsoleMode)
         {
-            configured.Add(origin.GetLeftPart(UriPartial.Authority));
+            ConsoleSession.EnsureAttached();
+        }
+        else
+        {
+            ApplicationConfiguration.Initialize();
+        }
+
+        try
+        {
+            return RunAsync(options).GetAwaiter().GetResult();
+        }
+        catch (Exception exception)
+        {
+            if (options.ConsoleMode)
+            {
+                Console.Error.WriteLine($"agent_start_failed:{exception.GetType().Name}");
+            }
+            else
+            {
+                MessageBox.Show(
+                    TrayText.Get("AgentStartFailed"),
+                    TrayText.Get("ActionRequired"),
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Error);
+            }
+
+            return 1;
         }
     }
 
-    return configured;
-}
+    private static async Task<int> RunAsync(AgentRuntimeOptions options)
+    {
+        await using SingleInstanceCoordinator singleInstance = SingleInstanceCoordinator.Create();
+        if (!singleInstance.IsPrimary)
+        {
+            try
+            {
+                using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(3));
+                await singleInstance.SignalPrimaryAsync(timeout.Token);
+            }
+            catch (Exception exception) when (exception is IOException or TimeoutException or OperationCanceledException)
+            {
+            }
 
-static async Task<IAgentEventStore> CreateEventStoreAsync(
-    string databasePath,
-    ILogger logger,
-    CancellationToken cancellationToken)
-{
-    var store = new SqliteAgentEventStore(databasePath);
-    try
-    {
-        await store.InitializeAsync(cancellationToken);
-        return store;
-    }
-    catch (Exception exception) when (exception is not OperationCanceledException)
-    {
-        await store.DisposeAsync();
-        logger.LogError(
-            "Durable event store is unavailable ({ErrorType}); agent starts degraded and blocks SIP registration/calls",
-            exception.GetType().Name);
-        return new UnavailableAgentEventStore();
-    }
-}
+            return 0;
+        }
 
-sealed class ForwardingLoggerProvider(ILoggerFactory loggerFactory) : ILoggerProvider
-{
-    public ILogger CreateLogger(string categoryName) => loggerFactory.CreateLogger(categoryName);
-    public void Dispose()
-    {
+        singleInstance.StartActivationServer();
+        string logDirectory = AgentStoragePaths.LogDirectory;
+        var logProvider = new SafeJsonLoggerProvider(logDirectory, options.ConsoleMode);
+        (IAgentEventStore eventStore, bool durableStoreAvailable) = await AgentEventStoreFactory.CreateAsync(
+            AgentStoragePaths.DatabasePath,
+            CancellationToken.None);
+
+        WebApplicationBuilder builder = WebApplication.CreateSlimBuilder(new WebApplicationOptions
+        {
+            Args = [],
+            ApplicationName = typeof(Program).Assembly.GetName().Name
+        });
+        builder.Logging.ClearProviders();
+        builder.Logging.SetMinimumLevel(LogLevel.Information);
+        builder.Logging.AddProvider(logProvider);
+        builder.WebHost.ConfigureKestrel(server =>
+        {
+            server.AddServerHeader = false;
+            server.ListenLocalhost(AgentRuntimeOptions.Port);
+        });
+
+        builder.Services.AddSingleton(options);
+        builder.Services.AddSingleton<IStartupRegistrationManager, StartupRegistrationManager>();
+        builder.Services.AddSingleton<IAgentEventStore>(eventStore);
+        builder.Services.AddSingleton<WebSocketEventPublisher>();
+        builder.Services.AddSingleton<IAgentEventPublisher>(provider => provider.GetRequiredService<WebSocketEventPublisher>());
+        builder.Services.AddSingleton<IAgentClock, SystemAgentClock>();
+        builder.Services.AddSingleton<IAgentIdGenerator, GuidAgentIdGenerator>();
+        builder.Services.AddSingleton<IAgentDelay, SystemAgentDelay>();
+        builder.Services.AddSingleton<SipRuntime>();
+        builder.Services.AddSingleton<ISipRuntime>(provider => provider.GetRequiredService<SipRuntime>());
+        builder.Services.AddSingleton(provider => new AgentCoordinator(
+            provider.GetRequiredService<ISipRuntime>(),
+            provider.GetRequiredService<IAgentEventStore>(),
+            provider.GetRequiredService<IAgentEventPublisher>(),
+            provider.GetRequiredService<IAgentClock>(),
+            provider.GetRequiredService<IAgentIdGenerator>(),
+            durableStoreAvailable,
+            provider.GetRequiredService<IAgentDelay>(),
+            AgentRuntimeOptions.OwnerDisconnectGrace,
+            options.ConfigurationError));
+        builder.Services.AddSingleton<V1CommandDispatcher>();
+        builder.Services.AddSingleton<LocalWebSocketServer>();
+
+        await using WebApplication app = builder.Build();
+        ILoggerFactory loggerFactory = app.Services.GetRequiredService<ILoggerFactory>();
+        ILogger logger = loggerFactory.CreateLogger("DebtFlow.SipAgent");
+        using ILoggerFactory sipLoggerFactory = LoggerFactory.Create(logging =>
+        {
+            logging.SetMinimumLevel(LogLevel.Warning);
+            logging.AddProvider(new RedactingSipLoggerProvider(loggerFactory));
+        });
+        SIPSorcery.LogFactory.Set(sipLoggerFactory);
+
+        _ = app.Services.GetRequiredService<AgentCoordinator>();
+        LocalWebSocketServer webSocketServer = app.Services.GetRequiredService<LocalWebSocketServer>();
+        app.UseWebSockets(new WebSocketOptions { KeepAliveInterval = Protocol.ProtocolConstants.HeartbeatInterval });
+        app.Map("/agent/v1", webSocketServer.HandleAsync);
+        app.MapFallback(context =>
+        {
+            context.Response.StatusCode = (int)HttpStatusCode.NotFound;
+            return Task.CompletedTask;
+        });
+
+        logger.LogInformation(
+            "Starting Debt Flow SIP Agent V1 in {Mode} mode with {OriginCount} allowed origins",
+            options.ConsoleMode ? "console" : "tray",
+            options.AllowedOrigins.Count);
+        if (!durableStoreAvailable)
+        {
+            logger.LogError("Durable event store is unavailable; registration and calls are blocked");
+        }
+
+        if (options.ConfigurationError != null)
+        {
+            logger.LogWarning("Agent configuration is degraded with code {Code}", options.ConfigurationError);
+        }
+
+        try
+        {
+            await app.StartAsync();
+        }
+        catch (Exception exception) when (exception is IOException or InvalidOperationException)
+        {
+            logger.LogError("Local WebSocket listener failed with {ErrorType}", exception.GetType().Name);
+            if (!options.ConsoleMode)
+            {
+                MessageBox.Show(
+                    TrayText.Get("PortUnavailable"),
+                    TrayText.Get("ActionRequired"),
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Error);
+            }
+
+            return 3;
+        }
+
+        if (options.ConsoleMode)
+        {
+            await app.WaitForShutdownAsync();
+        }
+        else
+        {
+            IStartupRegistrationManager startup = app.Services.GetRequiredService<IStartupRegistrationManager>();
+            bool startupRegistrationFailed = false;
+            try
+            {
+                startup.InitializeDefault();
+            }
+            catch (Exception exception) when (exception is UnauthorizedAccessException or IOException or InvalidOperationException)
+            {
+                startupRegistrationFailed = true;
+                logger.LogWarning("Automatic startup registration failed with {ErrorType}", exception.GetType().Name);
+            }
+
+            using var tray = new TrayApplicationContext(
+                app.Services.GetRequiredService<AgentCoordinator>(),
+                webSocketServer,
+                startup,
+                singleInstance,
+                options,
+                app.Services.GetRequiredService<ILogger<TrayApplicationContext>>(),
+                logDirectory,
+                startupRegistrationFailed);
+            System.Windows.Forms.Application.Run(tray);
+        }
+
+        using var shutdown = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        await app.Services.GetRequiredService<AgentCoordinator>().ShutdownAsync(shutdown.Token);
+        await app.StopAsync(shutdown.Token);
+        logger.LogInformation("Debt Flow SIP Agent stopped");
+        return 0;
     }
+
 }

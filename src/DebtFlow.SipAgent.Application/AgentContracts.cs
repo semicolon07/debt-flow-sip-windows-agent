@@ -8,6 +8,16 @@ public interface IAgentClock
     DateTimeOffset UtcNow { get; }
 }
 
+public interface IAgentDelay
+{
+    Task DelayAsync(TimeSpan delay, CancellationToken cancellationToken);
+}
+
+public sealed class SystemAgentDelay : IAgentDelay
+{
+    public Task DelayAsync(TimeSpan delay, CancellationToken cancellationToken) => Task.Delay(delay, cancellationToken);
+}
+
 public sealed class SystemAgentClock : IAgentClock
 {
     public DateTimeOffset UtcNow => DateTimeOffset.UtcNow;
@@ -102,6 +112,7 @@ public interface ISipRuntime : IAsyncDisposable
     Task StartCallAsync(string destination, CancellationToken cancellationToken);
     Task AnswerAsync(CancellationToken cancellationToken);
     Task RejectAsync(CancellationToken cancellationToken);
+    Task RejectUnavailableAsync(CancellationToken cancellationToken);
     Task HangupAsync(CancellationToken cancellationToken);
     Task SendDtmfAsync(char digit, CancellationToken cancellationToken);
 }

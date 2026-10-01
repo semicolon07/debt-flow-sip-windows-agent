@@ -1,6 +1,7 @@
 name: ci
 
 on:
+  workflow_dispatch:
   push:
     branches: [main]
   pull_request:
@@ -23,7 +24,9 @@ jobs:
       - uses: actions/setup-dotnet@v4
         with:
           dotnet-version: 10.0.x
-      - run: dotnet restore softphone-native-client.sln --locked-mode
-      - run: dotnet build softphone-native-client.sln -c Release --no-restore
-      - run: dotnet test tests/DebtFlow.SipAgent.Core.Tests/DebtFlow.SipAgent.Core.Tests.csproj -c Release --no-build
-      - run: dotnet list softphone-native-client.csproj package --vulnerable --include-transitive
+      - shell: pwsh
+        run: ./scripts/verify-p1-windows.ps1 -OutputRoot artifacts/p1-windows
+      - uses: actions/upload-artifact@v4
+        with:
+          name: debt-flow-sip-agent-win-x64
+          path: artifacts/p1-windows/**

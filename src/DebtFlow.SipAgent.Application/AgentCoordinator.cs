@@ -1,20 +1,34 @@
 using System.Text.Json;
+using System.Threading.Channels;
+using System.Net;
+using System.Net.Sockets;
 using DebtFlow.SipAgent.Protocol;
 
 namespace DebtFlow.SipAgent.Application;
 
 public sealed class AgentCoordinator : IAsyncDisposable
 {
+    private const int QueueCapacity = 512;
     private readonly ISipRuntime _sipRuntime;
     private readonly IAgentEventStore _eventStore;
     private readonly IAgentEventPublisher _publisher;
     private readonly IAgentClock _clock;
     private readonly IAgentIdGenerator _ids;
-    private readonly SemaphoreSlim _gate = new(1, 1);
+    private readonly IAgentDelay _delay;
+    private readonly TimeSpan _ownerDisconnectGrace;
+    private readonly Channel<CoordinatorWorkItem> _work;
+    private readonly CancellationTokenSource _lifetime = new();
+    private readonly Task _processor;
     private readonly string _agentSessionId;
+    private Task _ownerLeaseExpiration = Task.CompletedTask;
     private RegistrationState _registrationState = RegistrationState.Unconfigured;
     private CallSessionState? _call;
-    private string _agentState = "ready";
+    private string _agentState;
+    private string? _agentStateCode;
+    private bool _portalConnected;
+    private bool _clearCredentialsAfterCall;
+    private long _ownerLeaseGeneration;
+    private int _disposeStarted;
 
     public AgentCoordinator(
         ISipRuntime sipRuntime,
@@ -22,266 +36,409 @@ public sealed class AgentCoordinator : IAsyncDisposable
         IAgentEventPublisher publisher,
         IAgentClock clock,
         IAgentIdGenerator ids,
-        bool durableStoreAvailable = true)
+        bool durableStoreAvailable = true,
+        IAgentDelay? delay = null,
+        TimeSpan? ownerDisconnectGrace = null,
+        string? initialDegradedCode = null)
     {
         _sipRuntime = sipRuntime;
         _eventStore = eventStore;
         _publisher = publisher;
         _clock = clock;
         _ids = ids;
+        _delay = delay ?? new SystemAgentDelay();
+        _ownerDisconnectGrace = ownerDisconnectGrace ?? TimeSpan.FromSeconds(60);
         _agentSessionId = ids.NewId();
-        _agentState = durableStoreAvailable ? "ready" : "degraded";
+        _agentState = durableStoreAvailable && initialDegradedCode == null ? "ready" : "degraded";
+        _agentStateCode = durableStoreAvailable ? initialDegradedCode : "outbox_unavailable";
+        _work = Channel.CreateBounded<CoordinatorWorkItem>(new BoundedChannelOptions(QueueCapacity)
+        {
+            SingleReader = true,
+            SingleWriter = false,
+            FullMode = BoundedChannelFullMode.Wait,
+            AllowSynchronousContinuations = false
+        });
         _sipRuntime.Signal += OnSipSignalAsync;
+        _processor = ProcessAsync();
     }
 
     public string AgentSessionId => _agentSessionId;
     public string AgentInstanceId => _eventStore.AgentInstanceId;
 
-    public async Task ConfigureAsync(ConfigureCommand command, CancellationToken cancellationToken)
+    public Task ConfigureAsync(ConfigureCommand command, CancellationToken cancellationToken) =>
+        EnqueueAsync(token => ConfigureCoreAsync(command, token), cancellationToken);
+
+    public Task StartRegistrationAsync(CancellationToken cancellationToken) =>
+        EnqueueAsync(StartRegistrationCoreAsync, cancellationToken);
+
+    public Task StopRegistrationAsync(CancellationToken cancellationToken) =>
+        EnqueueAsync(StopRegistrationCoreAsync, cancellationToken);
+
+    public Task StartCallAsync(CallStartCommand command, CancellationToken cancellationToken) =>
+        EnqueueAsync(token => StartCallCoreAsync(command, token), cancellationToken);
+
+    public Task AnswerAsync(CallCommand command, CancellationToken cancellationToken) =>
+        EnqueueAsync(token => AnswerCoreAsync(command, token), cancellationToken);
+
+    public Task RejectAsync(CallCommand command, CancellationToken cancellationToken) =>
+        EnqueueAsync(token => RejectCoreAsync(command, token), cancellationToken);
+
+    public Task HangupAsync(CallCommand command, CancellationToken cancellationToken) =>
+        EnqueueAsync(token => HangupCoreAsync(command, token), cancellationToken);
+
+    public Task SendDtmfAsync(DtmfCommand command, CancellationToken cancellationToken) =>
+        EnqueueAsync(token => SendDtmfCoreAsync(command, token), cancellationToken);
+
+    public Task<AgentSnapshotPayload> GetSnapshotAsync(CancellationToken cancellationToken) =>
+        EnqueueAsync(GetSnapshotCoreAsync, cancellationToken);
+
+    public Task PortalConnectedAsync(CancellationToken cancellationToken) =>
+        EnqueueAsync(PortalConnectedCoreAsync, cancellationToken);
+
+    public async Task PortalDisconnectedAsync(CancellationToken cancellationToken)
     {
-        ValidateConfigure(command);
-        bool stopExistingRegistration;
-        await _gate.WaitAsync(cancellationToken);
+        long generation = await EnqueueAsync(PortalDisconnectedCoreAsync, cancellationToken);
+        Volatile.Write(ref _ownerLeaseExpiration, ExpireOwnerLeaseAsync(generation));
+    }
+
+    internal Task WaitForCurrentOwnerLeaseExpirationAsync() =>
+        Volatile.Read(ref _ownerLeaseExpiration);
+
+    public Task ShutdownAsync(CancellationToken cancellationToken) =>
+        EnqueueAsync(ShutdownCoreAsync, cancellationToken, cancelExecution: true);
+
+    public Task MarkDegradedAsync(string code, CancellationToken cancellationToken) =>
+        EnqueueAsync(token => MarkDegradedCoreAsync(code, token), cancellationToken);
+
+    public async ValueTask DisposeAsync()
+    {
+        if (Interlocked.Exchange(ref _disposeStarted, 1) != 0)
+        {
+            return;
+        }
+
         try
         {
-            if (_call is { State: not CallState.Ended })
-            {
-                throw new AgentCommandException("call_invalid_state");
-            }
-
-            stopExistingRegistration = _registrationState is not RegistrationState.Unconfigured and not RegistrationState.Unregistered;
+            using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+            await ShutdownAsync(timeout.Token);
         }
-        finally
+        catch (Exception exception) when (exception is OperationCanceledException or ChannelClosedException)
         {
-            _gate.Release();
         }
 
-        if (stopExistingRegistration)
+        _sipRuntime.Signal -= OnSipSignalAsync;
+        _work.Writer.TryComplete();
+        await _processor;
+        _lifetime.Cancel();
+        await _sipRuntime.DisposeAsync();
+        _lifetime.Dispose();
+    }
+
+    private async Task ConfigureCoreAsync(ConfigureCommand command, CancellationToken cancellationToken)
+    {
+        EnsureOperational();
+        SipConfiguration configuration = ValidateConfigure(command);
+        if (_call is { State: not CallState.Ended })
+        {
+            throw new AgentCommandException("call_invalid_state");
+        }
+
+        if (_registrationState is not RegistrationState.Unconfigured and not RegistrationState.Unregistered)
         {
             await _sipRuntime.StopRegistrationAsync(cancellationToken);
         }
 
-        await _sipRuntime.ConfigureAsync(
-            new SipConfiguration(command.Host.Trim(), command.Port, command.Username.Trim(), command.Password),
-            cancellationToken);
-
-        await _gate.WaitAsync(cancellationToken);
-        try
-        {
-            _registrationState = RegistrationState.Unregistered;
-        }
-        finally
-        {
-            _gate.Release();
-        }
-
+        await _sipRuntime.ConfigureAsync(configuration, cancellationToken);
+        _registrationState = RegistrationState.Unregistered;
         await PublishRealtimeAsync(
             "registration.state_changed",
             new { state = "unregistered", reason = "configured" },
             cancellationToken);
     }
 
-    public async Task StartRegistrationAsync(CancellationToken cancellationToken)
+    private async Task StartRegistrationCoreAsync(CancellationToken cancellationToken)
     {
-        await _gate.WaitAsync(cancellationToken);
-        try
+        EnsureOperational();
+        if (_registrationState == RegistrationState.Unconfigured)
         {
-            if (_agentState != "ready")
-            {
-                throw new AgentCommandException("outbox_unavailable");
-            }
-
-            if (_registrationState == RegistrationState.Unconfigured)
-            {
-                throw new AgentCommandException("agent_not_configured");
-            }
-
-            _registrationState = RegistrationState.Registering;
-        }
-        finally
-        {
-            _gate.Release();
+            throw new AgentCommandException("agent_not_configured");
         }
 
-        await PublishRealtimeAsync(
-            "registration.state_changed",
-            new { state = "registering" },
-            cancellationToken);
+        if (_registrationState is not RegistrationState.Unregistered and not RegistrationState.Failed)
+        {
+            throw new AgentCommandException("registration_unavailable");
+        }
+
+        _registrationState = RegistrationState.Registering;
+        await PublishRealtimeAsync("registration.state_changed", new { state = "registering" }, cancellationToken);
         await _sipRuntime.StartRegistrationAsync(cancellationToken);
     }
 
-    public async Task StopRegistrationAsync(CancellationToken cancellationToken)
+    private async Task StopRegistrationCoreAsync(CancellationToken cancellationToken)
     {
         await _sipRuntime.StopRegistrationAsync(cancellationToken);
-        await _gate.WaitAsync(cancellationToken);
-        try
-        {
-            _registrationState = RegistrationState.Unconfigured;
-        }
-        finally
-        {
-            _gate.Release();
-        }
-
+        _registrationState = RegistrationState.Unconfigured;
         await PublishRealtimeAsync(
             "registration.state_changed",
             new { state = "unconfigured", reason = "stopped" },
             cancellationToken);
     }
 
-    public async Task StartCallAsync(CallStartCommand command, CancellationToken cancellationToken)
+    private async Task StartCallCoreAsync(CallStartCommand command, CancellationToken cancellationToken)
     {
         ProtocolCodec.ValidateUuid(command.CallId, "callId");
-        if (string.IsNullOrWhiteSpace(command.Destination) || command.Destination.Length > 128)
+        if (string.IsNullOrWhiteSpace(command.Destination) || command.Destination.Length > 128 ||
+            string.IsNullOrWhiteSpace(command.ContextToken) || command.ContextToken.Length > 2048)
         {
             throw new AgentCommandException("invalid_message");
         }
 
-        if (string.IsNullOrWhiteSpace(command.ContextToken) || command.ContextToken.Length > 2048)
+        if (_registrationState != RegistrationState.Registered)
         {
-            throw new AgentCommandException("invalid_message");
+            throw new AgentCommandException("registration_unavailable");
         }
 
-        DateTimeOffset now = _clock.UtcNow;
-        await _gate.WaitAsync(cancellationToken);
+        EnsureOperational();
+        if (_call is { State: not CallState.Ended })
+        {
+            throw new AgentCommandException("call_invalid_state");
+        }
+
+        _call = CallReducer.CreateOutbound(
+            command.CallId,
+            command.CommandId,
+            _clock.UtcNow,
+            SensitiveValueMasker.MaskRemoteParty(command.Destination));
         try
         {
-            if (_registrationState != RegistrationState.Registered)
-            {
-                throw new AgentCommandException("registration_unavailable");
-            }
-
-            if (_agentState != "ready")
-            {
-                throw new AgentCommandException("outbox_unavailable");
-            }
-
-            if (_call is { State: not CallState.Ended })
-            {
-                throw new AgentCommandException("call_invalid_state");
-            }
-
-            _call = CallReducer.CreateOutbound(
-                command.CallId,
-                command.CommandId,
-                now,
-                SensitiveValueMasker.MaskRemoteParty(command.Destination));
+            await EmitCallEventAsync(
+                "call.created",
+                _call,
+                new { direction = "outbound", remoteParty = _call.MaskedRemoteParty },
+                cancellationToken);
+            await ApplyCallSignalCoreAsync(
+                new CallSignal(CallSignalType.Dial, _clock.UtcNow),
+                new { direction = "outbound" },
+                cancellationToken);
         }
-        finally
+        catch (AgentCommandException exception) when (exception.ErrorCode == "outbox_unavailable")
         {
-            _gate.Release();
+            _call = null;
+            throw;
         }
-
-        await EmitCallEventAsync("call.created", _call, new
-        {
-            direction = "outbound",
-            remoteParty = _call.MaskedRemoteParty
-        }, cancellationToken);
-        await ApplyCallSignalAsync(
-            new CallSignal(CallSignalType.Dial, now),
-            new { direction = "outbound" },
-            cancellationToken);
-
         _ = RunOutboundCallAsync(command.Destination);
     }
 
-    public async Task AnswerAsync(CallCommand command, CancellationToken cancellationToken)
+    private async Task AnswerCoreAsync(CallCommand command, CancellationToken cancellationToken)
     {
-        EnsureCurrentCall(command.CallId, CallDirection.Inbound);
-        await ApplyCallSignalAsync(
+        CallSessionState call = EnsureCurrentCall(command.CallId, CallDirection.Inbound);
+        if (call.State != CallState.Incoming)
+        {
+            throw new AgentCommandException("call_invalid_state");
+        }
+
+        await ApplyCallSignalCoreAsync(
             new CallSignal(CallSignalType.Answering, _clock.UtcNow),
             new { direction = "inbound" },
             cancellationToken);
         await _sipRuntime.AnswerAsync(cancellationToken);
     }
 
-    public async Task RejectAsync(CallCommand command, CancellationToken cancellationToken)
+    private async Task RejectCoreAsync(CallCommand command, CancellationToken cancellationToken)
     {
-        EnsureCurrentCall(command.CallId, CallDirection.Inbound);
-        await ApplyCallSignalAsync(
+        CallSessionState call = EnsureCurrentCall(command.CallId, CallDirection.Inbound);
+        if (call.State != CallState.Incoming)
+        {
+            throw new AgentCommandException("call_invalid_state");
+        }
+
+        await ApplyCallSignalCoreAsync(
             new CallSignal(CallSignalType.Ending, _clock.UtcNow),
             new { reason = "local_reject" },
             cancellationToken);
         await _sipRuntime.RejectAsync(cancellationToken);
-        await EndCallAsync(CallOutcome.Rejected, "local_reject", cancellationToken);
+        await EndCallCoreAsync(CallOutcome.Rejected, "local_reject", cancellationToken);
     }
 
-    public async Task HangupAsync(CallCommand command, CancellationToken cancellationToken)
+    private async Task HangupCoreAsync(CallCommand command, CancellationToken cancellationToken)
     {
         CallSessionState call = EnsureCurrentCall(command.CallId);
-        await ApplyCallSignalAsync(
+        await ApplyCallSignalCoreAsync(
             new CallSignal(CallSignalType.Ending, _clock.UtcNow),
             new { reason = "local_hangup" },
             cancellationToken);
         await _sipRuntime.HangupAsync(cancellationToken);
-        CallOutcome outcome = call.AnsweredAtUtc.HasValue ? CallOutcome.Completed : CallOutcome.Cancelled;
-        await EndCallAsync(outcome, "local_hangup", cancellationToken);
+        await EndCallCoreAsync(
+            call.AnsweredAtUtc.HasValue ? CallOutcome.Completed : CallOutcome.Cancelled,
+            "local_hangup",
+            cancellationToken);
     }
 
-    public async Task SendDtmfAsync(DtmfCommand command, CancellationToken cancellationToken)
+    private async Task SendDtmfCoreAsync(DtmfCommand command, CancellationToken cancellationToken)
     {
         CallSessionState call = EnsureCurrentCall(command.CallId);
-        if (call.State != CallState.Connected || command.Digit.Length != 1 || !IsValidDtmf(command.Digit[0]))
+        if (call.State != CallState.Connected ||
+            string.IsNullOrEmpty(command.Digit) ||
+            command.Digit.Length != 1 ||
+            !IsValidDtmf(command.Digit[0]))
         {
             throw new AgentCommandException("call_invalid_state");
         }
 
         await _sipRuntime.SendDtmfAsync(command.Digit[0], cancellationToken);
-        await EmitCallEventAsync(
-            "call.dtmf_sent",
-            call,
-            new { success = true },
-            cancellationToken);
+        await EmitCallEventAsync("call.dtmf_sent", call, new { success = true }, cancellationToken);
     }
 
-    public async Task<AgentSnapshotPayload> GetSnapshotAsync(CancellationToken cancellationToken)
+    private async Task<AgentSnapshotPayload> GetSnapshotCoreAsync(CancellationToken cancellationToken)
     {
-        await _gate.WaitAsync(cancellationToken);
+        IReadOnlyList<ActiveCallSnapshot> calls = _call is { State: not CallState.Ended } call
+            ? [new ActiveCallSnapshot(call.CallId, ToWire(call.Direction), ToWire(call.State), call.StartedAtUtc, call.AnsweredAtUtc)]
+            : [];
+        long pendingEventCount;
         try
         {
-            IReadOnlyList<ActiveCallSnapshot> calls = _call is { State: not CallState.Ended } call
-                ? [new ActiveCallSnapshot(
-                    call.CallId,
-                    ToWire(call.Direction),
-                    ToWire(call.State),
-                    call.StartedAtUtc,
-                    call.AnsweredAtUtc)]
-                : [];
-
-            return new AgentSnapshotPayload(
-                _agentState,
-                ToWire(_registrationState),
-                _sipRuntime.AudioState,
-                calls,
-                await _eventStore.CountPendingAsync(cancellationToken),
-                _eventStore.LastSequence);
+            pendingEventCount = await _eventStore.CountPendingAsync(cancellationToken);
         }
-        finally
+        catch (Exception exception) when (exception is not OperationCanceledException)
         {
-            _gate.Release();
+            await MarkDegradedCoreAsync("outbox_unavailable", CancellationToken.None);
+            pendingEventCount = 0;
+        }
+
+        return new AgentSnapshotPayload(
+            _agentState,
+            ToWire(_registrationState),
+            _sipRuntime.AudioState,
+            calls,
+            pendingEventCount,
+            _eventStore.LastSequence);
+    }
+
+    private Task PortalConnectedCoreAsync(CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        _portalConnected = true;
+        _clearCredentialsAfterCall = false;
+        _ownerLeaseGeneration++;
+        return Task.CompletedTask;
+    }
+
+    private Task<long> PortalDisconnectedCoreAsync(CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        _portalConnected = false;
+        return Task.FromResult(++_ownerLeaseGeneration);
+    }
+
+    private async Task ExpireOwnerLeaseCoreAsync(long generation, CancellationToken cancellationToken)
+    {
+        if (_portalConnected || generation != _ownerLeaseGeneration)
+        {
+            return;
+        }
+
+        if (_call is { State: not CallState.Ended })
+        {
+            _clearCredentialsAfterCall = true;
+            return;
+        }
+
+        if (_registrationState != RegistrationState.Unconfigured)
+        {
+            await StopRegistrationCoreAsync(cancellationToken);
         }
     }
 
-    public async ValueTask DisposeAsync()
+    private async Task ShutdownCoreAsync(CancellationToken cancellationToken)
     {
-        _sipRuntime.Signal -= OnSipSignalAsync;
-        _gate.Dispose();
-        await _sipRuntime.DisposeAsync();
+        if (_agentState == "stopping")
+        {
+            return;
+        }
+
+        _agentState = "stopping";
+        _agentStateCode = null;
+        await PublishRealtimeAsync("agent.state_changed", new { state = "stopping" }, cancellationToken);
+        if (_call is { State: not CallState.Ended } active)
+        {
+            try
+            {
+                await _sipRuntime.HangupAsync(cancellationToken);
+            }
+            catch (Exception exception) when (exception is not OperationCanceledException)
+            {
+            }
+
+            try
+            {
+                await EndCallCoreAsync(
+                    active.AnsweredAtUtc.HasValue ? CallOutcome.Completed : CallOutcome.Cancelled,
+                    "agent_shutdown",
+                    cancellationToken);
+            }
+            catch (AgentCommandException exception) when (exception.ErrorCode == "outbox_unavailable")
+            {
+            }
+        }
+
+        if (_registrationState != RegistrationState.Unconfigured)
+        {
+            try
+            {
+                await StopRegistrationCoreAsync(cancellationToken);
+            }
+            catch (Exception exception) when (exception is not OperationCanceledException)
+            {
+                _registrationState = RegistrationState.Unconfigured;
+            }
+        }
+
+        _portalConnected = false;
+        _ownerLeaseGeneration++;
+    }
+
+    private async Task MarkDegradedCoreAsync(string code, CancellationToken cancellationToken)
+    {
+        if (_agentState == "stopping" || (_agentState == "degraded" && string.Equals(_agentStateCode, code, StringComparison.Ordinal)))
+        {
+            return;
+        }
+
+        _agentState = "degraded";
+        _agentStateCode = code;
+        await PublishRealtimeAsync(
+            "agent.state_changed",
+            new { state = "degraded", code },
+            cancellationToken);
     }
 
     private async Task RunOutboundCallAsync(string destination)
     {
         try
         {
-            await _sipRuntime.StartCallAsync(destination, CancellationToken.None);
+            await _sipRuntime.StartCallAsync(destination, _lifetime.Token);
+        }
+        catch (OperationCanceledException) when (_lifetime.IsCancellationRequested)
+        {
         }
         catch
         {
-            await EndCallAsync(CallOutcome.Failed, "sip_runtime_error", CancellationToken.None);
+            try
+            {
+                await EnqueueAsync(
+                    token => EndCallCoreAsync(CallOutcome.Failed, "sip_runtime_error", token),
+                    CancellationToken.None);
+            }
+            catch (ChannelClosedException)
+            {
+            }
         }
     }
 
-    private async Task OnSipSignalAsync(SipSignal signal)
+    private Task OnSipSignalAsync(SipSignal signal) =>
+        EnqueueAsync(token => ApplySipSignalCoreAsync(signal, token), CancellationToken.None);
+
+    private async Task ApplySipSignalCoreAsync(SipSignal signal, CancellationToken cancellationToken)
     {
         switch (signal.Type)
         {
@@ -289,180 +446,126 @@ public sealed class AgentCoordinator : IAsyncDisposable
             case SipSignalType.RegistrationRegistered:
             case SipSignalType.RegistrationUnregistered:
             case SipSignalType.RegistrationFailed:
-                await ApplyRegistrationSignalAsync(signal);
+                _registrationState = RegistrationReducer.Apply(_registrationState, signal.Type);
+                await PublishRealtimeAsync(
+                    "registration.state_changed",
+                    new { state = ToWire(_registrationState), code = signal.SafeCode },
+                    cancellationToken);
                 break;
-
             case SipSignalType.IncomingCall:
-                await StartIncomingCallAsync(signal.Caller);
+                await StartIncomingCallCoreAsync(signal.Caller, cancellationToken);
                 break;
-
             case SipSignalType.CallTrying:
-                await ApplyCallSignalAsync(
-                    new CallSignal(CallSignalType.Trying, _clock.UtcNow),
-                    new { sipStatusCode = signal.SipStatusCode },
-                    CancellationToken.None);
+                await ApplyCallSignalCoreAsync(new CallSignal(CallSignalType.Trying, _clock.UtcNow), new { sipStatusCode = signal.SipStatusCode }, cancellationToken);
                 break;
-
             case SipSignalType.CallRinging:
-                await ApplyCallSignalAsync(
-                    new CallSignal(CallSignalType.Ringing, _clock.UtcNow),
-                    new { sipStatusCode = signal.SipStatusCode },
-                    CancellationToken.None);
+                await ApplyCallSignalCoreAsync(new CallSignal(CallSignalType.Ringing, _clock.UtcNow), new { sipStatusCode = signal.SipStatusCode }, cancellationToken);
                 break;
-
             case SipSignalType.CallConnected:
-                await ApplyCallSignalAsync(
-                    new CallSignal(CallSignalType.Connected, _clock.UtcNow),
-                    new { sipStatusCode = signal.SipStatusCode },
-                    CancellationToken.None);
+                await ApplyCallSignalCoreAsync(new CallSignal(CallSignalType.Connected, _clock.UtcNow), new { sipStatusCode = signal.SipStatusCode }, cancellationToken);
                 break;
-
             case SipSignalType.CallFailed:
-                await EndCallAsync(NormalizeFailure(signal.SipStatusCode), signal.SafeCode ?? "sip_failed", CancellationToken.None);
+                await EndCallCoreAsync(NormalizeFailure(signal.SipStatusCode), signal.SafeCode ?? "sip_failed", cancellationToken);
                 break;
-
             case SipSignalType.CallRemoteEnded:
-                await EndCallAsync(CallOutcome.Completed, "remote_hangup", CancellationToken.None);
+                await EndCallCoreAsync(CallOutcome.Completed, "remote_hangup", cancellationToken);
                 break;
-
             case SipSignalType.IncomingCancelled:
-                await EndCallAsync(CallOutcome.Missed, "remote_cancel", CancellationToken.None);
+                await EndCallCoreAsync(CallOutcome.Missed, "remote_cancel", cancellationToken);
                 break;
-
             case SipSignalType.MediaReady:
-                await EmitForCurrentCallAsync("call.media_ready", new { codec = signal.Codec ?? "unknown" });
+                await EmitForCurrentCallCoreAsync("call.media_ready", new { codec = signal.Codec ?? "unknown" }, cancellationToken);
                 break;
-
             case SipSignalType.MediaDegraded:
                 await PublishRealtimeAsync(
                     "audio.state_changed",
                     new { state = "degraded", code = signal.SafeCode ?? "audio_error" },
-                    CancellationToken.None);
-                await EmitForCurrentCallAsync(
-                    "call.media_degraded",
-                    new { code = signal.SafeCode ?? "audio_error" });
+                    cancellationToken);
+                await EmitForCurrentCallCoreAsync("call.media_degraded", new { code = signal.SafeCode ?? "audio_error" }, cancellationToken);
                 break;
-
             case SipSignalType.DtmfReceived:
-                await EmitForCurrentCallAsync("call.dtmf_received", new { received = true });
+                await EmitForCurrentCallCoreAsync("call.dtmf_received", new { received = true }, cancellationToken);
                 break;
         }
     }
 
-    private async Task ApplyRegistrationSignalAsync(SipSignal signal)
+    private async Task StartIncomingCallCoreAsync(string? caller, CancellationToken cancellationToken)
     {
-        RegistrationState state;
-        await _gate.WaitAsync();
+        if (_call is { State: not CallState.Ended })
+        {
+            return;
+        }
+
+        _call = CallReducer.CreateInbound(_ids.NewId(), _clock.UtcNow, SensitiveValueMasker.MaskRemoteParty(caller));
         try
         {
-            _registrationState = RegistrationReducer.Apply(_registrationState, signal.Type);
-            state = _registrationState;
-        }
-        finally
-        {
-            _gate.Release();
-        }
-
-        await PublishRealtimeAsync(
-            "registration.state_changed",
-            new { state = ToWire(state), code = signal.SafeCode },
-            CancellationToken.None);
-    }
-
-    private async Task StartIncomingCallAsync(string? caller)
-    {
-        CallSessionState incoming;
-        await _gate.WaitAsync();
-        try
-        {
-            if (_call is { State: not CallState.Ended })
-            {
-                return;
-            }
-
-            incoming = CallReducer.CreateInbound(
-                _ids.NewId(),
-                _clock.UtcNow,
-                SensitiveValueMasker.MaskRemoteParty(caller));
-            _call = incoming;
-        }
-        finally
-        {
-            _gate.Release();
-        }
-
-        await EmitCallEventAsync(
-            "call.created",
-            incoming,
-            new { direction = "inbound", remoteParty = incoming.MaskedRemoteParty },
-            CancellationToken.None);
-        await ApplyCallSignalAsync(
-            new CallSignal(CallSignalType.Incoming, _clock.UtcNow),
-            new { direction = "inbound" },
-            CancellationToken.None);
-    }
-
-    private async Task ApplyCallSignalAsync(CallSignal signal, object data, CancellationToken cancellationToken)
-    {
-        CallSessionState? changed = null;
-        await _gate.WaitAsync(cancellationToken);
-        try
-        {
-            if (_call == null)
-            {
-                return;
-            }
-
-            CallTransition transition = CallReducer.Apply(_call, signal);
-            if (!transition.Accepted || !transition.StateChanged)
-            {
-                return;
-            }
-
-            _call = transition.State;
-            changed = _call;
-        }
-        finally
-        {
-            _gate.Release();
-        }
-
-        await EmitCallEventAsync("call.state_changed", changed, data, cancellationToken);
-    }
-
-    private async Task EndCallAsync(CallOutcome outcome, string reason, CancellationToken cancellationToken)
-    {
-        CallSessionState? ended = null;
-        await _gate.WaitAsync(cancellationToken);
-        try
-        {
-            if (_call == null || _call.State == CallState.Ended)
-            {
-                return;
-            }
-
-            CallTransition transition = CallReducer.Apply(
+            await EmitCallEventAsync(
+                "call.created",
                 _call,
-                new CallSignal(CallSignalType.End, _clock.UtcNow, outcome, reason));
-            if (!transition.Accepted || !transition.StateChanged)
-            {
-                return;
-            }
-
-            _call = transition.State;
-            ended = _call;
+                new { direction = "inbound", remoteParty = _call.MaskedRemoteParty },
+                cancellationToken);
+            await ApplyCallSignalCoreAsync(
+                new CallSignal(CallSignalType.Incoming, _clock.UtcNow),
+                new { direction = "inbound" },
+                cancellationToken);
         }
-        finally
+        catch (AgentCommandException exception) when (exception.ErrorCode == "outbox_unavailable")
         {
-            _gate.Release();
+            await _sipRuntime.RejectUnavailableAsync(cancellationToken);
+            _call = null;
+            return;
         }
 
+        if (!_portalConnected)
+        {
+            await ApplyCallSignalCoreAsync(
+                new CallSignal(CallSignalType.Ending, _clock.UtcNow),
+                new { reason = "portal_unavailable" },
+                cancellationToken);
+            await _sipRuntime.RejectUnavailableAsync(cancellationToken);
+            await EndCallCoreAsync(CallOutcome.Rejected, "portal_unavailable", cancellationToken);
+        }
+    }
+
+    private async Task ApplyCallSignalCoreAsync(CallSignal signal, object data, CancellationToken cancellationToken)
+    {
+        if (_call == null)
+        {
+            return;
+        }
+
+        CallTransition transition = CallReducer.Apply(_call, signal);
+        if (!transition.Accepted || !transition.StateChanged)
+        {
+            return;
+        }
+
+        _call = transition.State;
+        await EmitCallEventAsync("call.state_changed", _call, data, cancellationToken);
+    }
+
+    private async Task EndCallCoreAsync(CallOutcome outcome, string reason, CancellationToken cancellationToken)
+    {
+        if (_call == null || _call.State == CallState.Ended)
+        {
+            return;
+        }
+
+        CallTransition transition = CallReducer.Apply(
+            _call,
+            new CallSignal(CallSignalType.End, _clock.UtcNow, outcome, reason));
+        if (!transition.Accepted || !transition.StateChanged)
+        {
+            return;
+        }
+
+        _call = transition.State;
+        CallSessionState ended = _call;
         await EmitCallEventAsync(
             "call.state_changed",
             ended,
             new { outcome = ToWire(outcome), endReason = reason },
             cancellationToken);
-
         long? talkDurationMs = ended.AnsweredAtUtc.HasValue
             ? Math.Max(0, (long)(ended.EndedAtUtc!.Value - ended.AnsweredAtUtc.Value).TotalMilliseconds)
             : null;
@@ -479,26 +582,18 @@ public sealed class AgentCoordinator : IAsyncDisposable
                 totalDurationMs
             },
             cancellationToken);
+
+        if (_clearCredentialsAfterCall && !_portalConnected)
+        {
+            _clearCredentialsAfterCall = false;
+            await StopRegistrationCoreAsync(cancellationToken);
+        }
     }
 
-    private async Task EmitForCurrentCallAsync(string eventType, object data)
-    {
-        CallSessionState? call;
-        await _gate.WaitAsync();
-        try
-        {
-            call = _call is { State: not CallState.Ended } current ? current : null;
-        }
-        finally
-        {
-            _gate.Release();
-        }
-
-        if (call != null)
-        {
-            await EmitCallEventAsync(eventType, call, data, CancellationToken.None);
-        }
-    }
+    private Task EmitForCurrentCallCoreAsync(string eventType, object data, CancellationToken cancellationToken) =>
+        _call is { State: not CallState.Ended } call
+            ? EmitCallEventAsync(eventType, call, data, cancellationToken)
+            : Task.CompletedTask;
 
     private async Task EmitCallEventAsync(
         string eventType,
@@ -506,19 +601,26 @@ public sealed class AgentCoordinator : IAsyncDisposable
         object data,
         CancellationToken cancellationToken)
     {
-        string dataJson = JsonSerializer.Serialize(data, ProtocolJson.Options);
-        StoredDurableEvent stored = await _eventStore.AppendAsync(
-            new DurableEventDraft(
-                _ids.NewId(),
-                _agentSessionId,
-                call.CallId,
-                call.CommandId,
-                eventType,
-                _clock.UtcNow,
-                ToWire(call.State),
-                dataJson),
-            cancellationToken);
-        await _publisher.PublishDurableAsync(stored, cancellationToken);
+        try
+        {
+            StoredDurableEvent stored = await _eventStore.AppendAsync(
+                new DurableEventDraft(
+                    _ids.NewId(),
+                    _agentSessionId,
+                    call.CallId,
+                    call.CommandId,
+                    eventType,
+                    _clock.UtcNow,
+                    ToWire(call.State),
+                    JsonSerializer.Serialize(data, ProtocolJson.Options)),
+                cancellationToken);
+            await _publisher.PublishDurableAsync(stored, cancellationToken);
+        }
+        catch (Exception exception) when (exception is not OperationCanceledException and not AgentCommandException)
+        {
+            await MarkDegradedCoreAsync("outbox_unavailable", CancellationToken.None);
+            throw new AgentCommandException("outbox_unavailable");
+        }
     }
 
     private async Task PublishRealtimeAsync(string type, object data, CancellationToken cancellationToken)
@@ -536,8 +638,62 @@ public sealed class AgentCoordinator : IAsyncDisposable
             cancellationToken);
     }
 
+    private async Task ExpireOwnerLeaseAsync(long generation)
+    {
+        try
+        {
+            await _delay.DelayAsync(_ownerDisconnectGrace, _lifetime.Token);
+            await EnqueueAsync(token => ExpireOwnerLeaseCoreAsync(generation, token), _lifetime.Token);
+        }
+        catch (OperationCanceledException) when (_lifetime.IsCancellationRequested)
+        {
+        }
+        catch (ChannelClosedException)
+        {
+        }
+    }
+
+    private async Task ProcessAsync()
+    {
+        await foreach (CoordinatorWorkItem item in _work.Reader.ReadAllAsync())
+        {
+            await item.ExecuteAsync(_lifetime.Token);
+        }
+    }
+
+    private Task EnqueueAsync(
+        Func<CancellationToken, Task> action,
+        CancellationToken cancellationToken,
+        bool cancelExecution = false) =>
+        EnqueueAsync(async token =>
+        {
+            await action(token);
+            return true;
+        }, cancellationToken, cancelExecution);
+
+    private async Task<T> EnqueueAsync<T>(
+        Func<CancellationToken, Task<T>> action,
+        CancellationToken cancellationToken,
+        bool cancelExecution = false)
+    {
+        var completion = new TaskCompletionSource<T>(TaskCreationOptions.RunContinuationsAsynchronously);
+        await _work.Writer.WriteAsync(
+            new CoordinatorWorkItem<T>(action, completion, cancellationToken, cancelExecution),
+            cancellationToken);
+        return await completion.Task.WaitAsync(cancellationToken);
+    }
+
+    private void EnsureOperational()
+    {
+        if (_agentState != "ready")
+        {
+            throw new AgentCommandException(_agentStateCode ?? "agent_unavailable");
+        }
+    }
+
     private CallSessionState EnsureCurrentCall(string callId, CallDirection? direction = null)
     {
+        ProtocolCodec.ValidateUuid(callId, "callId");
         CallSessionState? call = _call;
         if (call == null || call.State == CallState.Ended || !string.Equals(call.CallId, callId, StringComparison.Ordinal))
         {
@@ -552,15 +708,24 @@ public sealed class AgentCoordinator : IAsyncDisposable
         return call;
     }
 
-    private static void ValidateConfigure(ConfigureCommand command)
+    private static SipConfiguration ValidateConfigure(ConfigureCommand command)
     {
-        if (string.IsNullOrWhiteSpace(command.Host) || command.Host.Length > 255 ||
+        string host = command.Host.Trim();
+        if (!IPAddress.TryParse(host, out IPAddress? address) ||
+            !string.Equals(host, address.ToString(), StringComparison.OrdinalIgnoreCase) ||
+            address.AddressFamily == AddressFamily.InterNetworkV6 && address.ScopeId != 0 ||
             command.Port is < 1 or > 65535 ||
             string.IsNullOrWhiteSpace(command.Username) || command.Username.Length > 128 ||
             string.IsNullOrEmpty(command.Password) || command.Password.Length > 512)
         {
             throw new AgentCommandException("invalid_message");
         }
+
+        return new SipConfiguration(
+            address.ToString(),
+            command.Port,
+            command.Username.Trim(),
+            command.Password);
     }
 
     private static bool IsValidDtmf(char value) =>
@@ -575,6 +740,43 @@ public sealed class AgentCoordinator : IAsyncDisposable
 
     public static string ToWire<T>(T value) where T : struct, Enum =>
         value.ToString().Replace("NoAnswer", "no_answer", StringComparison.Ordinal).ToLowerInvariant();
+
+    private abstract record CoordinatorWorkItem
+    {
+        public abstract Task ExecuteAsync(CancellationToken lifetimeToken);
+    }
+
+    private sealed record CoordinatorWorkItem<T>(
+        Func<CancellationToken, Task<T>> Action,
+        TaskCompletionSource<T> Completion,
+        CancellationToken RequestCancellationToken,
+        bool CancelExecution) : CoordinatorWorkItem
+    {
+        public override async Task ExecuteAsync(CancellationToken lifetimeToken)
+        {
+            if (RequestCancellationToken.IsCancellationRequested)
+            {
+                Completion.TrySetCanceled(RequestCancellationToken);
+                return;
+            }
+
+            try
+            {
+                CancellationToken executionToken = CancelExecution
+                    ? RequestCancellationToken
+                    : lifetimeToken;
+                Completion.TrySetResult(await Action(executionToken));
+            }
+            catch (OperationCanceledException exception)
+            {
+                Completion.TrySetCanceled(exception.CancellationToken);
+            }
+            catch (Exception exception)
+            {
+                Completion.TrySetException(exception);
+            }
+        }
+    }
 }
 
 public sealed class AgentCommandException(string errorCode) : Exception(errorCode)

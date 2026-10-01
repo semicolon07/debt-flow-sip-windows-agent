@@ -1,5 +1,6 @@
 using System.Net;
 using System.Net.WebSockets;
+using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.Logging;
 using DebtFlow.SipAgent.Application;
 using DebtFlow.SipAgent.Protocol;
@@ -12,121 +13,112 @@ public sealed class LocalWebSocketServer(
     WebSocketEventPublisher publisher,
     V1CommandDispatcher dispatcher,
     ILogger<LocalWebSocketServer> logger,
-    IReadOnlySet<string> allowedOrigins) : IAsyncDisposable
+    AgentRuntimeOptions options)
 {
-    private readonly HttpListener _listener = new();
     private int _clientConnected;
 
-    public async Task RunAsync(CancellationToken cancellationToken)
+    public bool IsClientConnected => Volatile.Read(ref _clientConnected) != 0;
+
+    public async Task HandleAsync(HttpContext context)
     {
-        _listener.Prefixes.Add("http://localhost:8443/");
-        _listener.Start();
-        logger.LogInformation("SIP agent listening on ws://localhost:8443/agent/v1");
-
-        using CancellationTokenRegistration registration = cancellationToken.Register(() =>
+        if (!options.IsOperational)
         {
-            try
-            {
-                _listener.Stop();
-            }
-            catch (ObjectDisposedException)
-            {
-            }
-        });
-
-        try
-        {
-            while (!cancellationToken.IsCancellationRequested)
-            {
-                HttpListenerContext context = await _listener.GetContextAsync();
-                _ = ProcessContextAsync(context, cancellationToken);
-            }
-        }
-        catch (HttpListenerException) when (cancellationToken.IsCancellationRequested)
-        {
-        }
-        catch (ObjectDisposedException) when (cancellationToken.IsCancellationRequested)
-        {
-        }
-    }
-
-    public ValueTask DisposeAsync()
-    {
-        _listener.Close();
-        return ValueTask.CompletedTask;
-    }
-
-    private async Task ProcessContextAsync(HttpListenerContext context, CancellationToken applicationToken)
-    {
-        if (!string.Equals(context.Request.Url?.AbsolutePath, "/agent/v1", StringComparison.Ordinal) ||
-            !context.Request.IsWebSocketRequest)
-        {
-            context.Response.StatusCode = (int)HttpStatusCode.NotFound;
-            context.Response.Close();
+            context.Response.StatusCode = (int)HttpStatusCode.ServiceUnavailable;
             return;
         }
 
-        string? origin = context.Request.Headers["Origin"];
-        if (!OriginPolicy.IsAllowed(origin, allowedOrigins))
+        if (context.Request.QueryString.HasValue)
+        {
+            context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
+            return;
+        }
+
+        if (!context.WebSockets.IsWebSocketRequest)
+        {
+            context.Response.StatusCode = (int)HttpStatusCode.NotFound;
+            return;
+        }
+
+        string? origin = context.Request.Headers.Origin.FirstOrDefault();
+        if (!OriginPolicy.IsAllowed(origin, options.AllowedOrigins))
         {
             context.Response.StatusCode = (int)HttpStatusCode.Forbidden;
-            context.Response.Close();
             return;
         }
 
         if (Interlocked.CompareExchange(ref _clientConnected, 1, 0) != 0)
         {
-            context.Response.StatusCode = (int)HttpStatusCode.Conflict;
-            context.Response.Close();
+            using WebSocket rejected = await context.WebSockets.AcceptWebSocketAsync();
+            await SendDirectAsync(
+                rejected,
+                ProtocolCodec.Serialize(
+                    "error",
+                    "protocol.error",
+                    new ErrorPayload(null, "client_already_connected", false)),
+                context.RequestAborted);
+            await rejected.CloseAsync(WebSocketCloseStatus.PolicyViolation, "client_already_connected", context.RequestAborted);
             return;
         }
 
         WebSocket? socket = null;
+        bool portalConnected = false;
+        bool publisherAttached = false;
+        string? correlationMessageId = null;
         try
         {
-            HttpListenerWebSocketContext webSocketContext = await context.AcceptWebSocketAsync(subProtocol: null);
-            socket = webSocketContext.WebSocket;
-            if (!publisher.TryAttach(socket))
-            {
-                await socket.CloseAsync(WebSocketCloseStatus.PolicyViolation, "client_already_connected", applicationToken);
-                return;
-            }
-
-            ProtocolEnvelope hello = await ReceiveAsync(socket, applicationToken);
+            socket = await context.WebSockets.AcceptWebSocketAsync();
+            var rateWindow = new Queue<DateTimeOffset>();
+            ProtocolEnvelope hello = await ReceiveAsync(socket, rateWindow, context.RequestAborted);
+            correlationMessageId = hello.MessageId;
             ValidateHello(hello);
             HelloPayload helloPayload = ProtocolCodec.DeserializePayload<HelloPayload>(hello.Payload);
+            ValidateHelloPayload(helloPayload);
             if (!helloPayload.SupportedProtocolVersions.Contains(ProtocolConstants.Version))
             {
-                await publisher.SendControlAsync(
-                    "error",
-                    "protocol.error",
-                    new ErrorPayload(hello.MessageId, "protocol_version_unsupported", false),
-                    applicationToken);
-                await socket.CloseAsync(WebSocketCloseStatus.PolicyViolation, "protocol_version_unsupported", applicationToken);
+                await SendDirectAsync(
+                    socket,
+                    ProtocolCodec.Serialize(
+                        "error",
+                        "protocol.error",
+                        new ErrorPayload(hello.MessageId, "protocol_version_unsupported", false)),
+                    context.RequestAborted);
+                await socket.CloseAsync(WebSocketCloseStatus.PolicyViolation, "protocol_version_unsupported", context.RequestAborted);
                 return;
             }
 
-            await SendWelcomeAndStateAsync(applicationToken);
-            await ReplayPendingEventsAsync(applicationToken);
-
-            while (socket.State == WebSocketState.Open && !applicationToken.IsCancellationRequested)
+            if (!publisher.TryAttach(socket, context.RequestAborted))
             {
-                ProtocolEnvelope message = await ReceiveAsync(socket, applicationToken);
+                await socket.CloseAsync(WebSocketCloseStatus.PolicyViolation, "client_already_connected", context.RequestAborted);
+                return;
+            }
+
+            publisherAttached = true;
+            await coordinator.PortalConnectedAsync(context.RequestAborted);
+            portalConnected = true;
+            await SendWelcomeAndStateAsync(context.RequestAborted);
+            long replayedThroughSequence = await ReplayPendingEventsAsync(context.RequestAborted);
+            publisher.Activate(socket, replayedThroughSequence);
+
+            while (socket.State == WebSocketState.Open && !context.RequestAborted.IsCancellationRequested)
+            {
+                ProtocolEnvelope message = await ReceiveAsync(socket, rateWindow, context.RequestAborted);
+                correlationMessageId = message.MessageId;
                 if (message.Kind == "ping" && message.Type == "session.ping")
                 {
+                    _ = ProtocolCodec.DeserializePayload<EmptyPayload>(message.Payload);
                     await publisher.SendControlAsync(
                         "pong",
                         "session.pong",
                         new { correlationMessageId = message.MessageId },
-                        applicationToken);
+                        context.RequestAborted);
                     continue;
                 }
 
-                byte[] response = await dispatcher.DispatchAsync(message, applicationToken);
-                await publisher.SendRawAsync(response, applicationToken);
+                byte[] response = await dispatcher.DispatchAsync(message, context.RequestAborted);
+                await publisher.SendRawAsync(response, context.RequestAborted);
                 if (message.Kind == "command" && message.Type == "state.get")
                 {
-                    await SendSnapshotAsync(applicationToken);
+                    await SendSnapshotAsync(context.RequestAborted);
                 }
             }
         }
@@ -135,11 +127,25 @@ public sealed class LocalWebSocketServer(
             logger.LogWarning("WebSocket protocol message rejected with code {Code}", exception.Code);
             if (socket is { State: WebSocketState.Open })
             {
-                await publisher.SendControlAsync(
-                    "error",
-                    "protocol.error",
-                    new ErrorPayload(null, exception.Code, false),
-                    CancellationToken.None);
+                if (publisherAttached)
+                {
+                    await publisher.SendControlAndWaitAsync(
+                        "error",
+                        "protocol.error",
+                        new ErrorPayload(correlationMessageId, exception.Code, false),
+                        CancellationToken.None);
+                }
+                else
+                {
+                    await SendDirectAsync(
+                        socket,
+                        ProtocolCodec.Serialize(
+                            "error",
+                            "protocol.error",
+                            new ErrorPayload(correlationMessageId, exception.Code, false)),
+                        CancellationToken.None);
+                }
+
                 await socket.CloseAsync(WebSocketCloseStatus.InvalidPayloadData, exception.Code, CancellationToken.None);
             }
         }
@@ -162,8 +168,20 @@ public sealed class LocalWebSocketServer(
         {
             if (socket != null)
             {
-                publisher.Detach(socket);
+                await publisher.DetachAsync(socket);
                 socket.Dispose();
+            }
+
+            if (portalConnected)
+            {
+                try
+                {
+                    await coordinator.PortalDisconnectedAsync(CancellationToken.None);
+                }
+                catch (Exception exception) when (exception is not OperationCanceledException)
+                {
+                    logger.LogWarning("Portal disconnect cleanup failed with {ErrorType}", exception.GetType().Name);
+                }
             }
 
             Interlocked.Exchange(ref _clientConnected, 0);
@@ -176,7 +194,7 @@ public sealed class LocalWebSocketServer(
             "welcome",
             "session.welcome",
             new WelcomePayload(
-                typeof(LocalWebSocketServer).Assembly.GetName().Version?.ToString() ?? "1.0.0",
+                GetAgentVersion(),
                 eventStore.AgentInstanceId,
                 coordinator.AgentSessionId,
                 ["sip.register", "call.outbound", "call.inbound", "call.dtmf", "event.durable"],
@@ -186,35 +204,51 @@ public sealed class LocalWebSocketServer(
         await SendSnapshotAsync(cancellationToken);
     }
 
+    private static string GetAgentVersion()
+    {
+        Version? version = typeof(LocalWebSocketServer).Assembly.GetName().Version;
+        return version == null
+            ? "1.0.0"
+            : $"{version.Major}.{version.Minor}.{Math.Max(0, version.Build)}";
+    }
+
     private async Task SendSnapshotAsync(CancellationToken cancellationToken)
     {
         AgentSnapshotPayload snapshot = await coordinator.GetSnapshotAsync(cancellationToken);
         await publisher.SendControlAsync("snapshot", "agent.snapshot", snapshot, cancellationToken);
     }
 
-    private async Task ReplayPendingEventsAsync(CancellationToken cancellationToken)
+    private async Task<long> ReplayPendingEventsAsync(CancellationToken cancellationToken)
     {
-        long afterSequence = eventStore.LastAcknowledgedSequence;
-        while (true)
+        try
         {
-            IReadOnlyList<StoredDurableEvent> page = await eventStore.LoadPendingAsync(
-                afterSequence,
-                250,
-                cancellationToken);
-            if (page.Count == 0)
+            long afterSequence = eventStore.LastAcknowledgedSequence;
+            while (true)
             {
-                return;
-            }
+                IReadOnlyList<StoredDurableEvent> page = await eventStore.LoadPendingAsync(afterSequence, 250, cancellationToken);
+                if (page.Count == 0)
+                {
+                    return afterSequence;
+                }
 
-            foreach (StoredDurableEvent storedEvent in page)
-            {
-                await publisher.PublishDurableAsync(storedEvent, cancellationToken);
-                afterSequence = storedEvent.Sequence;
+                foreach (StoredDurableEvent storedEvent in page)
+                {
+                    await publisher.SendReplayAsync(storedEvent, cancellationToken);
+                    afterSequence = storedEvent.Sequence;
+                }
             }
+        }
+        catch (Exception exception) when (exception is not OperationCanceledException)
+        {
+            await coordinator.MarkDegradedAsync("outbox_unavailable", CancellationToken.None);
+            throw;
         }
     }
 
-    private static async Task<ProtocolEnvelope> ReceiveAsync(WebSocket socket, CancellationToken applicationToken)
+    private static async Task<ProtocolEnvelope> ReceiveAsync(
+        WebSocket socket,
+        Queue<DateTimeOffset> rateWindow,
+        CancellationToken applicationToken)
     {
         using var timeout = CancellationTokenSource.CreateLinkedTokenSource(applicationToken);
         timeout.CancelAfter(ProtocolConstants.ClientTimeout);
@@ -243,14 +277,42 @@ public sealed class LocalWebSocketServer(
         }
         while (!result.EndOfMessage);
 
+        DateTimeOffset now = DateTimeOffset.UtcNow;
+        while (rateWindow.TryPeek(out DateTimeOffset oldest) && now - oldest >= ProtocolConstants.MessageRateWindow)
+        {
+            rateWindow.Dequeue();
+        }
+
+        if (rateWindow.Count >= ProtocolConstants.MaximumMessagesPerWindow)
+        {
+            throw new ProtocolException("rate_limit_exceeded", "Message rate limit exceeded.");
+        }
+
+        rateWindow.Enqueue(now);
         return ProtocolCodec.Deserialize(buffer.ToArray());
     }
+
+    private static Task SendDirectAsync(WebSocket socket, byte[] message, CancellationToken cancellationToken) =>
+        socket.SendAsync(message, WebSocketMessageType.Text, true, cancellationToken);
 
     private static void ValidateHello(ProtocolEnvelope hello)
     {
         if (hello.Kind != "hello" || hello.Type != "session.hello")
         {
             throw new ProtocolException("invalid_message", "The first message must be session.hello.");
+        }
+    }
+
+    private static void ValidateHelloPayload(HelloPayload hello)
+    {
+        if (string.IsNullOrWhiteSpace(hello.PortalVersion) ||
+            hello.PortalVersion.Length > 128 ||
+            hello.SupportedProtocolVersions == null ||
+            hello.SupportedProtocolVersions.Count is < 1 or > 16 ||
+            hello.SupportedProtocolVersions.Any(version => version < 1) ||
+            hello.SupportedProtocolVersions.Distinct().Count() != hello.SupportedProtocolVersions.Count)
+        {
+            throw new ProtocolException("invalid_message", "session.hello payload is invalid.");
         }
     }
 }

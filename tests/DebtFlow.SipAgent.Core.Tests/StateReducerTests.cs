@@ -4,6 +4,27 @@ namespace DebtFlow.SipAgent.Core.Tests;
 
 public sealed class StateReducerTests
 {
+    [Fact]
+    public void RegistrationUnregisteredSignal_DoesNotReintroduceConfigurationAfterExplicitStop()
+    {
+        RegistrationState state = RegistrationReducer.Apply(
+            RegistrationState.Unconfigured,
+            SipSignalType.RegistrationUnregistered);
+
+        Assert.Equal(RegistrationState.Unconfigured, state);
+    }
+
+    [Fact]
+    public void LateRegistrationSuccessOrFailure_DoesNotChangeUnconfiguredState()
+    {
+        Assert.Equal(
+            RegistrationState.Unconfigured,
+            RegistrationReducer.Apply(RegistrationState.Unconfigured, SipSignalType.RegistrationRegistered));
+        Assert.Equal(
+            RegistrationState.Unconfigured,
+            RegistrationReducer.Apply(RegistrationState.Unconfigured, SipSignalType.RegistrationFailed));
+    }
+
     private static readonly DateTimeOffset StartedAt = new(2026, 10, 1, 0, 0, 0, TimeSpan.Zero);
 
     [Fact]

@@ -9,13 +9,17 @@ public sealed class V1CommandDispatcher(
     IAgentEventStore eventStore,
     IAgentClock clock)
 {
+    private static readonly HashSet<string> CallScopedCommandTypes =
+        ["call.start", "call.answer", "call.reject", "call.hangup", "call.dtmf"];
+
     public async Task<byte[]> DispatchAsync(ProtocolEnvelope envelope, CancellationToken cancellationToken)
     {
         if (envelope.Kind == "ack" && envelope.Type == "events.ack")
         {
             AckPayload ack = ProtocolCodec.DeserializePayload<AckPayload>(envelope.Payload);
             ProtocolCodec.ValidateUuid(ack.AgentInstanceId, "agentInstanceId");
-            if (!string.Equals(ack.AgentInstanceId, eventStore.AgentInstanceId, StringComparison.Ordinal))
+            if (ack.AcknowledgedThroughSequence < 0 ||
+                !string.Equals(ack.AgentInstanceId, eventStore.AgentInstanceId, StringComparison.Ordinal))
             {
                 return Error(envelope.MessageId, "invalid_message", false);
             }
@@ -33,6 +37,11 @@ public sealed class V1CommandDispatcher(
             {
                 return Error(envelope.MessageId, exception.Message, false);
             }
+            catch (Exception exception) when (exception is not OperationCanceledException)
+            {
+                await coordinator.MarkDegradedAsync("outbox_unavailable", CancellationToken.None);
+                return Error(envelope.MessageId, "outbox_unavailable", true);
+            }
         }
 
         if (envelope.Kind != "command")
@@ -41,18 +50,29 @@ public sealed class V1CommandDispatcher(
         }
 
         string commandId;
+        string? callId;
         try
         {
             commandId = GetCommandId(envelope);
             ProtocolCodec.ValidateUuid(commandId, "commandId");
+            callId = GetCallIdForFingerprint(envelope);
         }
         catch (ProtocolException exception)
         {
             return Error(envelope.MessageId, exception.Code, false);
         }
 
-        string requestHash = ProtocolCodec.ComputeRequestHash(envelope.Payload);
-        ProcessedCommand? existing = await eventStore.FindCommandAsync(commandId, cancellationToken);
+        string requestHash = ProtocolCodec.ComputeCommandIdentityHash(envelope.Type, commandId, callId);
+        ProcessedCommand? existing;
+        try
+        {
+            existing = await eventStore.FindCommandAsync(commandId, cancellationToken);
+        }
+        catch (Exception exception) when (exception is not OperationCanceledException)
+        {
+            await coordinator.MarkDegradedAsync("outbox_unavailable", CancellationToken.None);
+            return Result(commandId, envelope.Type, false, "outbox_unavailable");
+        }
         if (existing != null)
         {
             if (!string.Equals(existing.CommandType, envelope.Type, StringComparison.Ordinal) ||
@@ -65,14 +85,22 @@ public sealed class V1CommandDispatcher(
         }
 
         byte[] provisional = Result(commandId, envelope.Type, false, "command_outcome_unknown");
-        await eventStore.SaveCommandAsync(
-            new ProcessedCommand(
-                commandId,
-                envelope.Type,
-                requestHash,
-                System.Text.Encoding.UTF8.GetString(provisional),
-                clock.UtcNow),
-            cancellationToken);
+        try
+        {
+            await eventStore.SaveCommandAsync(
+                new ProcessedCommand(
+                    commandId,
+                    envelope.Type,
+                    requestHash,
+                    System.Text.Encoding.UTF8.GetString(provisional),
+                    clock.UtcNow),
+                cancellationToken);
+        }
+        catch (Exception exception) when (exception is not OperationCanceledException)
+        {
+            await coordinator.MarkDegradedAsync("outbox_unavailable", CancellationToken.None);
+            return Result(commandId, envelope.Type, false, "outbox_unavailable");
+        }
 
         byte[] result;
         try
@@ -93,14 +121,23 @@ public sealed class V1CommandDispatcher(
             result = Result(commandId, envelope.Type, false, "internal_error");
         }
 
-        await eventStore.SaveCommandAsync(
-            new ProcessedCommand(
-                commandId,
-                envelope.Type,
-                requestHash,
-                System.Text.Encoding.UTF8.GetString(result),
-                clock.UtcNow),
-            cancellationToken);
+        try
+        {
+            await eventStore.SaveCommandAsync(
+                new ProcessedCommand(
+                    commandId,
+                    envelope.Type,
+                    requestHash,
+                    System.Text.Encoding.UTF8.GetString(result),
+                    clock.UtcNow),
+                cancellationToken);
+        }
+        catch (Exception exception) when (exception is not OperationCanceledException)
+        {
+            await coordinator.MarkDegradedAsync("outbox_unavailable", CancellationToken.None);
+            return Result(commandId, envelope.Type, false, "command_outcome_unknown");
+        }
+
         return result;
     }
 
@@ -164,6 +201,25 @@ public sealed class V1CommandDispatcher(
         }
 
         return property.GetString()!;
+    }
+
+    private static string? GetCallIdForFingerprint(ProtocolEnvelope envelope)
+    {
+        if (!CallScopedCommandTypes.Contains(envelope.Type))
+        {
+            return null;
+        }
+
+        if (!envelope.Payload.TryGetProperty("callId", out JsonElement property) ||
+            property.ValueKind != JsonValueKind.String ||
+            string.IsNullOrWhiteSpace(property.GetString()))
+        {
+            throw new ProtocolException("invalid_message", "callId is required.");
+        }
+
+        string callId = property.GetString()!;
+        ProtocolCodec.ValidateUuid(callId, "callId");
+        return callId;
     }
 
     private static byte[] Result(string commandId, string commandType, bool accepted, string? errorCode) =>

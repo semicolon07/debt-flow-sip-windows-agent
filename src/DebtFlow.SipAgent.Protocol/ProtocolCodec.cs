@@ -1,5 +1,6 @@
 using System.Text;
 using System.Text.Json;
+using System.Globalization;
 
 namespace DebtFlow.SipAgent.Protocol;
 
@@ -29,6 +30,7 @@ public static class ProtocolCodec
                 throw new ProtocolException("invalid_message", "Message must be a JSON object.");
             }
 
+            ValidateNoDuplicateProperties(root);
             foreach (JsonProperty property in root.EnumerateObject())
             {
                 if (!EnvelopeFields.Contains(property.Name))
@@ -84,6 +86,7 @@ public static class ProtocolCodec
     {
         try
         {
+            ValidateNoDuplicateProperties(payload);
             return payload.Deserialize<T>(ProtocolJson.Options)
                 ?? throw new ProtocolException("invalid_message", "Payload is required.");
         }
@@ -101,15 +104,19 @@ public static class ProtocolCodec
 
     public static void ValidateUuid(string value, string fieldName)
     {
-        if (!Guid.TryParseExact(value, "D", out _))
+        if (!Guid.TryParseExact(value, "D", out Guid parsed) ||
+            !string.Equals(value, parsed.ToString("D"), StringComparison.Ordinal))
         {
-            throw new ProtocolException("invalid_message", $"{fieldName} must be a UUID.");
+            throw new ProtocolException("invalid_message", $"{fieldName} must be a lowercase UUID.");
         }
     }
 
-    public static string ComputeRequestHash(JsonElement payload)
+    public static string ComputeCommandIdentityHash(string commandType, string commandId, string? callId)
     {
-        byte[] bytes = Encoding.UTF8.GetBytes(payload.GetRawText());
+        ArgumentException.ThrowIfNullOrWhiteSpace(commandType);
+        ArgumentException.ThrowIfNullOrWhiteSpace(commandId);
+
+        byte[] bytes = Encoding.UTF8.GetBytes($"{commandType}\n{commandId}\n{callId ?? string.Empty}");
         return Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(bytes)).ToLowerInvariant();
     }
 
@@ -147,11 +154,40 @@ public static class ProtocolCodec
     {
         if (!root.TryGetProperty(name, out JsonElement property) ||
             property.ValueKind != JsonValueKind.String ||
-            !DateTimeOffset.TryParse(property.GetString(), out DateTimeOffset value))
+            !DateTimeOffset.TryParseExact(
+                property.GetString(),
+                "yyyy-MM-dd'T'HH:mm:ss.FFFFFFFK",
+                CultureInfo.InvariantCulture,
+                DateTimeStyles.None,
+                out DateTimeOffset value))
         {
             throw new ProtocolException("invalid_message", $"{name} is invalid.");
         }
 
         return value.ToUniversalTime();
+    }
+
+    private static void ValidateNoDuplicateProperties(JsonElement element)
+    {
+        if (element.ValueKind == JsonValueKind.Object)
+        {
+            var names = new HashSet<string>(StringComparer.Ordinal);
+            foreach (JsonProperty property in element.EnumerateObject())
+            {
+                if (!names.Add(property.Name))
+                {
+                    throw new ProtocolException("invalid_message", "Message contains a duplicate field.");
+                }
+
+                ValidateNoDuplicateProperties(property.Value);
+            }
+        }
+        else if (element.ValueKind == JsonValueKind.Array)
+        {
+            foreach (JsonElement item in element.EnumerateArray())
+            {
+                ValidateNoDuplicateProperties(item);
+            }
+        }
     }
 }

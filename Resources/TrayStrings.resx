@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="utf-8"?>
+<root>
+  <resheader name="resmimetype"><value>text/microsoft-resx</value></resheader>
+  <resheader name="version"><value>2.0</value></resheader>
+  <resheader name="reader"><value>System.Resources.ResXResourceReader, System.Windows.Forms</value></resheader>
+  <resheader name="writer"><value>System.Resources.ResXResourceWriter, System.Windows.Forms</value></resheader>
+  <data name="AppName" xml:space="preserve"><value>Debt Flow SIP Agent</value></data>
+  <data name="AgentStatus" xml:space="preserve"><value>Agent: {0}</value></data>
+  <data name="PortalStatus" xml:space="preserve"><value>Portal: {0}</value></data>
+  <data name="RegistrationStatus" xml:space="preserve"><value>SIP: {0}</value></data>
+  <data name="CallStatus" xml:space="preserve"><value>Call: {0}</value></data>
+  <data name="AudioStatus" xml:space="preserve"><value>Audio: {0}</value></data>
+  <data name="Connected" xml:space="preserve"><value>Connected</value></data>
+  <data name="Disconnected" xml:space="preserve"><value>Disconnected</value></data>
+  <data name="Idle" xml:space="preserve"><value>Idle</value></data>
+  <data name="OpenLogs" xml:space="preserve"><value>Open log folder</value></data>
+  <data name="StartWithWindows" xml:space="preserve"><value>Start with Windows</value></data>
+  <data name="Exit" xml:space="preserve"><value>Exit</value></data>
+  <data name="ExitTitle" xml:space="preserve"><value>Exit SIP Agent</value></data>
+  <data name="ExitActiveCall" xml:space="preserve"><value>A call is active. Exit and hang up the call?</value></data>
+  <data name="ActionRequired" xml:space="preserve"><value>Action required</value></data>
+  <data name="SecondInstance" xml:space="preserve"><value>SIP Agent is already running for this Windows user.</value></data>
+  <data name="StartupFailed" xml:space="preserve"><value>Unable to update Windows startup settings.</value></data>
+  <data name="ConfigurationInvalid" xml:space="preserve"><value>Portal Origin configuration is missing or invalid.</value></data>
+  <data name="RegistrationFailed" xml:space="preserve"><value>SIP registration failed. Open Portal to retry or review the configuration.</value></data>
+  <data name="PortUnavailable" xml:space="preserve"><value>The local SIP Agent port is unavailable.</value></data>
+  <data name="AgentStartFailed" xml:space="preserve"><value>SIP Agent could not start. Review the diagnostic log or contact support.</value></data>
+  <data name="StateStarting" xml:space="preserve"><value>Starting</value></data>
+  <data name="StateReady" xml:space="preserve"><value>Ready</value></data>
+  <data name="StateDegraded" xml:space="preserve"><value>Action required</value></data>
+  <data name="StateStopping" xml:space="preserve"><value>Stopping</value></data>
+  <data name="StateUnconfigured" xml:space="preserve"><value>Not configured</value></data>
+  <data name="StateUnregistered" xml:space="preserve"><value>Not registered</value></data>
+  <data name="StateRegistering" xml:space="preserve"><value>Registering</value></data>
+  <data name="StateRegistered" xml:space="preserve"><value>Registered</value></data>
+  <data name="StateUnregistering" xml:space="preserve"><value>Unregistering</value></data>
+  <data name="StateRetrying" xml:space="preserve"><value>Retrying</value></data>
+  <data name="StateFailed" xml:space="preserve"><value>Failed</value></data>
+  <data name="StateCalling" xml:space="preserve"><value>Calling</value></data>
+  <data name="StateDialing" xml:space="preserve"><value>Dialing</value></data>
+  <data name="StateTrying" xml:space="preserve"><value>Trying</value></data>
+  <data name="StateRinging" xml:space="preserve"><value>Ringing</value></data>
+  <data name="StateIncoming" xml:space="preserve"><value>Incoming</value></data>
+  <data name="StateAnswering" xml:space="preserve"><value>Answering</value></data>
+  <data name="StateConnected" xml:space="preserve"><value>Connected</value></data>
+  <data name="StateEnding" xml:space="preserve"><value>Ending</value></data>
+  <data name="StateEnded" xml:space="preserve"><value>Ended</value></data>
+  <data name="StateUnknown" xml:space="preserve"><value>Unknown</value></data>
+</root>

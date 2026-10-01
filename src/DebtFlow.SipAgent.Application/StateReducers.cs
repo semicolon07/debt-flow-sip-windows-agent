@@ -79,9 +79,12 @@ public static class RegistrationReducer
     {
         SipSignalType.RegistrationRegistering when current is RegistrationState.Unregistered or RegistrationState.Failed
             => RegistrationState.Registering,
-        SipSignalType.RegistrationRegistered => RegistrationState.Registered,
+        SipSignalType.RegistrationRegistered when current is RegistrationState.Registering or RegistrationState.Retrying
+            => RegistrationState.Registered,
+        SipSignalType.RegistrationUnregistered when current == RegistrationState.Unconfigured => RegistrationState.Unconfigured,
         SipSignalType.RegistrationUnregistered => RegistrationState.Unregistered,
-        SipSignalType.RegistrationFailed => RegistrationState.Failed,
+        SipSignalType.RegistrationFailed when current is RegistrationState.Registering or RegistrationState.Registered or RegistrationState.Retrying
+            => RegistrationState.Failed,
         _ => current
     };
 }
