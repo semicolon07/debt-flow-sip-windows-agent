@@ -15,15 +15,15 @@
 - `AUTO-01` รัน verifier จบด้วย exit code 0
 - `AUTO-02` แนบทั้งโฟลเดอร์ `artifacts/p1-windows/<run-id>` ซึ่งมี OS/runtime metadata,
 artifact SHA-256, test totals/TRX, vulnerability JSON และ command logs.
-Automated gate ผ่านต่อเมื่อ script exit code เป็น 0, tests อย่างน้อย 66 cases
-(46 core + 20 Windows host ณ baseline นี้). Script บังคับ clean Git worktree ก่อนเริ่มและ scan
+Automated gate ผ่านต่อเมื่อ script exit code เป็น 0, tests อย่างน้อย 67 cases
+(46 core + 21 Windows host ณ baseline นี้). Script บังคับ clean Git worktree ก่อนเริ่มและ scan
 NuGet vulnerability ทุก project ใน solution; dirty tree หรือ vulnerable package ใด ๆ ต้อง fail gate
 
 ## 2. Tray/non-admin gate
 
 - `TRAY-01` รัน EXE จาก stable extracted folder ด้วย standard user; ต้องไม่มี UAC/URL ACL prompt
 - `TRAY-02` ตรวจ tray status ไทยและอังกฤษตาม Windows UI language
-- `TRAY-03` ตรวจ `%ProgramData%\DebtFlow\SipAgent\agentsettings.json` valid/invalid/missing
+- `TRAY-03` ตรวจ `%LOCALAPPDATA%\DebtFlow\SipAgent\agentsettings.json` valid/invalid/missing
 - `TRAY-04` เปิด instance ที่สอง; ต้องไม่เปิด listener/SIP ซ้ำและ tray เดิมแจ้งเตือน
 - `TRAY-05` toggle Start with Windows, sign out/in และตรวจหนึ่ง process ต่อ user
 - `TRAY-06` Open log folder ต้องเปิด `%LOCALAPPDATA%\DebtFlow\SipAgent\Logs`

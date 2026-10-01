@@ -5,8 +5,10 @@ namespace DebtFlow.SipAgent.Host;
 
 public static class AgentStoragePaths
 {
-    public static string DatabasePath => Path.Combine(ResolveLocalApplicationData(), "agent-v1.db");
-    public static string LogDirectory => Path.Combine(ResolveLocalApplicationData(), "Logs");
+    public static string RootDirectory => ResolveLocalApplicationData();
+    public static string ConfigurationPath => Path.Combine(RootDirectory, "agentsettings.json");
+    public static string DatabasePath => Path.Combine(RootDirectory, "agent-v1.db");
+    public static string LogDirectory => Path.Combine(RootDirectory, "Logs");
 
     private static string ResolveLocalApplicationData()
     {

@@ -204,7 +204,7 @@ try {
             (Get-CounterValue $counters "aborted")
     }
 
-    if ($testTotal -lt 66 -or $testPassed -ne $testTotal -or $testFailed -ne 0) {
+    if ($testTotal -lt 67 -or $testPassed -ne $testTotal -or $testFailed -ne 0) {
         throw "test_evidence_invalid:total=$testTotal passed=$testPassed failed=$testFailed"
     }
 

@@ -16,7 +16,8 @@ Progress snapshot: **source implementation 100%; full P1 completion gate 70%**.
 - startup preference reconcile HKCU Run กับ executable path ปัจจุบันทุก launch โดยไม่เปิดค่าที่ผู้ใช้ปิดไว้
 - one instance ต่อ Windows user ด้วย global named mutex + current-user named-pipe activation
 - Kestrel bind IPv4/IPv6 loopback port 8443 แทน HttpListener โดยไม่ใช้ URL ACL
-- production exact Origin config จาก `%ProgramData%`; dev Origins/override จำกัด `--console`
+- production exact Origin config จาก `%LOCALAPPDATA%\DebtFlow\SipAgent\agentsettings.json`
+  ซึ่งอยู่ใน per-user storage เดียวกับ SQLite/Logs; dev Origins/override จำกัด `--console`
 - malformed production Origin config ล้าง allowlist ทั้งชุดและ WebSocket ตอบ 503 แบบ fail closed
 - reject query string ทุกชนิดก่อน WebSocket upgrade เพื่อกัน credential ใน URL
 - heartbeat `session.ping` ใช้ strict empty payload และ reject unknown field
@@ -51,7 +52,7 @@ Progress snapshot: **source implementation 100%; full P1 completion gate 70%**.
 | Release Windows cross-build | Passed, 0 warnings/errors |
 | Roslyn analyzer verification | Passed across host/core/test projects; 0/57 files changed |
 | cross-platform core tests | Passed, 46/46 |
-| Windows host test project compile | Passed, 20 test cases discovered by source inventory |
+| Windows host test project compile | Passed, 21 test cases discovered by source inventory |
 | self-contained `win-x64` publish | Passed |
 | multi-file ZIP integrity | Passed; `/tmp/debt-flow-sip-agent-p1-win-x64-20261001-final-v13.zip`, 76,615,806 bytes, 461 entries; SHA-256 `5208462cf67c2bc986d7090fe2678e6a3f12b05421e6155b752f5d5b29fdaeff` |
 | NuGet vulnerability scan | Passed; no vulnerable packagesจาก configured source |

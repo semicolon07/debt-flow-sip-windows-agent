@@ -5,6 +5,20 @@ namespace DebtFlow.SipAgent.Host.Tests;
 public sealed class AgentRuntimeOptionsTests
 {
     [Fact]
+    public void DefaultConfigurationPath_UsesPerUserAgentStorageDirectory()
+    {
+        string expectedRoot = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+            "DebtFlow",
+            "SipAgent");
+
+        Assert.Equal(Path.Combine(expectedRoot, "agentsettings.json"), AgentRuntimeOptions.GetConfigurationPath());
+        Assert.Equal(expectedRoot, AgentStoragePaths.RootDirectory);
+        Assert.Equal(expectedRoot, Path.GetDirectoryName(AgentStoragePaths.DatabasePath));
+        Assert.Equal(expectedRoot, Path.GetDirectoryName(AgentStoragePaths.LogDirectory));
+    }
+
+    [Fact]
     public void ConsoleMode_EnablesOnlyDevelopmentOriginsByDefault()
     {
         AgentRuntimeOptions options = AgentRuntimeOptions.Load(["--console"]);

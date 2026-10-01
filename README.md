@@ -22,8 +22,11 @@ Start with Windows และ Exit. SIP host/account/password รับจาก 
 Tray mode อ่าน exact allowlist จาก:
 
 ```text
-%ProgramData%\DebtFlow\SipAgent\agentsettings.json
+%LOCALAPPDATA%\DebtFlow\SipAgent\agentsettings.json
 ```
+
+ไฟล์ config, SQLite และ Logs อยู่ใต้โฟลเดอร์ข้อมูลรายผู้ใช้เดียวกัน และไม่ต้องใช้สิทธิ์
+Administrator เพื่อสร้างหรือแก้ไข configuration.
 
 ใช้รูปแบบเดียวกับ [agentsettings.example.json](agentsettings.example.json):
 

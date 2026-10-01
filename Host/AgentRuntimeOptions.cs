@@ -96,8 +96,7 @@ public sealed record AgentRuntimeOptions(
 
     public static string GetConfigurationPath()
     {
-        string root = Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData);
-        return Path.Combine(root, "DebtFlow", "SipAgent", "agentsettings.json");
+        return AgentStoragePaths.ConfigurationPath;
     }
 
     private static string NormalizeOrigin(string value)
