@@ -1,263 +1,216 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="en">
-
 <head>
-    <meta charset="UTF-8">
+    <meta charset="utf-8">
     <meta name="viewport" content="width=device-width,initial-scale=1">
-    <title>Softphone Full Function PoC</title>
+    <title>Debt Flow SIP Agent V1 Diagnostic</title>
     <style>
-        body {
-            font-family: Segoe UI, Arial, sans-serif;
-            background: #f5f6f8;
-            margin: 0;
-            padding: 24px;
-            color: #222
-        }
-
-        .wrap {
-            max-width: 900px;
-            margin: auto
-        }
-
-        .card {
-            background: #fff;
-            border: 1px solid #ddd;
-            border-radius: 10px;
-            padding: 18px;
-            margin-bottom: 14px
-        }
-
-        h1 {
-            margin-top: 0
-        }
-
-        h3 {
-            margin: 0 0 12px
-        }
-
-        .grid {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
-            gap: 10px
-        }
-
-        .row {
-            display: flex;
-            gap: 8px;
-            flex-wrap: wrap;
-            align-items: center
-        }
-
-        input {
-            box-sizing: border-box;
-            width: 100%;
-            padding: 9px;
-            border: 1px solid #bbb;
-            border-radius: 6px
-        }
-
-        button {
-            padding: 9px 14px;
-            border: 1px solid #aaa;
-            border-radius: 6px;
-            background: #fff;
-            cursor: pointer
-        }
-
-        button:hover {
-            background: #eee
-        }
-
-        button:disabled {
-            opacity: .45;
-            cursor: not-allowed
-        }
-
-        .primary {
-            background: #0878d1;
-            color: white
-        }
-
-        .danger {
-            background: #c62828;
-            color: white
-        }
-
-        .success {
-            background: #25853b;
-            color: white
-        }
-
-        .status-grid {
-            display: grid;
-            grid-template-columns: repeat(3, 1fr);
-            gap: 8px
-        }
-
-        .status-box {
-            background: #f6f7f8;
-            padding: 10px;
-            border-radius: 7px
-        }
-
-        .label {
-            font-size: 12px;
-            color: #666
-        }
-
-        .value {
-            font-weight: 600;
-            margin-top: 3px
-        }
-
-        .incoming {
-            display: none;
-            border: 2px solid #0878d1
-        }
-
-        .keypad {
-            display: grid;
-            grid-template-columns: repeat(3, 70px);
-            gap: 7px
-        }
-
-        .keypad button {
-            font-size: 17px
-        }
-
-        .log {
-            height: 260px;
-            overflow: auto;
-            background: #151515;
-            color: #ddd;
-            padding: 12px;
-            border-radius: 7px;
-            font-family: Consolas, monospace;
-            font-size: 13px;
-            white-space: pre-wrap
-        }
-
-        .muted {
-            color: #666;
-            font-size: 13px
-        }
-
-        @media(max-width:600px) {
-            .status-grid {
-                grid-template-columns: 1fr
-            }
-
-            .keypad {
-                grid-template-columns: repeat(3, 1fr)
-            }
-        }
+        :root { color-scheme: dark; font-family: Inter, system-ui, sans-serif; }
+        body { margin: 0; background: #0f172a; color: #e2e8f0; }
+        main { max-width: 980px; margin: 24px auto; padding: 0 16px; }
+        .notice { border: 1px solid #f59e0b; background: #422006; color: #fde68a; padding: 12px; border-radius: 8px; }
+        .grid { display: grid; grid-template-columns: repeat(auto-fit,minmax(260px,1fr)); gap: 14px; margin-top: 14px; }
+        .card { background: #1e293b; border: 1px solid #334155; border-radius: 10px; padding: 16px; }
+        label { display: block; margin-top: 10px; font-size: 13px; color: #94a3b8; }
+        input { width: 100%; box-sizing: border-box; padding: 9px; margin-top: 4px; border-radius: 6px; border: 1px solid #475569; background: #0f172a; color: #fff; }
+        button { margin: 8px 6px 0 0; padding: 9px 12px; border: 0; border-radius: 6px; cursor: pointer; }
+        button.primary { background: #10b981; color: #052e16; }
+        button.danger { background: #ef4444; color: #fff; }
+        .status { display: grid; grid-template-columns: repeat(4,1fr); gap: 8px; margin: 14px 0; }
+        .status div { background: #1e293b; padding: 10px; border-radius: 7px; }
+        .status small { display: block; color: #94a3b8; }
+        pre { min-height: 220px; max-height: 420px; overflow: auto; background: #020617; padding: 12px; border-radius: 8px; white-space: pre-wrap; }
+        .inline { display: flex; align-items: center; gap: 8px; margin-top: 10px; }
+        .inline input { width: auto; margin: 0; }
+        @media (max-width: 700px) { .status { grid-template-columns: 1fr 1fr; } }
     </style>
 </head>
-
 <body>
-    <div class="wrap">
-        <h1>Softphone Agent — Full Function PoC</h1>
-        <div class="card">
-            <h3>Agent Connection</h3>
-            <div class="row"><input id="wsUrl" value="ws://localhost:8443/" style="flex:1;min-width:240px"><button
-                    class="primary" onclick="connectAgent()">Connect</button><button
-                    onclick="disconnectAgent()">Disconnect</button></div>
-            <p class="muted">Browser ↔ local C# agent via WebSocket.</p>
-        </div>
-        <div class="card">
-            <h3>Status</h3>
-            <div class="status-grid">
-                <div class="status-box">
-                    <div class="label">Agent</div>
-                    <div class="value" id="agentStatus">Disconnected</div>
-                </div>
-                <div class="status-box">
-                    <div class="label">SIP</div>
-                    <div class="value" id="sipStatus">Not registered</div>
-                </div>
-                <div class="status-box">
-                    <div class="label">Call</div>
-                    <div class="value" id="callStatus">Idle</div>
-                </div>
-            </div>
-            <div class="row" style="margin-top:10px"><button onclick="getStatus()">Get Status</button></div>
-        </div>
-        <div class="card">
-            <h3>SIP Registration</h3>
-            <div class="grid">
-                <div>
-                    <div class="label">PBX IP / Host</div><input id="server" value="192.168.1.100">
-                </div>
-                <div>
-                    <div class="label">Extension</div><input id="user" value="1002">
-                </div>
-                <div>
-                    <div class="label">Password</div><input id="pass" type="password" value="123456">
-                </div>
-            </div>
-            <div class="row" style="margin-top:12px"><button class="primary"
-                    onclick="registerSIP()">Register</button><button onclick="unregisterSIP()">Unregister</button></div>
-        </div>
-        <div class="card incoming" id="incomingCard">
-            <h3>Incoming Call</h3>
-            <div id="callerId" style="font-size:22px;margin-bottom:12px">Unknown</div>
-            <div class="row"><button class="success" onclick="answerCall()">Answer</button><button class="danger"
-                    onclick="rejectCall()">Reject</button></div>
-        </div>
-        <div class="card">
-            <h3>Call Control</h3>
-            <div class="row"><input id="target" placeholder="Destination, e.g. 1001"
-                    style="flex:1;min-width:220px"><button class="success" onclick="makeCall()">Call</button><button
-                    class="danger" onclick="hangup()">Hangup</button></div>
-        </div>
-        <div class="card">
-            <h3>DTMF</h3>
-            <div class="keypad" id="keypad"></div>
-        </div>
-        <div class="card">
-            <div class="row" style="justify-content:space-between">
-                <h3>Event Log</h3><button onclick="clearLog()">Clear</button>
-            </div>
-            <div class="log" id="log"></div>
-        </div>
+<main>
+    <h1>Debt Flow SIP Agent V1 Diagnostic</h1>
+    <div class="notice">
+        Development diagnostic only. Serve this file from <code>http://localhost:8765</code>.
+        Credentials remain in page memory and are never printed. This is not the production Portal.
     </div>
-    <script>
-        let ws = null;
-        function stamp() { return new Date().toLocaleTimeString(); }
-        function log(message, data) { const el = document.getElementById('log'); el.textContent += `[${stamp()}] ${message}${data !== undefined ? ' ' + (typeof data === 'string' ? data : JSON.stringify(data)) : ''}\n`; el.scrollTop = el.scrollHeight; }
-        function setText(id, text) { document.getElementById(id).textContent = text; }
-        function isOpen() { return ws && ws.readyState === WebSocket.OPEN; }
-        function send(action, payload = {}) { if (!isOpen()) { log('ERROR: Agent WebSocket is not connected.'); setText('agentStatus', 'Disconnected'); return false; } const msg = { action, ...payload }; ws.send(JSON.stringify(msg)); log('>>', msg); return true; }
-        function connectAgent() { if (isOpen()) { log('Agent is already connected.'); return; } const url = document.getElementById('wsUrl').value.trim(); log(`Connecting ${url} ...`); try { ws = new WebSocket(url); } catch (e) { log('WebSocket create failed:', e.message); return; } ws.onopen = () => { setText('agentStatus', 'Connected'); log('WebSocket connected.'); getStatus(); }; ws.onerror = () => log('WebSocket error.'); ws.onclose = e => { setText('agentStatus', 'Disconnected'); setText('sipStatus', 'Unknown'); setText('callStatus', 'Idle'); hideIncoming(); log(`WebSocket closed (${e.code}).`); }; ws.onmessage = e => { let data; try { data = JSON.parse(e.data); } catch { log('<< RAW', e.data); return; } log('<<', data); handleEvent(data); }; }
-        function disconnectAgent() { if (ws) { ws.close(1000, 'PoC disconnect'); ws = null; } }
-        function registerSIP() { send('register', { server: val('server'), user: val('user'), pass: val('pass') }); }
-        function unregisterSIP() { send('unregister'); }
-        function makeCall() { const destination = val('target'); if (!destination) { log('ERROR: Destination is required.'); return; } send('call', { destination }); }
-        function answerCall() { send('answer'); }
-        function rejectCall() { send('reject'); }
-        function hangup() { send('hangup'); }
-        function sendDTMF(digit) { send('dtmf', { digit }); }
-        function getStatus() { send('status'); }
-        function val(id) { return document.getElementById(id).value.trim(); }
-        function showIncoming(caller) { document.getElementById('incomingCard').style.display = 'block'; setText('callerId', caller || 'Unknown'); }
-        function hideIncoming() { document.getElementById('incomingCard').style.display = 'none'; }
-        function clearLog() { document.getElementById('log').textContent = ''; }
-        function handleEvent(d) {
-            const type = String(d.eventType || d.type || '').toUpperCase(); const message = d.message ?? '';
-            if (type.includes('REGISTRATION_SUCCESS') || type === 'SIP_REGISTERED' || type === 'REGISTERED') setText('sipStatus', 'Registered');
-            else if (type.includes('REGISTRATION_FAILED') || type === 'SIP_REGISTRATION_FAILED') setText('sipStatus', 'Registration failed');
-            else if (type.includes('UNREGISTER')) setText('sipStatus', 'Not registered');
-            if (type === 'INCOMING_CALL' || type === 'CALL_INCOMING') { setText('callStatus', 'Incoming'); showIncoming(message || d.callerId); }
-            else if (type.includes('DIAL') || type.includes('TRYING')) setText('callStatus', 'Dialing');
-            else if (type.includes('RINGING')) setText('callStatus', 'Ringing');
-            else if (type.includes('CONNECTED') || type.includes('ANSWERED')) { setText('callStatus', 'Connected'); hideIncoming(); }
-            else if (type.includes('ENDED') || type.includes('HUNGUP') || type.includes('HANGUP') || type.includes('REJECT') || type.includes('CANCEL')) { setText('callStatus', 'Idle'); hideIncoming(); }
-            else if (type.includes('CALL_FAILED')) { setText('callStatus', 'Failed'); hideIncoming(); }
-            if (type === 'STATUS' || type === 'STATUS_RESPONSE') { if (d.registered !== undefined) setText('sipStatus', d.registered ? 'Registered' : 'Not registered'); if (d.callState) setText('callStatus', d.callState); }
-        }
-        ['1', '2', '3', '4', '5', '6', '7', '8', '9', '*', '0', '#', 'A', 'B', 'C', 'D'].forEach(d => { const b = document.createElement('button'); b.textContent = d; b.onclick = () => sendDTMF(d); document.getElementById('keypad').appendChild(b); });
-        log('PoC UI ready. Connect to the local agent to begin.');
-    </script>
-</body>
 
+    <div class="status">
+        <div><small>WebSocket</small><strong id="wsState">Disconnected</strong></div>
+        <div><small>Registration</small><strong id="registrationState">Unknown</strong></div>
+        <div><small>Call</small><strong id="callState">Idle</strong></div>
+        <div><small>Pending events</small><strong id="pendingEvents">0</strong></div>
+    </div>
+
+    <div class="grid">
+        <section class="card">
+            <h2>Agent</h2>
+            <label>WebSocket URL<input id="wsUrl" value="ws://localhost:8443/agent/v1"></label>
+            <button class="primary" id="connectButton">Connect</button>
+            <button id="disconnectButton">Disconnect</button>
+            <button id="snapshotButton">Refresh snapshot</button>
+            <div class="inline">
+                <input id="simulateAck" type="checkbox">
+                <label for="simulateAck" style="margin:0">Simulate backend commit and ACK durable events</label>
+            </div>
+        </section>
+
+        <section class="card">
+            <h2>SIP configuration</h2>
+            <label>PBX IP / Host<input id="host" autocomplete="off"></label>
+            <label>Port<input id="port" type="number" min="1" max="65535" value="5060"></label>
+            <label>Username<input id="username" autocomplete="off"></label>
+            <label>Password<input id="password" type="password" autocomplete="new-password"></label>
+            <button id="configureButton">Configure</button>
+            <button class="primary" id="registerButton">Register</button>
+            <button id="unregisterButton">Unregister</button>
+        </section>
+
+        <section class="card">
+            <h2>Call control</h2>
+            <label>Destination<input id="destination" autocomplete="off"></label>
+            <button class="primary" id="callButton">Call</button>
+            <button id="answerButton">Answer</button>
+            <button id="rejectButton">Reject</button>
+            <button class="danger" id="hangupButton">Hang up</button>
+            <label>DTMF digit<input id="dtmf" maxlength="1" autocomplete="off"></label>
+            <button id="dtmfButton">Send DTMF</button>
+        </section>
+    </div>
+
+    <h2>Safe event log</h2>
+    <button id="clearButton">Clear</button>
+    <pre id="log"></pre>
+</main>
+
+<script>
+    const protocolVersion = 1;
+    let socket = null;
+    let heartbeat = null;
+    let agentInstanceId = null;
+    let activeCallId = null;
+
+    const byId = id => document.getElementById(id);
+    const newId = () => crypto.randomUUID().toLowerCase();
+    const now = () => new Date().toISOString();
+    const set = (id, value) => { byId(id).textContent = value; };
+    const log = (message, data) => {
+        const suffix = data === undefined ? '' : ` ${JSON.stringify(data)}`;
+        byId('log').textContent += `[${new Date().toLocaleTimeString()}] ${message}${suffix}\n`;
+        byId('log').scrollTop = byId('log').scrollHeight;
+    };
+
+    function send(kind, type, payload = {}) {
+        if (!socket || socket.readyState !== WebSocket.OPEN) {
+            log('Agent is not connected.');
+            return false;
+        }
+        const envelope = { protocolVersion, kind, messageId: newId(), sentAtUtc: now(), type, payload };
+        socket.send(JSON.stringify(envelope));
+        log(`>> ${kind} ${type}`, { messageId: envelope.messageId });
+        return true;
+    }
+
+    function command(type, payload = {}) {
+        const commandId = newId();
+        send('command', type, { commandId, ...payload });
+        return commandId;
+    }
+
+    function connect() {
+        if (socket && socket.readyState === WebSocket.OPEN) return;
+        socket = new WebSocket(byId('wsUrl').value.trim());
+        set('wsState', 'Connecting');
+        socket.onopen = () => {
+            set('wsState', 'Connected');
+            send('hello', 'session.hello', {
+                portalVersion: 'p0-diagnostic',
+                supportedProtocolVersions: [1]
+            });
+            heartbeat = setInterval(() => send('ping', 'session.ping'), 15000);
+        };
+        socket.onclose = event => {
+            clearInterval(heartbeat);
+            heartbeat = null;
+            set('wsState', `Disconnected (${event.code})`);
+            socket = null;
+        };
+        socket.onerror = () => log('WebSocket error.');
+        socket.onmessage = event => {
+            let message;
+            try { message = JSON.parse(event.data); }
+            catch { log('Invalid JSON received.'); return; }
+            handleMessage(message);
+        };
+    }
+
+    function handleMessage(message) {
+        const payload = message.payload || {};
+        log(`<< ${message.kind} ${message.type}`, safeForLog(message));
+
+        if (message.kind === 'welcome') {
+            agentInstanceId = payload.agentInstanceId;
+            set('pendingEvents', Math.max(0, payload.lastSequence - payload.lastAcknowledgedSequence));
+        }
+        if (message.kind === 'snapshot') {
+            set('registrationState', payload.registrationState || 'unknown');
+            set('pendingEvents', payload.pendingEventCount ?? 0);
+            const call = payload.activeCalls && payload.activeCalls[0];
+            activeCallId = call ? call.callId : null;
+            set('callState', call ? call.state : 'idle');
+        }
+        if (message.kind === 'event' && message.type === 'registration.state_changed') {
+            set('registrationState', payload.data?.state || 'unknown');
+        }
+        if (message.kind === 'event' && message.type.startsWith('call.')) {
+            activeCallId = payload.callId || activeCallId;
+            if (payload.state) set('callState', payload.state);
+            if (message.type === 'call.ended') activeCallId = null;
+            if (payload.delivery === 'durable') {
+                set('pendingEvents', Number(byId('pendingEvents').textContent || 0) + 1);
+                if (byId('simulateAck').checked && agentInstanceId) {
+                    send('ack', 'events.ack', {
+                        agentInstanceId,
+                        acknowledgedThroughSequence: payload.sequence
+                    });
+                }
+            }
+        }
+    }
+
+    function safeForLog(message) {
+        if (message.type === 'session.configure' || message.type === 'call.start' || message.type === 'call.dtmf') {
+            return { kind: message.kind, type: message.type, messageId: message.messageId };
+        }
+        return message;
+    }
+
+    byId('connectButton').onclick = connect;
+    byId('disconnectButton').onclick = () => socket?.close(1000, 'diagnostic_disconnect');
+    byId('snapshotButton').onclick = () => command('state.get');
+    byId('configureButton').onclick = () => command('session.configure', {
+        host: byId('host').value.trim(),
+        port: Number(byId('port').value),
+        username: byId('username').value.trim(),
+        password: byId('password').value
+    });
+    byId('registerButton').onclick = () => command('registration.start');
+    byId('unregisterButton').onclick = () => command('registration.stop');
+    byId('callButton').onclick = () => {
+        activeCallId = newId();
+        command('call.start', {
+            callId: activeCallId,
+            destination: byId('destination').value.trim(),
+            contextToken: 'diagnostic-only'
+        });
+    };
+    byId('answerButton').onclick = () => activeCallId && command('call.answer', { callId: activeCallId });
+    byId('rejectButton').onclick = () => activeCallId && command('call.reject', { callId: activeCallId });
+    byId('hangupButton').onclick = () => activeCallId && command('call.hangup', { callId: activeCallId });
+    byId('dtmfButton').onclick = () => activeCallId && command('call.dtmf', {
+        callId: activeCallId,
+        digit: byId('dtmf').value
+    });
+    byId('clearButton').onclick = () => { byId('log').textContent = ''; };
+    log('V1 diagnostic ready. Serve from localhost:8765 before connecting.');
+</script>
+</body>
 </html>

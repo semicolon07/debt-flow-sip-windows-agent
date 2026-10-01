@@ -1,0 +1,65 @@
+using DebtFlow.SipAgent.Application;
+
+namespace DebtFlow.SipAgent.Core.Tests;
+
+public sealed class StateReducerTests
+{
+    private static readonly DateTimeOffset StartedAt = new(2026, 10, 1, 0, 0, 0, TimeSpan.Zero);
+
+    [Fact]
+    public void OutboundCall_ValidLifecycle_EndsOnceWithOutcome()
+    {
+        CallSessionState state = CallReducer.CreateOutbound("call", "command", StartedAt, "xxxx5678");
+
+        state = Apply(state, CallSignalType.Dial, 1);
+        state = Apply(state, CallSignalType.Trying, 2);
+        state = Apply(state, CallSignalType.Ringing, 3);
+        state = Apply(state, CallSignalType.Connected, 4);
+        CallTransition ended = CallReducer.Apply(
+            state,
+            new CallSignal(CallSignalType.End, StartedAt.AddSeconds(10), CallOutcome.Completed, "remote_hangup"));
+
+        Assert.True(ended.Accepted);
+        Assert.Equal(CallState.Ended, ended.State.State);
+        Assert.Equal(CallOutcome.Completed, ended.State.Outcome);
+        Assert.Equal("remote_hangup", ended.State.EndReason);
+
+        CallTransition duplicate = CallReducer.Apply(
+            ended.State,
+            new CallSignal(CallSignalType.End, StartedAt.AddSeconds(11), CallOutcome.Failed, "late_failure"));
+        Assert.False(duplicate.Accepted);
+        Assert.Equal(CallOutcome.Completed, duplicate.State.Outcome);
+    }
+
+    [Fact]
+    public void DuplicateConnected_DoesNotChangeStateAgain()
+    {
+        CallSessionState state = CallReducer.CreateOutbound("call", "command", StartedAt, "xxxx5678");
+        state = Apply(state, CallSignalType.Dial, 1);
+        state = Apply(state, CallSignalType.Connected, 2);
+
+        CallTransition duplicate = CallReducer.Apply(
+            state,
+            new CallSignal(CallSignalType.Connected, StartedAt.AddSeconds(3)));
+
+        Assert.True(duplicate.Accepted);
+        Assert.False(duplicate.StateChanged);
+        Assert.Equal(StartedAt.AddSeconds(2), duplicate.State.AnsweredAtUtc);
+    }
+
+    [Theory]
+    [InlineData("0812345678", "xxxxxx5678")]
+    [InlineData("1002", "xxxx")]
+    [InlineData(null, "unknown")]
+    public void MaskRemoteParty_DoesNotExposeFullValue(string? input, string expected)
+    {
+        Assert.Equal(expected, SensitiveValueMasker.MaskRemoteParty(input));
+    }
+
+    private static CallSessionState Apply(CallSessionState state, CallSignalType signal, int seconds)
+    {
+        CallTransition transition = CallReducer.Apply(state, new CallSignal(signal, StartedAt.AddSeconds(seconds)));
+        Assert.True(transition.Accepted);
+        return transition.State;
+    }
+}
