@@ -708,6 +708,23 @@ public sealed class SqliteAgentEventStore : IAgentEventStore
     {
         _ = RequireConnection();
         long pending = await CountPendingCoreAsync(cancellationToken);
+        DateTimeOffset? oldestPendingAtUtc = null;
+        if (pending > 0)
+        {
+            await using SqliteCommand oldestCommand = RequireConnection().CreateCommand();
+            oldestCommand.CommandText = "SELECT MIN(OccurredAtUtc) FROM DurableEvents WHERE Sequence > $ack;";
+            oldestCommand.Parameters.AddWithValue("$ack", LastAcknowledgedSequence);
+            object? oldest = await oldestCommand.ExecuteScalarAsync(cancellationToken);
+            if (oldest is string oldestText && DateTimeOffset.TryParse(
+                    oldestText,
+                    CultureInfo.InvariantCulture,
+                    DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal,
+                    out DateTimeOffset parsed))
+            {
+                oldestPendingAtUtc = parsed;
+            }
+        }
+
         long storageBytes = GetFileSize(_databasePath) + GetFileSize($"{_databasePath}-wal");
         double ratio = Math.Max(
             (double)pending / _limits.MaximumPendingEvents,
@@ -719,7 +736,7 @@ public sealed class SqliteAgentEventStore : IAgentEventStore
             >= 0.8 => EventStoreCapacityState.Warning,
             _ => EventStoreCapacityState.Healthy
         };
-        return new EventStoreHealth(pending, storageBytes, state);
+        return new EventStoreHealth(pending, storageBytes, state, oldestPendingAtUtc);
     }
 
     private async Task<long> CountPendingCoreAsync(CancellationToken cancellationToken)

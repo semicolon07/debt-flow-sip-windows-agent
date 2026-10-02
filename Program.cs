@@ -14,6 +14,17 @@ public static class Program
     [STAThread]
     public static int Main(string[] args)
     {
+        bool consoleRequested = args.Contains("--console", StringComparer.Ordinal);
+        if (consoleRequested)
+        {
+            ConsoleSession.EnsureAttached();
+        }
+        else
+        {
+            ApplicationConfiguration.Initialize();
+            _ = AgentSettingsProvisioner.EnsureFromPackagedExample();
+        }
+
         AgentRuntimeOptions options;
         try
         {
@@ -21,10 +32,8 @@ public static class Program
         }
         catch (AgentConfigurationException exception)
         {
-            bool consoleRequested = args.Contains("--console", StringComparer.Ordinal);
             if (consoleRequested)
             {
-                ConsoleSession.EnsureAttached();
                 Console.Error.WriteLine(exception.Code);
             }
             else
@@ -35,13 +44,20 @@ public static class Program
             return 2;
         }
 
-        if (options.ConsoleMode)
+        if (!options.ConsoleMode && !options.IsOperational)
         {
-            ConsoleSession.EnsureAttached();
-        }
-        else
-        {
-            ApplicationConfiguration.Initialize();
+            using var dialog = new OriginConfigurationDialog();
+            if (dialog.ShowDialog() != DialogResult.OK ||
+                !AgentSettingsProvisioner.TrySave(
+                    AgentRuntimeOptions.GetConfigurationPath(),
+                    dialog.IsAllowAllOrigins,
+                    dialog.AllowedOrigins))
+            {
+                return 2;
+            }
+
+            options = AgentRuntimeOptions.Load(args);
+            if (!options.IsOperational) return 2;
         }
 
         try
@@ -151,8 +167,9 @@ public static class Program
         });
 
         logger.LogInformation(
-            "Starting Debt Flow SIP Agent V1 in {Mode} mode with {OriginCount} allowed origins",
+            "Starting Debt Flow SIP Agent V1 in {Mode} mode with allow-all={AllowAllOrigins} and {OriginCount} allowed origins",
             options.ConsoleMode ? "console" : "tray",
+            options.IsAllowAllOrigins,
             options.AllowedOrigins.Count);
         if (!durableStoreAvailable)
         {

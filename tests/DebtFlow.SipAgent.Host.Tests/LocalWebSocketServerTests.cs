@@ -28,6 +28,7 @@ public sealed class LocalWebSocketServerTests
             new AgentRuntimeOptions(
                 ConsoleMode: false,
                 BackgroundMode: true,
+                IsAllowAllOrigins: false,
                 new HashSet<string>(["https://portal.example.test"], StringComparer.Ordinal),
                 ConfigurationError: "origin_configuration_invalid"));
         var context = new DefaultHttpContext();
@@ -58,6 +59,7 @@ public sealed class LocalWebSocketServerTests
         var options = new AgentRuntimeOptions(
             ConsoleMode: true,
             BackgroundMode: false,
+            IsAllowAllOrigins: false,
             new HashSet<string>(["http://localhost:8765"], StringComparer.Ordinal),
             ConfigurationError: null);
         var endpoint = new LocalWebSocketServer(

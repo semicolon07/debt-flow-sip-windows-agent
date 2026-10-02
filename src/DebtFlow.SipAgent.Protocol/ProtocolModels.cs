@@ -75,7 +75,11 @@ public sealed record AgentSnapshotPayload(
     IReadOnlyList<ActiveCallSnapshot> ActiveCalls,
     long PendingEventCount,
     long LastSequence,
-    string? AgentStateCode = null);
+    string? AgentStateCode = null,
+    long? LastAcknowledgedSequence = null,
+    string? OutboxCapacityState = null,
+    long? OutboxStorageBytes = null,
+    long? OldestPendingAgeSeconds = null);
 
 public sealed record DurableEventPayload(
     string Delivery,

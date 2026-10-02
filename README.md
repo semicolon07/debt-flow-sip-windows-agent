@@ -1,7 +1,7 @@
 # Debt Flow SIP Windows Agent
 
 Per-user SIP/audio tray agent สำหรับ Debt Flow Portal บน Windows 10 1809 ขึ้นไป.
-สถานะปัจจุบันคือ **P2 source implemented — Windows/PBX acceptance pending**
+สถานะปัจจุบันคือ **P5 source implemented — release-gated**
 
 ## Runtime
 
@@ -9,7 +9,7 @@ Per-user SIP/audio tray agent สำหรับ Debt Flow Portal บน Windows
 - WinForms tray + .NET Generic Host
 - Kestrel loopback WebSocket V1: `ws://localhost:8443/agent/v1`
 - SIPSorcery 10.0.16: UDP first และ automatic TCP fallback เมื่อเกิด transport-level temporary failure
-- SQLite schema v2 outbox/call journal: `%LOCALAPPDATA%\DebtFlow\SipAgent\agent-v1.db`
+- SQLite schema v3 outbox/call journal: `%LOCALAPPDATA%\DebtFlow\SipAgent\agent-v1.db`
 - JSONL logs: `%LOCALAPPDATA%\DebtFlow\SipAgent\Logs`, 10 MB ต่อไฟล์/7 rolling files
 - หนึ่ง Agent ต่อ Windows user, หนึ่ง Portal controller และหนึ่ง active call
 
@@ -19,7 +19,7 @@ Start with Windows และ Exit. SIP host/account/password รับจาก 
 
 ## Production Origin configuration
 
-Tray mode อ่าน exact allowlist จาก:
+Tray mode อ่าน allow-all flag หรือ exact allowlist จาก:
 
 ```text
 %LOCALAPPDATA%\DebtFlow\SipAgent\agentsettings.json
@@ -33,13 +33,16 @@ Administrator เพื่อสร้างหรือแก้ไข configur
 ```json
 {
   "agent": {
-    "allowedOrigins": ["https://portal.example.com"]
+    "isAllowAllOrigins": true,
+    "allowedOrigins": []
   }
 }
 ```
 
-ไฟล์นี้ห้ามมี SIP credential. Unknown field, URL ที่มี path/query/user-info หรือ allowlist ว่าง
-ทำให้ Agent เริ่มแบบ degraded และไม่รับ Portal connection
+ไฟล์นี้ห้ามมี SIP credential. `isAllowAllOrigins=true` bypass allowlistตาม accepted P5 exception.
+หากตั้ง false ต้องมี exact `http/https` originอย่างน้อยหนึ่งค่า. เมื่อ configไม่มี Agent copy packaged example
+แบบ atomicโดยไม่ overwrite; example/target invalidจะเปิด setup dialogก่อน listener. Legacy configที่มี listไม่ว่าง
+inferเป็น exact mode ส่วน listว่าง/หาย inferเป็น allow-all.
 
 ## Build, test และ publish
 
@@ -61,8 +64,15 @@ dotnet build softphone-native-client.sln -c Release --no-restore -p:EnableWindow
 dotnet test tests/DebtFlow.SipAgent.Core.Tests/DebtFlow.SipAgent.Core.Tests.csproj -c Release --no-build
 ```
 
-CI เรียก script เดียวกันและอัปโหลด ZIP, TRX, checksum/evidence และ logs ในนาม
-`debt-flow-sip-agent-win-x64`; ยังไม่ใช่ signed installer
+CI เรียก P2 verifierและอัปโหลด ZIP, TRX, checksum/evidence และ logs. P5 releaseจาก clean exact tag
+`v1.0.0` ใช้:
+
+```powershell
+./scripts/verify-p5-release.ps1
+```
+
+ผลลัพธ์คือ unsigned self-contained multi-file `debt-flow-sip-agent-1.0.0-win-x64.zip` พร้อม
+SPDX SBOM, release manifestและ SHA-256 checksum; target machineไม่ต้องติดตั้ง .NET Runtime/SDK.
 
 ## V1 diagnostic client
 
@@ -85,7 +95,7 @@ CI เรียก script เดียวกันและอัปโหลด
 - active call ไม่ถูกตัดเมื่อ Portal หลุด; หลังจบสายจึง unregister/ล้าง credential
 - สายเข้าขณะไม่มี Portal ถูกตอบ 480 และจบด้วย `portal_unavailable`
 - Exit ระหว่างสายต้องยืนยัน จากนั้น hangup/unregister/flush ภายใน 10 วินาที
-- listener bind loopback, exact Origin, reject query string, one owner, 64 KiB และ 60 messages/10 seconds
+- listener bind loopback, configured allow-all/exact Origin, reject query string, one owner, 64 KiB และ 60 messages/10 seconds
 - durable `call.*` ถูกเขียน SQLite ก่อน publish และ replay จนได้รับ contiguous ACK
 - active-call journal ทำให้ process restart ปิด lifecycle เดิมด้วย `agent_restarted` เพียงครั้งเดียว
 - command journal มี `executing/completed/failed`; command ที่ crash ค้างจะไม่ dial ซ้ำจาก commandId เดิม
@@ -108,4 +118,5 @@ CI เรียก script เดียวกันและอัปโหลด
   [P2 result](docs/plan-results/2026-10-01-p2-hardening-result.md)
 - การปิด P2 ยังรอ [P2 Windows/PBX checklist](docs/manual-verification/p2-windows-pbx-soak.md):
   Windows host tests, UDP/TCP matrix, device change, diagnostic privacy review และ 2 ชั่วโมง/50 calls soak
-- phase หลัง: Portal/Web API/Collection DB call-history, installer, signing และ staged rollout
+- P5 sourceเพิ่ม portable release pipelineและ additive outbox health snapshotแล้ว; Windows release runner,
+  PBX/privacy matrix, owner migration readback, alert/rollback rehearsalและ full-target rolloutยัง pending

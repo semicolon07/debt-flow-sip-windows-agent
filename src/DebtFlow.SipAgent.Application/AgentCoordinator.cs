@@ -420,25 +420,33 @@ public sealed class AgentCoordinator : IAsyncDisposable
         IReadOnlyList<ActiveCallSnapshot> calls = _call is { State: not CallState.Ended } call
             ? [new ActiveCallSnapshot(call.CallId, ToWire(call.Direction), ToWire(call.State), call.StartedAtUtc, call.AnsweredAtUtc)]
             : [];
-        long pendingEventCount;
+        EventStoreHealth health;
         try
         {
-            pendingEventCount = await _eventStore.CountPendingAsync(cancellationToken);
+            health = await _eventStore.GetHealthAsync(cancellationToken);
         }
         catch (Exception exception) when (exception is not OperationCanceledException)
         {
             await MarkDegradedCoreAsync("outbox_unavailable", CancellationToken.None);
-            pendingEventCount = 0;
+            health = new EventStoreHealth(0, 0, EventStoreCapacityState.Full);
         }
+
+        long? oldestPendingAgeSeconds = health.OldestPendingAtUtc.HasValue
+            ? Math.Max(0, (long)(_clock.UtcNow - health.OldestPendingAtUtc.Value).TotalSeconds)
+            : null;
 
         return new AgentSnapshotPayload(
             _agentState,
             ToWire(_registrationState),
             _sipRuntime.AudioState,
             calls,
-            pendingEventCount,
+            health.PendingEventCount,
             _eventStore.LastSequence,
-            _agentStateCode);
+            _agentStateCode,
+            _eventStore.LastAcknowledgedSequence,
+            health.CapacityState.ToString().ToLowerInvariant(),
+            health.StorageBytes,
+            oldestPendingAgeSeconds);
     }
 
     private Task PortalConnectedCoreAsync(CancellationToken cancellationToken)

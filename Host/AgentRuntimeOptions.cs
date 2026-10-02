@@ -6,6 +6,7 @@ namespace DebtFlow.SipAgent.Host;
 public sealed record AgentRuntimeOptions(
     bool ConsoleMode,
     bool BackgroundMode,
+    bool IsAllowAllOrigins,
     IReadOnlySet<string> AllowedOrigins,
     string? ConfigurationError)
 {
@@ -43,6 +44,7 @@ public sealed record AgentRuntimeOptions(
         }
 
         var origins = new HashSet<string>(StringComparer.Ordinal);
+        bool isAllowAllOrigins = false;
         string? configurationError = null;
         if (consoleMode)
         {
@@ -63,14 +65,21 @@ public sealed record AgentRuntimeOptions(
                     AgentSettingsDocument document = JsonSerializer.Deserialize<AgentSettingsDocument>(
                         File.ReadAllBytes(resolvedConfigurationPath),
                         JsonOptions) ?? throw new JsonException();
-                    if (document.Agent?.AllowedOrigins == null)
+                    if (document.Agent == null)
                     {
                         throw new JsonException();
                     }
 
-                    foreach (string origin in document.Agent.AllowedOrigins)
+                    IReadOnlyList<string> configuredOrigins = document.Agent.AllowedOrigins ?? [];
+                    isAllowAllOrigins = document.Agent.IsAllowAllOrigins ?? configuredOrigins.Count == 0;
+                    foreach (string origin in configuredOrigins)
                     {
                         origins.Add(NormalizeOrigin(origin));
+                    }
+
+                    if (!isAllowAllOrigins && origins.Count == 0)
+                    {
+                        throw new AgentConfigurationException("origin_configuration_invalid");
                     }
                 }
                 catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or JsonException or AgentConfigurationException)
@@ -86,12 +95,12 @@ public sealed record AgentRuntimeOptions(
             origins.Add(NormalizeOrigin(origin));
         }
 
-        if (origins.Count == 0)
+        if (!isAllowAllOrigins && origins.Count == 0)
         {
             configurationError ??= "origin_configuration_missing";
         }
 
-        return new AgentRuntimeOptions(consoleMode, backgroundMode, origins, configurationError);
+        return new AgentRuntimeOptions(consoleMode, backgroundMode, isAllowAllOrigins, origins, configurationError);
     }
 
     public static string GetConfigurationPath()
@@ -122,7 +131,7 @@ public sealed record AgentRuntimeOptions(
     };
 
     private sealed record AgentSettingsDocument(AgentSettings Agent);
-    private sealed record AgentSettings(IReadOnlyList<string> AllowedOrigins);
+    private sealed record AgentSettings(bool? IsAllowAllOrigins, IReadOnlyList<string>? AllowedOrigins);
 }
 
 public sealed class AgentConfigurationException(string code) : Exception(code)

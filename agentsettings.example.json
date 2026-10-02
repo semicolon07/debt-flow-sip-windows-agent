@@ -1,7 +1,6 @@
 {
   "agent": {
-    "allowedOrigins": [
-      "https://portal.example.com"
-    ]
+    "isAllowAllOrigins": true,
+    "allowedOrigins": []
   }
 }

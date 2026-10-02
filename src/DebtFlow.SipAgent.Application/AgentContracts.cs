@@ -100,7 +100,8 @@ public enum EventStoreCapacityState
 public sealed record EventStoreHealth(
     long PendingEventCount,
     long StorageBytes,
-    EventStoreCapacityState CapacityState);
+    EventStoreCapacityState CapacityState,
+    DateTimeOffset? OldestPendingAtUtc = null);
 
 public sealed class AgentStoreException(string errorCode, Exception? innerException = null)
     : Exception(errorCode, innerException)

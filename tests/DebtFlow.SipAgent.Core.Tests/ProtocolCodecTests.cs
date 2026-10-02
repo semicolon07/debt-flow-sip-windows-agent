@@ -146,6 +146,14 @@ public sealed class ProtocolCodecTests
         Assert.Equal(expected, OriginPolicy.IsAllowed(origin, allowed));
     }
 
+    [Theory]
+    [InlineData("https://portal.example")]
+    [InlineData(null)]
+    public void OriginPolicy_AllowAll_BypassesOriginHeader(string? origin)
+    {
+        Assert.True(OriginPolicy.IsAllowed(origin, new HashSet<string>(), isAllowAllOrigins: true));
+    }
+
     [Fact]
     public void ComputeCommandIdentityHash_UsesOnlyNonSensitiveCommandIdentity()
     {

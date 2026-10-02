@@ -40,7 +40,7 @@ public sealed class LocalWebSocketServer(
         }
 
         string? origin = context.Request.Headers.Origin.FirstOrDefault();
-        if (!OriginPolicy.IsAllowed(origin, options.AllowedOrigins))
+        if (!OriginPolicy.IsAllowed(origin, options.AllowedOrigins, options.IsAllowAllOrigins))
         {
             context.Response.StatusCode = (int)HttpStatusCode.Forbidden;
             return;

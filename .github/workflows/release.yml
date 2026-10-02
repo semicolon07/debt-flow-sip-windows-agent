@@ -1,0 +1,27 @@
+name: release
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ['v*']
+
+jobs:
+  portable-win-x64:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+      - shell: pwsh
+        run: ./scripts/verify-p5-release.ps1 -OutputRoot artifacts/p5-release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: debt-flow-sip-agent-1.0.0-win-x64
+          path: |
+            artifacts/p5-release/**/debt-flow-sip-agent-1.0.0-win-x64.zip
+            artifacts/p5-release/**/debt-flow-sip-agent-1.0.0-win-x64.zip.sha256
+            artifacts/p5-release/**/verification/**/*.json
+            artifacts/p5-release/**/logs/**
