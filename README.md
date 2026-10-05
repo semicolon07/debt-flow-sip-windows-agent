@@ -7,7 +7,7 @@ Per-user SIP/audio tray agent สำหรับ Debt Flow Portal บน Windows
 
 - .NET 10 LTS, self-contained `win-x64`
 - WinForms tray + .NET Generic Host
-- Kestrel loopback WebSocket V1: `ws://localhost:8443/agent/v1`
+- Kestrel loopback secure WebSocket V1: `wss://localhost:8443/agent/v1` (ไม่มี plaintext listener/fallback)
 - SIPSorcery 10.0.16: UDP first และ automatic TCP fallback เมื่อเกิด transport-level temporary failure
 - SQLite schema v3 outbox/call journal: `%LOCALAPPDATA%\DebtFlow\SipAgent\agent-v1.db`
 - JSONL logs: `%LOCALAPPDATA%\DebtFlow\SipAgent\Logs`, 10 MB ต่อไฟล์/7 rolling files
@@ -16,6 +16,12 @@ Per-user SIP/audio tray agent สำหรับ Debt Flow Portal บน Windows
 Tray แสดง Agent, Portal, SIP, Call และ Audio status พร้อม Open log folder, safe diagnostic export,
 Start with Windows และ Exit. SIP host/account/password รับจาก Portal ผ่าน WebSocket เท่านั้น
 และไม่ถูกบันทึกใน config, registry, SQLite หรือ log
+
+ครั้งแรก Agent ขอ consent ไทย/อังกฤษแล้วสร้าง self-signed certificate สำหรับ `localhost`,
+`127.0.0.1` และ `::1` ด้วย CNG key แบบ non-exportable เฉพาะ Windows user. Certificate อยู่ใน
+`CurrentUser\My` และ public trust copy อยู่ใน `CurrentUser\Root`; metadata อยู่ที่
+`%LOCALAPPDATA%\DebtFlow\SipAgent\tls-certificate.json`. Agent rotate เมื่อเหลืออายุไม่เกิน 30 วัน.
+หาก policy บล็อกการติดตั้ง trust Agent จะเปิด degraded recovery tray โดยไม่เปิด SIP หรือ listener.
 
 ## Production Origin configuration
 
@@ -52,7 +58,7 @@ Windows:
 ./scripts/verify-p2-windows.ps1
 ```
 
-Script นี้รัน locked restore, Release build, tests ทั้ง solution (ขั้นต่ำ 81 cases ตาม source ปัจจุบัน),
+Script นี้รัน locked restore, Release build, tests ทั้ง solution (ขั้นต่ำ 109 cases ตาม source ปัจจุบัน),
 vulnerability gate, self-contained publish, ZIP integrity/checksum และสร้าง `p2-windows-evidence.json`
 ใน `artifacts/p2-windows/<run-id>`. P1 verifier เดิมยังใช้ได้และ default เป็น P1 evidence.
 
@@ -83,6 +89,21 @@ SPDX SBOM, release manifestและ SHA-256 checksum; target machineไม่�
 3. เปิด `http://localhost:8765/poc.html`
 4. Connect แล้ว configure/register ด้วย test credential
 
+หน้า HTTP localhost สำหรับ diagnostic สามารถเปิด `wss://localhost:8443` ได้เมื่อ certificate พร้อม.
+Production รองรับ Portal ผ่าน HTTPS บน Microsoft Edge และ Google Chrome. หาก production edge กำหนด
+CSP ภายนอก ต้องอนุญาต `connect-src wss://localhost:8443`.
+
+Certificate maintenance แบบ explicit consent:
+
+```powershell
+DebtFlow.SipAgent.Host.exe --repair-local-certificate
+DebtFlow.SipAgent.Host.exe --remove-local-certificate
+```
+
+flags นี้ใช้ร่วมกับ `--console`, `--background` หรือ `--allowed-origin` ไม่ได้ และจะปฏิเสธเมื่อ Agent
+instance หลักกำลังทำงาน. Exit codeคือ `0` success, `2` invalid arguments, `4` TLS operation failureและ
+`5` Agent already running. การลบโฟลเดอร์โปรแกรมไม่ลบ certificate; ให้ใช้ tray หรือ remove flag.
+
 `--console` เท่านั้นที่อนุญาต `http://localhost:8765`, `http://127.0.0.1:8765`
 และ `--allowed-origin`. Tray mode ไม่รับ command-line Origin override
 
@@ -95,7 +116,7 @@ SPDX SBOM, release manifestและ SHA-256 checksum; target machineไม่�
 - active call ไม่ถูกตัดเมื่อ Portal หลุด; หลังจบสายจึง unregister/ล้าง credential
 - สายเข้าขณะไม่มี Portal ถูกตอบ 480 และจบด้วย `portal_unavailable`
 - Exit ระหว่างสายต้องยืนยัน จากนั้น hangup/unregister/flush ภายใน 10 วินาที
-- listener bind loopback, configured allow-all/exact Origin, reject query string, one owner, 64 KiB และ 60 messages/10 seconds
+- WSS listener bind loopback, configured allow-all/exact Origin, reject query string, one owner, 64 KiB และ 60 messages/10 seconds
 - durable `call.*` ถูกเขียน SQLite ก่อน publish และ replay จนได้รับ contiguous ACK
 - active-call journal ทำให้ process restart ปิด lifecycle เดิมด้วย `agent_restarted` เพียงครั้งเดียว
 - command journal มี `executing/completed/failed`; command ที่ crash ค้างจะไม่ dial ซ้ำจาก commandId เดิม

@@ -28,7 +28,10 @@ public sealed class DiagnosticBundleExporterTests
                 1,
                 1,
                 true,
-                CancellationToken.None);
+                CancellationToken.None,
+                tlsCertificateProfileVersion: 1,
+                tlsCertificateDaysRemaining: 24,
+                tlsCertificateErrorCode: "tls_certificate_rotation_failed");
 
             using ZipArchive archive = ZipFile.OpenRead(output);
             Assert.NotNull(archive.GetEntry("summary.json"));
@@ -46,6 +49,8 @@ public sealed class DiagnosticBundleExporterTests
             Assert.DoesNotContain("0812345678", combined, StringComparison.Ordinal);
             Assert.DoesNotContain("portal.customer.example", combined, StringComparison.Ordinal);
             Assert.Contains("registration_failed", combined, StringComparison.Ordinal);
+            Assert.Contains("tls_certificate_rotation_failed", combined, StringComparison.Ordinal);
+            Assert.Contains("\"tlsCertificateDaysRemaining\":24", combined, StringComparison.Ordinal);
             Assert.Contains("[REDACTED]", combined, StringComparison.Ordinal);
         }
         finally

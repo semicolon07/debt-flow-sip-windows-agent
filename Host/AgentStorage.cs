@@ -10,6 +10,8 @@ public static class AgentStoragePaths
     public static string DatabasePath => Path.Combine(RootDirectory, "agent-v1.db");
     public static string LogDirectory => Path.Combine(RootDirectory, "Logs");
     public static string DiagnosticDirectory => Path.Combine(RootDirectory, "Diagnostics");
+    public static string TlsCertificateMetadataPath => Path.Combine(RootDirectory, "tls-certificate.json");
+    public static string TlsCertificateConsentPath => Path.Combine(RootDirectory, "tls-certificate-consent-v1");
 
     private static string ResolveLocalApplicationData()
     {

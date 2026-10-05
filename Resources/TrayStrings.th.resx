@@ -28,6 +28,16 @@
   <data name="RegistrationFailed" xml:space="preserve"><value>ลงทะเบียน SIP ไม่สำเร็จ กรุณาเปิด Portal เพื่อลองใหม่หรือตรวจสอบการตั้งค่า</value></data>
   <data name="PortUnavailable" xml:space="preserve"><value>พอร์ตภายในเครื่องของ SIP Agent ไม่พร้อมใช้งาน</value></data>
   <data name="AgentStartFailed" xml:space="preserve"><value>ไม่สามารถเปิด SIP Agent ได้ กรุณาตรวจสอบ Log หรือติดต่อผู้ดูแลระบบ</value></data>
+  <data name="TlsConsent" xml:space="preserve"><value>Debt Flow SIP Agent ต้องสร้างและติดตั้งใบรับรองเฉพาะเครื่องสำหรับการเชื่อมต่อแบบเข้ารหัสกับ Portal ใบรับรองนี้ใช้ได้เฉพาะ localhost และผู้ใช้ Windows คนนี้ ต้องการดำเนินการต่อหรือไม่</value></data>
+  <data name="TlsConsentTitle" xml:space="preserve"><value>ตั้งค่าการเชื่อมต่อภายในเครื่องแบบปลอดภัย</value></data>
+  <data name="TlsUnavailable" xml:space="preserve"><value>ใบรับรองภายในเครื่องยังไม่พร้อม ({0}) กรุณาเลือก ซ่อมแซมใบรับรองภายในเครื่อง</value></data>
+  <data name="TlsWarning" xml:space="preserve"><value>ใบรับรองภายในเครื่องปัจจุบันยังใช้งานได้ แต่ต้องซ่อมบำรุง ({0}) กรุณาเลือก ซ่อมแซมใบรับรองภายในเครื่อง</value></data>
+  <data name="RepairCertificate" xml:space="preserve"><value>ซ่อมแซมใบรับรองภายในเครื่อง</value></data>
+  <data name="RemoveCertificate" xml:space="preserve"><value>ลบใบรับรองภายในเครื่องและออก</value></data>
+  <data name="RemoveCertificateConfirm" xml:space="preserve"><value>ต้องการลบใบรับรองภายในเครื่องของ SIP Agent และออกหรือไม่</value></data>
+  <data name="CertificateRepairFailed" xml:space="preserve"><value>ไม่สามารถซ่อมแซมใบรับรองภายในเครื่องได้</value></data>
+  <data name="CertificateRemoveFailed" xml:space="preserve"><value>ไม่สามารถลบใบรับรองภายในเครื่องอย่างปลอดภัยได้</value></data>
+  <data name="ActiveCallBlocksCertificateMaintenance" xml:space="preserve"><value>กรุณาวางสายที่ใช้งานอยู่ก่อนซ่อมแซมหรือลบใบรับรองภายในเครื่อง</value></data>
   <data name="StateStarting" xml:space="preserve"><value>กำลังเริ่ม</value></data>
   <data name="StateReady" xml:space="preserve"><value>พร้อมใช้งาน</value></data>
   <data name="StateDegraded" xml:space="preserve"><value>ต้องดำเนินการ</value></data>

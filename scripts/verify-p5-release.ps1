@@ -88,6 +88,8 @@ try {
         version = $version
         gitCommit = $gitCommit
         protocolVersion = 1
+        localTransport = "wss"
+        certificateProfileVersion = 1
         sqliteSchemaVersion = 3
         capabilities = @(
             "sip.register",
@@ -104,6 +106,26 @@ try {
         supportedOperatingSystems = @("Windows 11 x64", "Windows 10 Enterprise LTSC x64")
         files = $fileHashes
     } | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $manifestPath -Encoding UTF8
+
+    $forbiddenEndpoint = "ws://localhost:8443"
+    $forbiddenCertificateExtensions = @(".pfx", ".p12", ".pem", ".key")
+    foreach ($publishedFile in Get-ChildItem -LiteralPath $publishDirectory -File -Recurse) {
+        if ($forbiddenCertificateExtensions -contains $publishedFile.Extension.ToLowerInvariant()) {
+            throw "shipping_certificate_or_private_key_file_found:$($publishedFile.FullName)"
+        }
+        $bytes = [System.IO.File]::ReadAllBytes($publishedFile.FullName)
+        $utf8Text = [System.Text.Encoding]::UTF8.GetString($bytes)
+        $unicodeText = [System.Text.Encoding]::Unicode.GetString($bytes)
+        if ($utf8Text.Contains($forbiddenEndpoint, [System.StringComparison]::Ordinal) -or
+            $unicodeText.Contains($forbiddenEndpoint, [System.StringComparison]::Ordinal)) {
+            throw "shipping_plaintext_websocket_endpoint_found:$($publishedFile.FullName)"
+        }
+        if ($utf8Text.Contains("-----BEGIN PRIVATE KEY-----", [System.StringComparison]::Ordinal) -or
+            $utf8Text.Contains("-----BEGIN RSA PRIVATE KEY-----", [System.StringComparison]::Ordinal) -or
+            $utf8Text.Contains("-----BEGIN CERTIFICATE-----", [System.StringComparison]::Ordinal)) {
+            throw "shipping_embedded_certificate_material_found:$($publishedFile.FullName)"
+        }
+    }
 
     Add-Type -AssemblyName System.IO.Compression
     $stream = [System.IO.File]::Open($artifactPath, [System.IO.FileMode]::CreateNew)

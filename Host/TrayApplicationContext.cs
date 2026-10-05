@@ -19,6 +19,8 @@ public sealed class TrayApplicationContext : ApplicationContext
     private readonly IAgentEventStore _eventStore;
     private readonly DiagnosticBundleExporter _diagnosticExporter;
     private readonly string _logDirectory;
+    private readonly int? _tlsDaysRemaining;
+    private readonly string? _tlsWarningCode;
     private readonly NotifyIcon _notifyIcon;
     private readonly ToolStripMenuItem _agentStatus;
     private readonly ToolStripMenuItem _portalStatus;
@@ -32,6 +34,8 @@ public sealed class TrayApplicationContext : ApplicationContext
     private bool _exitStarted;
     private int _refreshing;
 
+    public AgentMaintenanceRequest MaintenanceRequest { get; private set; }
+
     public TrayApplicationContext(
         AgentCoordinator coordinator,
         LocalWebSocketServer webSocketServer,
@@ -42,7 +46,9 @@ public sealed class TrayApplicationContext : ApplicationContext
         IAgentEventStore eventStore,
         DiagnosticBundleExporter diagnosticExporter,
         string logDirectory,
-        bool startupRegistrationFailed)
+        bool startupRegistrationFailed,
+        int? tlsDaysRemaining = null,
+        string? tlsWarningCode = null)
     {
         _coordinator = coordinator;
         _webSocketServer = webSocketServer;
@@ -53,6 +59,8 @@ public sealed class TrayApplicationContext : ApplicationContext
         _eventStore = eventStore;
         _diagnosticExporter = diagnosticExporter;
         _logDirectory = logDirectory;
+        _tlsDaysRemaining = tlsDaysRemaining;
+        _tlsWarningCode = tlsWarningCode;
         _uiContext = SynchronizationContext.Current ?? new WindowsFormsSynchronizationContext();
 
         _agentStatus = StatusItem("AgentStatus", TrayText.State("starting"));
@@ -71,6 +79,10 @@ public sealed class TrayApplicationContext : ApplicationContext
         openLogs.Click += (_, _) => OpenLogDirectory();
         var exportDiagnostics = new ToolStripMenuItem(TrayText.Get("ExportDiagnostics"));
         exportDiagnostics.Click += async (_, _) => await ExportDiagnosticsAsync();
+        var repairCertificate = new ToolStripMenuItem(TrayText.Get("RepairCertificate"));
+        repairCertificate.Click += async (_, _) => await RequestCertificateMaintenanceAsync(AgentMaintenanceRequest.RepairCertificate);
+        var removeCertificate = new ToolStripMenuItem(TrayText.Get("RemoveCertificate"));
+        removeCertificate.Click += async (_, _) => await RequestCertificateMaintenanceAsync(AgentMaintenanceRequest.RemoveCertificate);
         var exit = new ToolStripMenuItem(TrayText.Get("Exit"));
         exit.Click += async (_, _) => await ExitAsync(confirmActiveCall: true);
 
@@ -84,6 +96,8 @@ public sealed class TrayApplicationContext : ApplicationContext
             new ToolStripSeparator(),
             openLogs,
             exportDiagnostics,
+            repairCertificate,
+            removeCertificate,
             _startupItem,
             new ToolStripSeparator(),
             exit
@@ -111,6 +125,11 @@ public sealed class TrayApplicationContext : ApplicationContext
         if (startupRegistrationFailed)
         {
             Notify("startup_registration_failed", TrayText.Get("StartupFailed"));
+        }
+
+        if (tlsWarningCode != null)
+        {
+            Notify(tlsWarningCode, TrayText.Format("TlsWarning", tlsWarningCode));
         }
     }
 
@@ -209,6 +228,35 @@ public sealed class TrayApplicationContext : ApplicationContext
         ExitThread();
     }
 
+    private async Task RequestCertificateMaintenanceAsync(AgentMaintenanceRequest request)
+    {
+        if (_exitStarted) return;
+
+        AgentSnapshotPayload snapshot = await _coordinator.GetSnapshotAsync(CancellationToken.None);
+        if (snapshot.ActiveCalls.Count > 0)
+        {
+            MessageBox.Show(
+                TrayText.Get("ActiveCallBlocksCertificateMaintenance"),
+                TrayText.Get("ActionRequired"),
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Warning);
+            return;
+        }
+
+        if (request == AgentMaintenanceRequest.RemoveCertificate && MessageBox.Show(
+                TrayText.Get("RemoveCertificateConfirm"),
+                TrayText.Get("ActionRequired"),
+                MessageBoxButtons.YesNo,
+                MessageBoxIcon.Warning,
+                MessageBoxDefaultButton.Button2) != DialogResult.Yes)
+        {
+            return;
+        }
+
+        MaintenanceRequest = request;
+        await ExitAsync(confirmActiveCall: false);
+    }
+
     private void OnSessionEnding(object sender, SessionEndingEventArgs eventArgs) =>
         _uiContext.Post(async _ => await ExitAsync(confirmActiveCall: false), null);
 
@@ -266,7 +314,10 @@ public sealed class TrayApplicationContext : ApplicationContext
                 WaveIn.DeviceCount,
                 WaveOut.DeviceCount,
                 _options.IsOperational,
-                CancellationToken.None);
+                CancellationToken.None,
+                LocalTlsCertificateProfile.Version,
+                _tlsDaysRemaining,
+                _tlsWarningCode);
             MessageBox.Show(
                 TrayText.Format("DiagnosticExported", exported),
                 TrayText.Get("AppName"),

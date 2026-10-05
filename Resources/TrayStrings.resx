@@ -28,6 +28,16 @@
   <data name="RegistrationFailed" xml:space="preserve"><value>SIP registration failed. Open Portal to retry or review the configuration.</value></data>
   <data name="PortUnavailable" xml:space="preserve"><value>The local SIP Agent port is unavailable.</value></data>
   <data name="AgentStartFailed" xml:space="preserve"><value>SIP Agent could not start. Review the diagnostic log or contact support.</value></data>
+  <data name="TlsConsent" xml:space="preserve"><value>Debt Flow SIP Agent needs to create and trust a private local certificate for encrypted communication with Portal. The certificate is valid only for localhost and this Windows user. Continue?</value></data>
+  <data name="TlsConsentTitle" xml:space="preserve"><value>Set up secure local connection</value></data>
+  <data name="TlsUnavailable" xml:space="preserve"><value>The local certificate is not ready ({0}). Use Repair local certificate.</value></data>
+  <data name="TlsWarning" xml:space="preserve"><value>The current local certificate remains active, but maintenance needs attention ({0}). Use Repair local certificate.</value></data>
+  <data name="RepairCertificate" xml:space="preserve"><value>Repair local certificate</value></data>
+  <data name="RemoveCertificate" xml:space="preserve"><value>Remove local certificate and exit</value></data>
+  <data name="RemoveCertificateConfirm" xml:space="preserve"><value>Remove the SIP Agent local certificate and exit?</value></data>
+  <data name="CertificateRepairFailed" xml:space="preserve"><value>The local certificate could not be repaired.</value></data>
+  <data name="CertificateRemoveFailed" xml:space="preserve"><value>The local certificate could not be removed safely.</value></data>
+  <data name="ActiveCallBlocksCertificateMaintenance" xml:space="preserve"><value>End the active call before repairing or removing the local certificate.</value></data>
   <data name="StateStarting" xml:space="preserve"><value>Starting</value></data>
   <data name="StateReady" xml:space="preserve"><value>Ready</value></data>
   <data name="StateDegraded" xml:space="preserve"><value>Action required</value></data>

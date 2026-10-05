@@ -210,7 +210,7 @@ try {
             (Get-CounterValue $counters "aborted")
     }
 
-    $minimumTestCount = if ($Phase -eq "p2") { 81 } else { 67 }
+    $minimumTestCount = if ($Phase -eq "p2") { 109 } else { 67 }
     if ($testTotal -lt $minimumTestCount -or $testPassed -ne $testTotal -or $testFailed -ne 0) {
         throw "test_evidence_invalid:total=$testTotal passed=$testPassed failed=$testFailed"
     }

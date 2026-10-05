@@ -1,6 +1,7 @@
 using System.Net;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Hosting;
+using Microsoft.AspNetCore.Server.Kestrel.Https;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
@@ -14,7 +15,19 @@ public static class Program
     [STAThread]
     public static int Main(string[] args)
     {
-        bool consoleRequested = args.Contains("--console", StringComparer.Ordinal);
+        AgentLaunchCommand command;
+        try
+        {
+            command = AgentCommandLine.Parse(args);
+        }
+        catch (AgentConfigurationException exception)
+        {
+            ConsoleSession.EnsureAttached();
+            Console.Error.WriteLine(exception.Code);
+            return 2;
+        }
+
+        bool consoleRequested = args.Contains("--console", StringComparer.Ordinal) || command != AgentLaunchCommand.Run;
         if (consoleRequested)
         {
             ConsoleSession.EnsureAttached();
@@ -25,10 +38,10 @@ public static class Program
             _ = AgentSettingsProvisioner.EnsureFromPackagedExample();
         }
 
-        AgentRuntimeOptions options;
+        AgentRuntimeOptions? options = null;
         try
         {
-            options = AgentRuntimeOptions.Load(args);
+            if (command == AgentLaunchCommand.Run) options = AgentRuntimeOptions.Load(args);
         }
         catch (AgentConfigurationException exception)
         {
@@ -44,7 +57,7 @@ public static class Program
             return 2;
         }
 
-        if (!options.ConsoleMode && !options.IsOperational)
+        if (options is { ConsoleMode: false, IsOperational: false })
         {
             using var dialog = new OriginConfigurationDialog();
             if (dialog.ShowDialog() != DialogResult.OK ||
@@ -62,11 +75,11 @@ public static class Program
 
         try
         {
-            return RunAsync(options).GetAwaiter().GetResult();
+            return RunAsync(command, options).GetAwaiter().GetResult();
         }
         catch (Exception exception)
         {
-            if (options.ConsoleMode)
+            if (consoleRequested)
             {
                 Console.Error.WriteLine($"agent_start_failed:{exception.GetType().Name}");
             }
@@ -83,11 +96,17 @@ public static class Program
         }
     }
 
-    private static async Task<int> RunAsync(AgentRuntimeOptions options)
+    private static async Task<int> RunAsync(AgentLaunchCommand command, AgentRuntimeOptions? options)
     {
         await using SingleInstanceCoordinator singleInstance = SingleInstanceCoordinator.Create();
         if (!singleInstance.IsPrimary)
         {
+            if (command != AgentLaunchCommand.Run)
+            {
+                Console.Error.WriteLine("agent_already_running");
+                return 5;
+            }
+
             try
             {
                 using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(3));
@@ -101,6 +120,118 @@ public static class Program
         }
 
         singleInstance.StartActivationServer();
+        ILocalTlsCertificateManager certificateManager = new LocalTlsCertificateManager(
+            new WindowsLocalTlsCertificatePlatform(),
+            new FileLocalTlsCertificateMetadataStore(AgentStoragePaths.TlsCertificateMetadataPath),
+            new SystemLocalTlsClock(),
+            new FileLocalTlsConsentStore(AgentStoragePaths.TlsCertificateConsentPath));
+
+        if (command != AgentLaunchCommand.Run)
+        {
+            LocalTlsCertificateResult maintenanceResult = command == AgentLaunchCommand.RepairLocalCertificate
+                ? await certificateManager.RepairAsync(CancellationToken.None)
+                : await certificateManager.RemoveAsync(CancellationToken.None);
+            maintenanceResult.Certificate?.Dispose();
+            if (maintenanceResult.ErrorCode != null)
+            {
+                Console.Error.WriteLine(maintenanceResult.ErrorCode);
+                return 4;
+            }
+
+            Console.WriteLine(command == AgentLaunchCommand.RepairLocalCertificate
+                ? "local_certificate_repaired"
+                : "local_certificate_removed");
+            return 0;
+        }
+
+        if (options == null) throw new InvalidOperationException("runtime_options_unavailable");
+        while (true)
+        {
+            LocalTlsCertificateResult tls = await certificateManager.EnsureReadyAsync(
+                () => RequestTlsConsent(options.ConsoleMode),
+                CancellationToken.None);
+            if (!tls.IsReady || tls.Certificate == null)
+            {
+                tls.Certificate?.Dispose();
+                if (options.ConsoleMode)
+                {
+                    Console.Error.WriteLine(tls.ErrorCode ?? "tls_certificate_invalid");
+                    return 4;
+                }
+
+                using var recovery = new TlsRecoveryApplicationContext(
+                    certificateManager,
+                    singleInstance,
+                    tls,
+                    new TlsDiagnosticExporter(),
+                    AgentStoragePaths.LogDirectory);
+                System.Windows.Forms.Application.Run(recovery);
+                if (recovery.RetryRequested) continue;
+                return 4;
+            }
+
+            RuntimeExecutionResult runtime;
+            using (tls.Certificate)
+            {
+                runtime = await RunRuntimeAsync(
+                    options,
+                    tls.Certificate,
+                    singleInstance,
+                    tls.DaysRemaining,
+                    tls.IsDegraded ? tls.ErrorCode : null);
+            }
+
+            if (runtime.ExitCode != 0) return runtime.ExitCode;
+            AgentMaintenanceRequest request = runtime.MaintenanceRequest;
+            if (request == AgentMaintenanceRequest.None) return 0;
+            LocalTlsCertificateResult result = request == AgentMaintenanceRequest.RepairCertificate
+                ? await certificateManager.RepairAsync(CancellationToken.None)
+                : await certificateManager.RemoveAsync(CancellationToken.None);
+            result.Certificate?.Dispose();
+            if (result.ErrorCode != null)
+            {
+                using var recovery = new TlsRecoveryApplicationContext(
+                    certificateManager,
+                    singleInstance,
+                    result,
+                    new TlsDiagnosticExporter(),
+                    AgentStoragePaths.LogDirectory);
+                System.Windows.Forms.Application.Run(recovery);
+                if (recovery.RetryRequested) continue;
+                return 4;
+            }
+
+            if (request == AgentMaintenanceRequest.RemoveCertificate) return 0;
+        }
+    }
+
+    private static bool RequestTlsConsent(bool consoleMode)
+    {
+        if (!consoleMode)
+        {
+            return MessageBox.Show(
+                TrayText.Get("TlsConsent"),
+                TrayText.Get("TlsConsentTitle"),
+                MessageBoxButtons.YesNo,
+                MessageBoxIcon.Information,
+                MessageBoxDefaultButton.Button2) == DialogResult.Yes;
+        }
+
+        Console.Error.WriteLine(TrayText.Get("TlsConsent"));
+        Console.Error.Write("Continue? [y/N]: ");
+        string? response = Console.ReadLine()?.Trim();
+        return string.Equals(response, "y", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(response, "yes", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static async Task<RuntimeExecutionResult> RunRuntimeAsync(
+        AgentRuntimeOptions options,
+        System.Security.Cryptography.X509Certificates.X509Certificate2 certificate,
+        SingleInstanceCoordinator singleInstance,
+        int? tlsDaysRemaining,
+        string? tlsWarningCode)
+    {
+        AgentMaintenanceRequest maintenanceRequest = AgentMaintenanceRequest.None;
         string logDirectory = AgentStoragePaths.LogDirectory;
         var logProvider = new SafeJsonLoggerProvider(logDirectory, options.ConsoleMode);
         (IAgentEventStore eventStore, bool durableStoreAvailable, string? storageFailureCode) = await AgentEventStoreFactory.CreateAsync(
@@ -118,7 +249,7 @@ public static class Program
         builder.WebHost.ConfigureKestrel(server =>
         {
             server.AddServerHeader = false;
-            server.ListenLocalhost(AgentRuntimeOptions.Port);
+            server.ListenLocalhost(AgentRuntimeOptions.Port, listen => listen.UseHttps(certificate));
         });
 
         builder.Services.AddSingleton(options);
@@ -183,6 +314,11 @@ public static class Program
             logger.LogWarning("Agent configuration is degraded with code {Code}", options.ConfigurationError);
         }
 
+        if (tlsWarningCode != null)
+        {
+            logger.LogWarning("Local TLS certificate is operating with warning code {Code}", tlsWarningCode);
+        }
+
         try
         {
             await app.StartAsync();
@@ -199,7 +335,7 @@ public static class Program
                     MessageBoxIcon.Error);
             }
 
-            return 3;
+            return new RuntimeExecutionResult(3, AgentMaintenanceRequest.None);
         }
 
         if (options.ConsoleMode)
@@ -230,15 +366,20 @@ public static class Program
                 eventStore,
                 app.Services.GetRequiredService<DiagnosticBundleExporter>(),
                 logDirectory,
-                startupRegistrationFailed);
+                startupRegistrationFailed,
+                tlsDaysRemaining,
+                tlsWarningCode);
             System.Windows.Forms.Application.Run(tray);
+            maintenanceRequest = tray.MaintenanceRequest;
         }
 
         using var shutdown = new CancellationTokenSource(TimeSpan.FromSeconds(10));
         await coordinator.ShutdownAsync(shutdown.Token);
         await app.StopAsync(shutdown.Token);
         logger.LogInformation("Debt Flow SIP Agent stopped");
-        return 0;
+        return new RuntimeExecutionResult(0, maintenanceRequest);
     }
+
+    private sealed record RuntimeExecutionResult(int ExitCode, AgentMaintenanceRequest MaintenanceRequest);
 
 }

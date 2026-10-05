@@ -18,7 +18,10 @@ public sealed class DiagnosticBundleExporter(string logDirectory)
         int captureDeviceCount,
         int playbackDeviceCount,
         bool localConfigurationValid,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        int tlsCertificateProfileVersion = LocalTlsCertificateProfile.Version,
+        int? tlsCertificateDaysRemaining = null,
+        string? tlsCertificateErrorCode = null)
     {
         string fullPath = Path.GetFullPath(outputPath);
         string? directory = Path.GetDirectoryName(fullPath);
@@ -59,7 +62,10 @@ public sealed class DiagnosticBundleExporter(string logDirectory)
                             storageState = storage.CapacityState.ToString().ToLowerInvariant(),
                             captureDeviceCount,
                             playbackDeviceCount,
-                            localConfigurationValid
+                            localConfigurationValid,
+                            tlsCertificateProfileVersion,
+                            tlsCertificateDaysRemaining,
+                            tlsCertificateErrorCode
                         },
                         ProtocolJson.Options,
                         cancellationToken);

@@ -13,13 +13,18 @@ source inspection หรือผล P1 เดิมแทนการทดส�
 ./scripts/verify-p2-windows.ps1
 ```
 
-ต้องได้ Release build 0 warning/error, core + Windows host testsอย่างน้อย 81 casesผ่านทั้งหมด,
+ต้องได้ Release build 0 warning/error, core + Windows host testsอย่างน้อย 109 casesผ่านทั้งหมด,
 vulnerability count 0, self-contained multi-file ZIP, SHA-256 และ `p2-windows-evidence.json`.
 
 ## PBX and failure matrix
 
 | ID | Scenario | Expected | Result/evidence |
 | --- | --- | --- | --- |
+| P2-TLS-01 | clean standard-user profile + first launch | consentครั้งเดียว, My/Root/CNG metadataครบและ WSS trusted | pending |
+| P2-TLS-02 | HTTPS Portalใน Edge/Chrome + HTTP localhost PoC | ทั้งสองเชื่อม WSS; plaintext WSล้มเหลว | pending |
+| P2-TLS-03 | enterprise policyบล็อก CurrentUser Root | degraded recovery tray; ไม่มี listener/SIP; safe error | pending |
+| P2-TLS-04 | restart/reuse, <=30-day rotationและ rotation failure | reuse/rotateถูกต้อง; valid-old fallbackมี warning | pending |
+| P2-TLS-05 | Repair และ Removeจาก tray/CLI | ownership guard, key/store/metadata cleanup; config/DB/logคงอยู่ | pending |
 | P2-SIP-01 | UDP register + outbound/inbound/audio/DTMF | P1 behavior ยังผ่าน; terminal ต่อ call หนึ่งรายการ | pending |
 | P2-SIP-02 | UDP no-response/transport failure | state `retrying`, jittered retry และเปลี่ยนไป TCP | pending |
 | P2-SIP-03 | TCP register + outbound/inbound/audio/DTMF | ใช้งานได้โดยไม่เพิ่ม Admin transport field | pending |

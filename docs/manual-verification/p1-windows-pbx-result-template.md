@@ -56,6 +56,9 @@ artifact hash ตรงกับ automated evidence และ sign-off ครบ
 | TRAY-05 | `NOT_RUN` |  |  |
 | TRAY-06 | `NOT_RUN` |  |  |
 | TRAY-07 | `NOT_RUN` |  |  |
+| TRAY-08 | `NOT_RUN` |  |  |
+| TRAY-09 | `NOT_RUN` |  |  |
+| TRAY-10 | `NOT_RUN` |  |  |
 
 ## 5. WebSocket V1 gate
 
@@ -68,6 +71,8 @@ artifact hash ตรงกับ automated evidence และ sign-off ครบ
 | WS-05 | `NOT_RUN` |  |  |
 | WS-06 | `NOT_RUN` |  |  |
 | WS-07 | `NOT_RUN` |  |  |
+| WS-08 | `NOT_RUN` |  |  |
+| WS-09 | `NOT_RUN` |  |  |
 
 ## 6. PBX/audio gate
 

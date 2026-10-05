@@ -1,5 +1,7 @@
 using System.Net;
 using System.Net.WebSockets;
+using System.Security.Cryptography;
+using System.Security.Cryptography.X509Certificates;
 using System.Text.Json;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Hosting;
@@ -70,8 +72,10 @@ public sealed class LocalWebSocketServerTests
             NullLogger<LocalWebSocketServer>.Instance,
             options);
 
+        using X509Certificate2 testCertificate = CreateTestCertificate();
         WebApplicationBuilder builder = WebApplication.CreateSlimBuilder();
-        builder.WebHost.ConfigureKestrel(server => server.Listen(IPAddress.Loopback, 0));
+        builder.WebHost.ConfigureKestrel(server =>
+            server.Listen(IPAddress.Loopback, 0, listen => listen.UseHttps(testCertificate)));
         await using WebApplication app = builder.Build();
         app.UseWebSockets();
         app.Map("/agent/v1", endpoint.HandleAsync);
@@ -79,14 +83,18 @@ public sealed class LocalWebSocketServerTests
 
         try
         {
-            string httpAddress = app.Services.GetRequiredService<IServer>()
+            string httpsAddress = app.Services.GetRequiredService<IServer>()
                 .Features.Get<IServerAddressesFeature>()!.Addresses.Single();
-            using var http = new HttpClient();
+            using var httpHandler = new HttpClientHandler
+            {
+                ServerCertificateCustomValidationCallback = (_, _, _, _) => true
+            };
+            using var http = new HttpClient(httpHandler);
             using HttpResponseMessage queryRejected = await http.GetAsync(
-                httpAddress + "/agent/v1?password=must-not-be-accepted");
+                httpsAddress + "/agent/v1?password=must-not-be-accepted");
             Assert.Equal(HttpStatusCode.BadRequest, queryRejected.StatusCode);
 
-            using var wrongOrigin = new HttpRequestMessage(HttpMethod.Get, httpAddress + "/agent/v1")
+            using var wrongOrigin = new HttpRequestMessage(HttpMethod.Get, httpsAddress + "/agent/v1")
             {
                 Version = HttpVersion.Version11,
                 VersionPolicy = HttpVersionPolicy.RequestVersionExact
@@ -99,7 +107,7 @@ public sealed class LocalWebSocketServerTests
             using HttpResponseMessage originRejected = await http.SendAsync(wrongOrigin);
             Assert.Equal(HttpStatusCode.Forbidden, originRejected.StatusCode);
 
-            var uri = new Uri(httpAddress.Replace("http://", "ws://", StringComparison.Ordinal) + "/agent/v1");
+            var uri = new Uri(httpsAddress.Replace("https://", "wss://", StringComparison.Ordinal) + "/agent/v1");
             using (var invalidHello = CreateClient("http://localhost:8765"))
             {
                 await invalidHello.ConnectAsync(uri, CancellationToken.None);
@@ -197,7 +205,19 @@ public sealed class LocalWebSocketServerTests
     {
         var client = new ClientWebSocket();
         client.Options.SetRequestHeader("Origin", origin);
+        client.Options.RemoteCertificateValidationCallback = (_, _, _, _) => true;
         return client;
+    }
+
+    private static X509Certificate2 CreateTestCertificate()
+    {
+        using RSA rsa = RSA.Create(2048);
+        var request = new CertificateRequest("CN=localhost", rsa, HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1);
+        var san = new SubjectAlternativeNameBuilder();
+        san.AddDnsName("localhost");
+        san.AddIpAddress(IPAddress.Loopback);
+        request.CertificateExtensions.Add(san.Build());
+        return request.CreateSelfSigned(DateTimeOffset.UtcNow.AddMinutes(-1), DateTimeOffset.UtcNow.AddHours(1));
     }
 
     private static Task SendAsync(ClientWebSocket socket, byte[] message, CancellationToken cancellationToken) =>

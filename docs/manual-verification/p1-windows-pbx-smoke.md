@@ -32,16 +32,21 @@ NuGet vulnerability ทุก project ใน solution; dirty tree หรือ v
 - `TRAY-05` toggle Start with Windows, sign out/in และตรวจหนึ่ง process ต่อ user
 - `TRAY-06` Open log folder ต้องเปิด `%LOCALAPPDATA%\DebtFlow\SipAgent\Logs`
 - `TRAY-07` port 8443 ถูกใช้งานอยู่ต้องแสดง actionable error โดยไม่ crash/เปิด listenerอื่น
+- `TRAY-08` clean user profile แสดง consent ครั้งเดียวและติดตั้ง certificate โดยไม่ใช้ UAC
+- `TRAY-09` trust policy denial เปิด degraded recovery tray โดยไม่ initialize SIP/listener; Repair แล้วเริ่ม runtime ใน process เดิม
+- `TRAY-10` Remove certificate ลบ tracked My/Root/CNG key/metadata แต่คง config, SQLite และ logs
 
 ## 3. WebSocket V1 gate
 
-- `WS-01` เริ่ม `--console`, serve `poc.html` ที่ localhost:8765 และ connect สำเร็จ
+- `WS-01` เริ่ม `--console`, serve `poc.html` ที่ HTTP localhost:8765 และ connect WSS สำเร็จ
 - `WS-02` unknown/missing Origin ได้ HTTP 403; second client ได้ `client_already_connected`
 - `WS-03` request ที่มี query string ทุกชนิดถูกปฏิเสธ และ query value ไม่ปรากฏใน log
 - `WS-04` welcome มาก่อน snapshot และ replay; heartbeat 15/45 วินาทีไม่ disconnectผิดพลาด
 - `WS-05` message เกิน 64 KiB และมากกว่า 60 messages/10 seconds ถูกปฏิเสธด้วย safe code
 - `WS-06` disconnect/reconnectภายใน 60 วินาทีรักษา registration และ replay pending events
 - `WS-07` disconnectเกิน 60 วินาทีเมื่อไม่มีสายต้อง unregister/clear credential
+- `WS-08` plaintext WS บน 8443 ล้มเหลว และ shipping artifact ไม่มี plaintext endpoint/fallback
+- `WS-09` HTTPS Portal เชื่อมสำเร็จบน Edge/Chrome current enterprise; ตรวจ IPv4/IPv6 loopback และ Local Network Access policy
 
 ## 4. PBX/audio gate
 
