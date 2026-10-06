@@ -331,7 +331,7 @@ public sealed class AgentCoordinator : IAsyncDisposable
             command.CallId,
             command.CommandId,
             _clock.UtcNow,
-            SensitiveValueMasker.MaskRemoteParty(command.Destination),
+            RemotePartyNormalizer.Normalize(command.Destination),
             _collectionId,
             _collectionBindingId,
             command.CallContextId);
@@ -340,7 +340,7 @@ public sealed class AgentCoordinator : IAsyncDisposable
             await EmitCallEventAsync(
                 "call.created",
                 _call,
-                new { direction = "outbound", remoteParty = _call.MaskedRemoteParty },
+                new { direction = "outbound", remoteParty = _call.RemoteParty },
                 cancellationToken);
             await ApplyCallSignalCoreAsync(
                 new CallSignal(CallSignalType.Dial, _clock.UtcNow),
@@ -682,7 +682,7 @@ public sealed class AgentCoordinator : IAsyncDisposable
         _call = CallReducer.CreateInbound(
             _ids.NewId(),
             _clock.UtcNow,
-            SensitiveValueMasker.MaskRemoteParty(caller),
+            RemotePartyNormalizer.Normalize(caller),
             _collectionId,
             _collectionBindingId);
         try
@@ -690,7 +690,7 @@ public sealed class AgentCoordinator : IAsyncDisposable
             await EmitCallEventAsync(
                 "call.created",
                 _call,
-                new { direction = "inbound", remoteParty = _call.MaskedRemoteParty },
+                new { direction = "inbound", remoteParty = _call.RemoteParty },
                 cancellationToken);
             await ApplyCallSignalCoreAsync(
                 new CallSignal(CallSignalType.Incoming, _clock.UtcNow),

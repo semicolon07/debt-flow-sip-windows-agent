@@ -90,7 +90,7 @@ try {
         protocolVersion = 1
         localTransport = "wss"
         certificateProfileVersion = 1
-        sqliteSchemaVersion = 3
+        sqliteSchemaVersion = 4
         capabilities = @(
             "sip.register",
             "call.outbound",

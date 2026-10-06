@@ -12,7 +12,7 @@ public sealed record EventStoreLimits(long MaximumPendingEvents, long MaximumSto
 
 public sealed class SqliteAgentEventStore : IAgentEventStore
 {
-    private const int CurrentSchemaVersion = 3;
+    private const int CurrentSchemaVersion = 4;
     private readonly string _databasePath;
     private readonly EventStoreLimits _limits;
     private readonly SemaphoreSlim _gate = new(1, 1);
@@ -187,7 +187,7 @@ public sealed class SqliteAgentEventStore : IAgentEventStore
             command.CommandText =
                 """
                 SELECT CallId, CommandId, Direction, CallState, StartedAtUtc, AnsweredAtUtc,
-                       EndedAtUtc, Outcome, EndReason, MaskedRemoteParty,
+                       EndedAtUtc, Outcome, EndReason, RemoteParty,
                        CollectionId, CollectionBindingId, CallContextId
                 FROM ActiveCallJournal
                 WHERE JournalId = 1;
@@ -551,10 +551,10 @@ public sealed class SqliteAgentEventStore : IAgentEventStore
             """
             INSERT INTO ActiveCallJournal
                 (JournalId, CallId, CommandId, Direction, CallState, StartedAtUtc, AnsweredAtUtc,
-                 EndedAtUtc, Outcome, EndReason, MaskedRemoteParty, CollectionId, CollectionBindingId, CallContextId)
+                 EndedAtUtc, Outcome, EndReason, RemoteParty, CollectionId, CollectionBindingId, CallContextId)
             VALUES
                 (1, $callId, $commandId, $direction, $callState, $startedAtUtc, $answeredAtUtc,
-                 $endedAtUtc, $outcome, $endReason, $maskedRemoteParty, $collectionId, $collectionBindingId, $callContextId)
+                 $endedAtUtc, $outcome, $endReason, $remoteParty, $collectionId, $collectionBindingId, $callContextId)
             ON CONFLICT(JournalId) DO UPDATE SET
                 CallId = excluded.CallId,
                 CommandId = excluded.CommandId,
@@ -565,7 +565,7 @@ public sealed class SqliteAgentEventStore : IAgentEventStore
                 EndedAtUtc = excluded.EndedAtUtc,
                 Outcome = excluded.Outcome,
                 EndReason = excluded.EndReason,
-                MaskedRemoteParty = excluded.MaskedRemoteParty,
+                RemoteParty = excluded.RemoteParty,
                 CollectionId = excluded.CollectionId,
                 CollectionBindingId = excluded.CollectionBindingId,
                 CallContextId = excluded.CallContextId;
@@ -579,7 +579,7 @@ public sealed class SqliteAgentEventStore : IAgentEventStore
         command.Parameters.AddWithValue("$endedAtUtc", FormatNullableTimestamp(call.EndedAtUtc));
         command.Parameters.AddWithValue("$outcome", call.Outcome?.ToString() ?? (object)DBNull.Value);
         command.Parameters.AddWithValue("$endReason", (object?)call.EndReason ?? DBNull.Value);
-        command.Parameters.AddWithValue("$maskedRemoteParty", call.MaskedRemoteParty);
+        command.Parameters.AddWithValue("$remoteParty", call.RemoteParty);
         command.Parameters.AddWithValue("$collectionId", (object?)call.CollectionId ?? DBNull.Value);
         command.Parameters.AddWithValue("$collectionBindingId", (object?)call.CollectionBindingId ?? DBNull.Value);
         command.Parameters.AddWithValue("$callContextId", (object?)call.CallContextId ?? DBNull.Value);
@@ -635,6 +635,12 @@ public sealed class SqliteAgentEventStore : IAgentEventStore
             {
                 await EnsureCollectionBindingMigrationSafeAsync(connection, transaction, cancellationToken);
                 await ExecuteMigrationCommandAsync(connection, transaction, UpgradeV2ToV3Sql, cancellationToken);
+                version = 3;
+            }
+
+            if (version == 3)
+            {
+                await ExecuteMigrationCommandAsync(connection, transaction, UpgradeV3ToV4Sql, cancellationToken);
             }
         }
 
@@ -873,7 +879,7 @@ public sealed class SqliteAgentEventStore : IAgentEventStore
             EndedAtUtc TEXT NULL,
             Outcome TEXT NULL,
             EndReason TEXT NULL,
-            MaskedRemoteParty TEXT NOT NULL,
+            RemoteParty TEXT NOT NULL,
             CollectionId TEXT NULL,
             CollectionBindingId TEXT NULL,
             CallContextId TEXT NULL
@@ -912,5 +918,10 @@ public sealed class SqliteAgentEventStore : IAgentEventStore
         ALTER TABLE ActiveCallJournal ADD COLUMN CollectionId TEXT NULL;
         ALTER TABLE ActiveCallJournal ADD COLUMN CollectionBindingId TEXT NULL;
         ALTER TABLE ActiveCallJournal ADD COLUMN CallContextId TEXT NULL;
+        """;
+
+    private const string UpgradeV3ToV4Sql =
+        """
+        ALTER TABLE ActiveCallJournal RENAME COLUMN MaskedRemoteParty TO RemoteParty;
         """;
 }

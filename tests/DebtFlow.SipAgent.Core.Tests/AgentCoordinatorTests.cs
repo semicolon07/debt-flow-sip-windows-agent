@@ -26,11 +26,14 @@ public sealed class AgentCoordinatorTests
         Assert.Equal("collection-test", created.CollectionId);
         Assert.StartsWith("phonebind_", created.CollectionBindingId, StringComparison.Ordinal);
         Assert.Equal(callContextId, created.CallContextId);
+        Assert.Contains("\"remoteParty\":\"0812345678\"", created.DataJson,
+            StringComparison.Ordinal);
 
         CallSessionState active = Assert.IsType<CallSessionState>(
             await fixture.Store.LoadActiveCallAsync(CancellationToken.None));
         Assert.Equal(created.CollectionBindingId, active.CollectionBindingId);
         Assert.Equal(callContextId, active.CallContextId);
+        Assert.Equal("0812345678", active.RemoteParty);
     }
 
     [Fact]
@@ -209,7 +212,12 @@ public sealed class AgentCoordinatorTests
         IReadOnlyList<StoredDurableEvent> events = await fixture.Store.LoadPendingAsync(0, 100, CancellationToken.None);
         StoredDurableEvent ended = Assert.Single(events, item => item.EventType == "call.ended");
         Assert.Contains("completed", ended.DataJson, StringComparison.Ordinal);
-        Assert.DoesNotContain("0812345678", string.Join(string.Empty, events.Select(item => item.DataJson)), StringComparison.Ordinal);
+        Assert.Contains("0812345678",
+            Assert.Single(events, item => item.EventType == "call.created").DataJson,
+            StringComparison.Ordinal);
+        Assert.DoesNotContain("0812345678",
+            string.Join(string.Empty, events.Where(item => item.EventType != "call.created")
+                .Select(item => item.DataJson)), StringComparison.Ordinal);
     }
 
     [Fact]
@@ -362,7 +370,12 @@ public sealed class AgentCoordinatorTests
         IReadOnlyList<StoredDurableEvent> events = await fixture.Store.LoadPendingAsync(0, 100, CancellationToken.None);
         StoredDurableEvent ended = Assert.Single(events, item => item.EventType == "call.ended");
         Assert.Contains("portal_unavailable", ended.DataJson, StringComparison.Ordinal);
-        Assert.DoesNotContain("0812345678", string.Join(string.Empty, events.Select(item => item.DataJson)), StringComparison.Ordinal);
+        Assert.Contains("0812345678",
+            Assert.Single(events, item => item.EventType == "call.created").DataJson,
+            StringComparison.Ordinal);
+        Assert.DoesNotContain("0812345678",
+            string.Join(string.Empty, events.Where(item => item.EventType != "call.created")
+                .Select(item => item.DataJson)), StringComparison.Ordinal);
     }
 
     [Fact]

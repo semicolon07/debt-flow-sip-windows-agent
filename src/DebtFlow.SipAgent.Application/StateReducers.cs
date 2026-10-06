@@ -1,3 +1,5 @@
+using System.Text;
+
 namespace DebtFlow.SipAgent.Application;
 
 public enum RegistrationState
@@ -51,7 +53,7 @@ public sealed record CallSessionState(
     DateTimeOffset? EndedAtUtc,
     CallOutcome? Outcome,
     string? EndReason,
-    string MaskedRemoteParty,
+    string RemoteParty,
     string? CollectionId = null,
     string? CollectionBindingId = null,
     string? CallContextId = null);
@@ -98,21 +100,21 @@ public static class CallReducer
         string callId,
         string commandId,
         DateTimeOffset occurredAtUtc,
-        string maskedDestination,
+        string destination,
         string? collectionId = null,
         string? collectionBindingId = null,
         string? callContextId = null) =>
         new(callId, commandId, CallDirection.Outbound, CallState.Created, occurredAtUtc, null, null, null, null,
-            maskedDestination, collectionId, collectionBindingId, callContextId);
+            destination, collectionId, collectionBindingId, callContextId);
 
     public static CallSessionState CreateInbound(
         string callId,
         DateTimeOffset occurredAtUtc,
-        string maskedCaller,
+        string caller,
         string? collectionId = null,
         string? collectionBindingId = null) =>
         new(callId, null, CallDirection.Inbound, CallState.Created, occurredAtUtc, null, null, null, null,
-            maskedCaller, collectionId, collectionBindingId, null);
+            caller, collectionId, collectionBindingId, null);
 
     public static CallTransition Apply(CallSessionState current, CallSignal signal)
     {
@@ -165,23 +167,35 @@ public static class CallReducer
     }
 }
 
-public static class SensitiveValueMasker
+public static class RemotePartyNormalizer
 {
-    public static string MaskRemoteParty(string? value)
+    public static string Normalize(string? value)
     {
         if (string.IsNullOrWhiteSpace(value))
         {
             return "unknown";
         }
 
-        string trimmed = value.Trim();
-        if (trimmed.Length <= 4)
+        string normalized = value.Trim().Normalize(NormalizationForm.FormKC);
+        var builder = new StringBuilder(normalized.Length);
+        foreach (char character in normalized)
         {
-            return new string('x', trimmed.Length);
+            if (character is ' ' or '-' or '.' or '(' or ')') continue;
+            if (character is >= '0' and <= '9' or '*' or '#')
+            {
+                builder.Append(character);
+                continue;
+            }
+            if (character == '+' && builder.Length == 0)
+            {
+                builder.Append(character);
+                continue;
+            }
+            return "unknown";
         }
 
-        int suffixLength = Math.Min(4, Math.Max(1, trimmed.Length - 2));
-        int maskedLength = trimmed.Length - suffixLength;
-        return $"{new string('x', maskedLength)}{trimmed[^suffixLength..]}";
+        string result = builder.ToString();
+        int digitLikeLength = result.StartsWith('+') ? result.Length - 1 : result.Length;
+        return digitLikeLength is >= 1 and <= 32 ? result : "unknown";
     }
 }

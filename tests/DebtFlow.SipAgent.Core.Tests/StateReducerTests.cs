@@ -30,7 +30,7 @@ public sealed class StateReducerTests
     [Fact]
     public void OutboundCall_ValidLifecycle_EndsOnceWithOutcome()
     {
-        CallSessionState state = CallReducer.CreateOutbound("call", "command", StartedAt, "xxxx5678");
+        CallSessionState state = CallReducer.CreateOutbound("call", "command", StartedAt, "0812345678");
 
         state = Apply(state, CallSignalType.Dial, 1);
         state = Apply(state, CallSignalType.Trying, 2);
@@ -55,7 +55,7 @@ public sealed class StateReducerTests
     [Fact]
     public void DuplicateConnected_DoesNotChangeStateAgain()
     {
-        CallSessionState state = CallReducer.CreateOutbound("call", "command", StartedAt, "xxxx5678");
+        CallSessionState state = CallReducer.CreateOutbound("call", "command", StartedAt, "0812345678");
         state = Apply(state, CallSignalType.Dial, 1);
         state = Apply(state, CallSignalType.Connected, 2);
 
@@ -69,12 +69,13 @@ public sealed class StateReducerTests
     }
 
     [Theory]
-    [InlineData("0812345678", "xxxxxx5678")]
-    [InlineData("1002", "xxxx")]
+    [InlineData("081-234-5678", "0812345678")]
+    [InlineData("＋66812345678", "+66812345678")]
+    [InlineData("sip:1001@example.test", "unknown")]
     [InlineData(null, "unknown")]
-    public void MaskRemoteParty_DoesNotExposeFullValue(string? input, string expected)
+    public void NormalizeRemoteParty_ReturnsCanonicalDialableValue(string? input, string expected)
     {
-        Assert.Equal(expected, SensitiveValueMasker.MaskRemoteParty(input));
+        Assert.Equal(expected, RemotePartyNormalizer.Normalize(input));
     }
 
     private static CallSessionState Apply(CallSessionState state, CallSignalType signal, int seconds)

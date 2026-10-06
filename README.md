@@ -9,7 +9,7 @@ Per-user SIP/audio tray agent สำหรับ Debt Flow Portal บน Windows
 - WinForms tray + .NET Generic Host
 - Kestrel loopback secure WebSocket V1: `wss://localhost:8443/agent/v1` (ไม่มี plaintext listener/fallback)
 - SIPSorcery 10.0.16: UDP first และ automatic TCP fallback เมื่อเกิด transport-level temporary failure
-- SQLite schema v3 outbox/call journal: `%LOCALAPPDATA%\DebtFlow\SipAgent\agent-v1.db`
+- SQLite schema v4 outbox/call journal: `%LOCALAPPDATA%\DebtFlow\SipAgent\agent-v1.db`
 - JSONL logs: `%LOCALAPPDATA%\DebtFlow\SipAgent\Logs`, 10 MB ต่อไฟล์/7 rolling files
 - หนึ่ง Agent ต่อ Windows user, หนึ่ง Portal controller และหนึ่ง active call
 
@@ -33,6 +33,9 @@ Tray mode อ่าน allow-all flag หรือ exact allowlist จาก:
 
 ไฟล์ config, SQLite และ Logs อยู่ใต้โฟลเดอร์ข้อมูลรายผู้ใช้เดียวกัน และไม่ต้องใช้สิทธิ์
 Administrator เพื่อสร้างหรือแก้ไข configuration.
+
+SQLite outbox/journalเก็บ full remote partyเฉพาะที่จำเป็นสำหรับ durable `call.created` relayและ recovery.
+หมายเลขโทรศัพท์ห้ามถูกเขียนลง JSONL log หรือ safe diagnostic export; acknowledged eventถูก purgeตาม maintenanceเดิม.
 
 ใช้รูปแบบเดียวกับ [agentsettings.example.json](agentsettings.example.json):
 

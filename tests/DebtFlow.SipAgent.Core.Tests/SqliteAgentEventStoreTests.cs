@@ -161,6 +161,28 @@ public sealed class SqliteAgentEventStoreTests
     }
 
     [Fact]
+    public async Task Initialize_MigratesV3RemotePartyColumnWithoutInventingLegacyDigits()
+    {
+        string directory = CreateTemporaryDirectory();
+        string path = Path.Combine(directory, "agent.db");
+        try
+        {
+            await CreateVersionThreeDatabaseAsync(path);
+
+            await using var store = new SqliteAgentEventStore(path);
+            await store.InitializeAsync(CancellationToken.None);
+            CallSessionState call = Assert.IsType<CallSessionState>(
+                await store.LoadActiveCallAsync(CancellationToken.None));
+
+            Assert.Equal("xxxxxx5678", call.RemoteParty);
+        }
+        finally
+        {
+            Directory.Delete(directory, true);
+        }
+    }
+
+    [Fact]
     public async Task Initialize_RejectsNewerSchemaWithoutReplacingDatabase()
     {
         string directory = CreateTemporaryDirectory();
@@ -263,7 +285,7 @@ public sealed class SqliteAgentEventStoreTests
             null,
             null,
             null,
-            "***5678");
+            "0812345678");
         try
         {
             await using (var store = new SqliteAgentEventStore(path))
@@ -329,7 +351,7 @@ public sealed class SqliteAgentEventStoreTests
                 null,
                 null,
                 null,
-                "***1234");
+                "0812341234");
             await store.AppendCallEventAsync(CreateDraft(active.CallId), active, false, CancellationToken.None);
             Assert.Equal(EventStoreCapacityState.Full, (await store.GetHealthAsync(CancellationToken.None)).CapacityState);
         }
@@ -445,6 +467,66 @@ public sealed class SqliteAgentEventStoreTests
                 """;
         }
 
+        await command.ExecuteNonQueryAsync();
+    }
+
+    private static async Task CreateVersionThreeDatabaseAsync(string path)
+    {
+        await using var connection = new SqliteConnection($"Data Source={path}");
+        await connection.OpenAsync();
+        await using SqliteCommand command = connection.CreateCommand();
+        command.CommandText =
+            """
+            CREATE TABLE AgentMetadata (
+                MetadataKey TEXT NOT NULL PRIMARY KEY,
+                MetadataValue TEXT NOT NULL
+            );
+            CREATE TABLE DurableEvents (
+                Sequence INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+                EventId TEXT NOT NULL UNIQUE,
+                AgentSessionId TEXT NOT NULL,
+                CallId TEXT NOT NULL,
+                CommandId TEXT NULL,
+                EventType TEXT NOT NULL,
+                OccurredAtUtc TEXT NOT NULL,
+                CallState TEXT NULL,
+                DataJson TEXT NOT NULL,
+                CollectionId TEXT NULL,
+                CollectionBindingId TEXT NULL,
+                CallContextId TEXT NULL
+            );
+            CREATE TABLE ProcessedCommands (
+                CommandId TEXT NOT NULL PRIMARY KEY,
+                CommandType TEXT NOT NULL,
+                RequestHash TEXT NOT NULL,
+                ResultJson TEXT NOT NULL,
+                ProcessedAtUtc TEXT NOT NULL,
+                ExecutionState TEXT NOT NULL
+            );
+            CREATE TABLE ActiveCallJournal (
+                JournalId INTEGER NOT NULL PRIMARY KEY CHECK (JournalId = 1),
+                CallId TEXT NOT NULL,
+                CommandId TEXT NULL,
+                Direction TEXT NOT NULL,
+                CallState TEXT NOT NULL,
+                StartedAtUtc TEXT NOT NULL,
+                AnsweredAtUtc TEXT NULL,
+                EndedAtUtc TEXT NULL,
+                Outcome TEXT NULL,
+                EndReason TEXT NULL,
+                MaskedRemoteParty TEXT NOT NULL,
+                CollectionId TEXT NULL,
+                CollectionBindingId TEXT NULL,
+                CallContextId TEXT NULL
+            );
+            INSERT INTO ActiveCallJournal
+                (JournalId, CallId, Direction, CallState, StartedAtUtc, MaskedRemoteParty)
+            VALUES
+                (1, 'call-v3', 'Outbound', 'Ringing', '2026-10-01T00:00:00.0000000+00:00',
+                 'xxxxxx5678');
+            CREATE INDEX IX_ProcessedCommands_ProcessedAtUtc ON ProcessedCommands (ProcessedAtUtc);
+            PRAGMA user_version=3;
+            """;
         await command.ExecuteNonQueryAsync();
     }
 
