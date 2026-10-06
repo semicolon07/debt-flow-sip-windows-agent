@@ -8,6 +8,7 @@
     <PackageVersion Include="NAudio" Version="3.1.0" />
     <PackageVersion Include="SIPSorcery" Version="10.0.16" />
     <PackageVersion Include="SIPSorceryMedia.Windows" Version="10.0.16" />
+    <PackageVersion Include="System.Security.Cryptography.ProtectedData" Version="10.0.3" />
     <PackageVersion Include="SQLitePCLRaw.bundle_e_sqlite3" Version="2.1.13" />
     <PackageVersion Include="SQLitePCLRaw.lib.e_sqlite3" Version="2.1.13" />
     <PackageVersion Include="xunit" Version="2.9.3" />

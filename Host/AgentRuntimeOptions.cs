@@ -8,7 +8,8 @@ public sealed record AgentRuntimeOptions(
     bool BackgroundMode,
     bool IsAllowAllOrigins,
     IReadOnlySet<string> AllowedOrigins,
-    string? ConfigurationError)
+    string? ConfigurationError,
+    bool AcceptRtpFromAny = false)
 {
     public const int Port = 8443;
     public static readonly TimeSpan OwnerDisconnectGrace = TimeSpan.FromSeconds(60);
@@ -45,6 +46,7 @@ public sealed record AgentRuntimeOptions(
 
         var origins = new HashSet<string>(StringComparer.Ordinal);
         bool isAllowAllOrigins = false;
+        bool acceptRtpFromAny = false;
         string? configurationError = null;
         if (consoleMode)
         {
@@ -72,6 +74,7 @@ public sealed record AgentRuntimeOptions(
 
                     IReadOnlyList<string> configuredOrigins = document.Agent.AllowedOrigins ?? [];
                     isAllowAllOrigins = document.Agent.IsAllowAllOrigins ?? configuredOrigins.Count == 0;
+                    acceptRtpFromAny = document.Agent.AcceptRtpFromAny ?? false;
                     foreach (string origin in configuredOrigins)
                     {
                         origins.Add(NormalizeOrigin(origin));
@@ -100,7 +103,13 @@ public sealed record AgentRuntimeOptions(
             configurationError ??= "origin_configuration_missing";
         }
 
-        return new AgentRuntimeOptions(consoleMode, backgroundMode, isAllowAllOrigins, origins, configurationError);
+        return new AgentRuntimeOptions(
+            consoleMode,
+            backgroundMode,
+            isAllowAllOrigins,
+            origins,
+            configurationError,
+            acceptRtpFromAny);
     }
 
     public static string GetConfigurationPath()
@@ -131,7 +140,10 @@ public sealed record AgentRuntimeOptions(
     };
 
     private sealed record AgentSettingsDocument(AgentSettings Agent);
-    private sealed record AgentSettings(bool? IsAllowAllOrigins, IReadOnlyList<string>? AllowedOrigins);
+    private sealed record AgentSettings(
+        bool? IsAllowAllOrigins,
+        IReadOnlyList<string>? AllowedOrigins,
+        bool? AcceptRtpFromAny);
 }
 
 public sealed class AgentConfigurationException(string code) : Exception(code)

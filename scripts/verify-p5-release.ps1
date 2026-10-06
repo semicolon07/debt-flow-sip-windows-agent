@@ -5,9 +5,6 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
-$version = "1.0.0"
-$tag = "v$version"
-$artifactName = "debt-flow-sip-agent-$version-win-x64.zip"
 $repositoryRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 
 if (-not [System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform(
@@ -16,10 +13,17 @@ if (-not [System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform(
 }
 
 $gitCommit = (& git -C $repositoryRoot rev-parse HEAD).Trim()
-$exactTag = (& git -C $repositoryRoot describe --tags --exact-match HEAD 2>$null)
-if ($LASTEXITCODE -ne 0 -or $exactTag.Trim() -ne $tag) {
-    throw "release_tag_required:expected=$tag"
+$exactTagOutput = & git -C $repositoryRoot describe --tags --exact-match HEAD 2>$null
+if ($LASTEXITCODE -ne 0) {
+    throw "semantic_release_tag_required"
 }
+$exactTag = ([string]$exactTagOutput).Trim()
+if ($exactTag -notmatch '^v(?<version>[0-9]+\.[0-9]+\.[0-9]+)$') {
+    throw "semantic_release_tag_required"
+}
+$tag = $exactTag
+$version = $Matches.version
+$artifactName = "debt-flow-sip-agent-$version-win-x64.zip"
 if (@(& git -C $repositoryRoot status --porcelain).Count -gt 0) {
     throw "repository_dirty_commit_or_stash_before_release"
 }
@@ -58,6 +62,17 @@ try {
         "-p:PublishSingleFile=false", "-p:Version=$version", "-o", $publishDirectory
     ) (Join-Path $logDirectory "publish.log")
 
+    $agentExecutable = Join-Path $publishDirectory "DebtFlow.SipAgent.Host.exe"
+    $releaseMetadataJson = (& $agentExecutable --print-release-metadata)
+    if ($LASTEXITCODE -ne 0) { throw "release_metadata_command_failed" }
+    $releaseMetadata = $releaseMetadataJson | ConvertFrom-Json
+    if ($releaseMetadata.version -ne $version -or
+        $releaseMetadata.runtimeIdentifier -ne "win-x64" -or
+        $releaseMetadata.protocolVersion -ne 1 -or
+        $releaseMetadata.sqliteSchemaVersion -ne 4) {
+        throw "release_metadata_mismatch:tag=$tag metadata=$releaseMetadataJson"
+    }
+
     Copy-Item -LiteralPath (Join-Path $repositoryRoot "release\README-th-en.md") `
         -Destination (Join-Path $publishDirectory "README.md")
 
@@ -84,22 +99,15 @@ try {
     )
     $manifestPath = Join-Path $publishDirectory "release-manifest.json"
     [ordered]@{
-        schemaVersion = 1
-        version = $version
+        schemaVersion = $releaseMetadata.schemaVersion
+        version = $releaseMetadata.version
         gitCommit = $gitCommit
-        protocolVersion = 1
+        protocolVersion = $releaseMetadata.protocolVersion
         localTransport = "wss"
         certificateProfileVersion = 1
-        sqliteSchemaVersion = 4
-        capabilities = @(
-            "sip.register",
-            "call.outbound",
-            "call.inbound",
-            "call.dtmf",
-            "event.durable",
-            "event.collection_binding.v1"
-        )
-        runtimeIdentifier = "win-x64"
+        sqliteSchemaVersion = $releaseMetadata.sqliteSchemaVersion
+        capabilities = @($releaseMetadata.capabilities)
+        runtimeIdentifier = $releaseMetadata.runtimeIdentifier
         selfContained = $true
         singleFile = $false
         authenticodeSigned = $false

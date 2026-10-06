@@ -3,6 +3,7 @@ using System.Net.WebSockets;
 using System.Security.Cryptography;
 using System.Security.Cryptography.X509Certificates;
 using System.Text.Json;
+using System.Threading.Channels;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Hosting.Server;
@@ -57,7 +58,11 @@ public sealed class LocalWebSocketServerTests
             publisher,
             new SystemAgentClock(),
             new GuidAgentIdGenerator());
-        var dispatcher = new V1CommandDispatcher(coordinator, store, new SystemAgentClock());
+        var dispatcher = new V1CommandDispatcher(
+            coordinator,
+            store,
+            new SystemAgentClock(),
+            new TestCommandFingerprintService());
         var options = new AgentRuntimeOptions(
             ConsoleMode: true,
             BackgroundMode: false,
@@ -258,27 +263,36 @@ public sealed class LocalWebSocketServerTests
 
     private sealed class FakeSipRuntime : ISipRuntime
     {
-        public event Func<SipSignal, Task>? Signal
-        {
-            add { }
-            remove { }
-        }
+        private readonly Channel<SipSignal> _signals = Channel.CreateUnbounded<SipSignal>();
+        public ChannelReader<SipSignal> Signals => _signals.Reader;
         public string AudioState => "ready";
         public bool IsMicrophoneMuted => false;
         public int OutputVolume => 100;
         public int InputVolume => 100;
         public Task ConfigureAsync(SipConfiguration configuration, CancellationToken cancellationToken) => Task.CompletedTask;
-        public Task StartRegistrationAsync(CancellationToken cancellationToken) => Task.CompletedTask;
-        public Task StopRegistrationAsync(CancellationToken cancellationToken) => Task.CompletedTask;
-        public Task StartCallAsync(string destination, CancellationToken cancellationToken) => Task.CompletedTask;
-        public Task AnswerAsync(CancellationToken cancellationToken) => Task.CompletedTask;
-        public Task RejectAsync(CancellationToken cancellationToken) => Task.CompletedTask;
-        public Task RejectUnavailableAsync(CancellationToken cancellationToken) => Task.CompletedTask;
-        public Task HangupAsync(CancellationToken cancellationToken) => Task.CompletedTask;
-        public Task SendDtmfAsync(char digit, CancellationToken cancellationToken) => Task.CompletedTask;
-        public Task SetMicrophoneMutedAsync(bool muted, CancellationToken cancellationToken) => Task.CompletedTask;
-        public Task SetOutputVolumeAsync(int volume, CancellationToken cancellationToken) => Task.CompletedTask;
-        public Task SetInputVolumeAsync(int volume, CancellationToken cancellationToken) => Task.CompletedTask;
-        public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+        public Task StartRegistrationAsync(long generation, CancellationToken cancellationToken) => Task.CompletedTask;
+        public Task StopRegistrationAsync(long generation, CancellationToken cancellationToken) => Task.CompletedTask;
+        public Task StartCallAsync(SipCallHandle call, string destination, CancellationToken cancellationToken) => Task.CompletedTask;
+        public Task AnswerAsync(SipCallHandle call, CancellationToken cancellationToken) => Task.CompletedTask;
+        public Task RejectAsync(SipCallHandle call, CancellationToken cancellationToken) => Task.CompletedTask;
+        public Task RejectUnavailableAsync(SipCallHandle call, CancellationToken cancellationToken) => Task.CompletedTask;
+        public Task HangupAsync(SipCallHandle call, CancellationToken cancellationToken) => Task.CompletedTask;
+        public Task SendDtmfAsync(SipCallHandle call, char digit, CancellationToken cancellationToken) => Task.CompletedTask;
+        public Task SetMicrophoneMutedAsync(SipCallHandle call, bool muted, CancellationToken cancellationToken) => Task.CompletedTask;
+        public Task SetOutputVolumeAsync(SipCallHandle call, int volume, CancellationToken cancellationToken) => Task.CompletedTask;
+        public Task SetInputVolumeAsync(SipCallHandle call, int volume, CancellationToken cancellationToken) => Task.CompletedTask;
+        public ValueTask DisposeAsync()
+        {
+            _signals.Writer.TryComplete();
+            return ValueTask.CompletedTask;
+        }
+    }
+
+    private sealed class TestCommandFingerprintService : ICommandFingerprintService
+    {
+        public CommandFingerprint Compute(ReadOnlySpan<byte> canonicalPayload) =>
+            new(
+                $"v2:{Convert.ToHexString(SHA256.HashData(canonicalPayload)).ToLowerInvariant()}",
+                false);
     }
 }

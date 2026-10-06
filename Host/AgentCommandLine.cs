@@ -4,22 +4,30 @@ public enum AgentLaunchCommand
 {
     Run,
     RepairLocalCertificate,
-    RemoveLocalCertificate
+    RemoveLocalCertificate,
+    StoragePreflight,
+    PrintReleaseMetadata
 }
 
 public static class AgentCommandLine
 {
     public static AgentLaunchCommand Parse(string[] args)
     {
-        bool repair = args.Contains("--repair-local-certificate", StringComparer.Ordinal);
-        bool remove = args.Contains("--remove-local-certificate", StringComparer.Ordinal);
-        if (!repair && !remove) return AgentLaunchCommand.Run;
+        var commands = new Dictionary<string, AgentLaunchCommand>(StringComparer.Ordinal)
+        {
+            ["--repair-local-certificate"] = AgentLaunchCommand.RepairLocalCertificate,
+            ["--remove-local-certificate"] = AgentLaunchCommand.RemoveLocalCertificate,
+            ["--storage-preflight"] = AgentLaunchCommand.StoragePreflight,
+            ["--print-release-metadata"] = AgentLaunchCommand.PrintReleaseMetadata
+        };
+        string[] selected = args.Where(commands.ContainsKey).ToArray();
+        if (selected.Length == 0) return AgentLaunchCommand.Run;
 
-        if (repair == remove || args.Length != 1)
+        if (selected.Length != 1 || args.Length != 1)
         {
             throw new AgentConfigurationException("maintenance_arguments_invalid");
         }
 
-        return repair ? AgentLaunchCommand.RepairLocalCertificate : AgentLaunchCommand.RemoveLocalCertificate;
+        return commands[selected[0]];
     }
 }

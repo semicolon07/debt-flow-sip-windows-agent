@@ -1,6 +1,7 @@
 using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
+using System.Threading.Channels;
 using Microsoft.Extensions.Logging;
 
 namespace DebtFlow.SipAgent.Host;
@@ -9,27 +10,46 @@ public sealed class SafeJsonLoggerProvider : ILoggerProvider
 {
     private const long MaximumFileBytes = 10 * 1024 * 1024;
     private const int RetainedFileCount = 7;
-    private readonly object _gate = new();
     private readonly string _directory;
     private readonly bool _writeConsole;
+    private readonly Channel<string> _queue;
+    private readonly Task _writerTask;
     private StreamWriter? _writer;
     private string? _currentPath;
+    private int _disposed;
+    private long _droppedLines;
 
     public SafeJsonLoggerProvider(string directory, bool writeConsole)
     {
         _directory = directory;
         _writeConsole = writeConsole;
         Directory.CreateDirectory(directory);
+        _queue = Channel.CreateBounded<string>(new BoundedChannelOptions(2048)
+        {
+            SingleReader = true,
+            SingleWriter = false,
+            FullMode = BoundedChannelFullMode.Wait,
+            AllowSynchronousContinuations = false
+        });
+        _writerTask = Task.Run(WriteLoopAsync);
     }
 
     public ILogger CreateLogger(string categoryName) => new SafeJsonLogger(this, categoryName);
 
     public void Dispose()
     {
-        lock (_gate)
+        if (Interlocked.Exchange(ref _disposed, 1) != 0)
         {
-            _writer?.Dispose();
-            _writer = null;
+            return;
+        }
+
+        _queue.Writer.TryComplete();
+        try
+        {
+            _writerTask.Wait(TimeSpan.FromSeconds(2));
+        }
+        catch (AggregateException)
+        {
         }
     }
 
@@ -78,15 +98,61 @@ public sealed class SafeJsonLoggerProvider : ILoggerProvider
         }
 
         string line = Encoding.UTF8.GetString(buffer.ToArray());
-        lock (_gate)
+        if (!_queue.Writer.TryWrite(line))
         {
-            EnsureWriter(Encoding.UTF8.GetByteCount(line) + Encoding.UTF8.GetByteCount(Environment.NewLine));
-            _writer!.WriteLine(line);
-            _writer.Flush();
-            if (_writeConsole)
+            Interlocked.Increment(ref _droppedLines);
+        }
+    }
+
+    private async Task WriteLoopAsync()
+    {
+        try
+        {
+            while (await _queue.Reader.WaitToReadAsync())
             {
-                Console.WriteLine(line);
+                int count = 0;
+                while (count < 64 && _queue.Reader.TryRead(out string? line))
+                {
+                    WriteLineCore(line);
+                    count++;
+                }
+
+                long dropped = Interlocked.Exchange(ref _droppedLines, 0);
+                if (dropped > 0)
+                {
+                    WriteLineCore($"{{\"timestampUtc\":\"{DateTimeOffset.UtcNow:O}\",\"level\":\"Warning\",\"category\":\"DebtFlow.SipAgent.Logging\",\"messageTemplate\":\"log_queue_overflow\",\"properties\":{{\"droppedLines\":{dropped}}}}}");
+                }
+
+                if (_writer != null)
+                {
+                    await _writer.FlushAsync();
+                }
             }
+        }
+        catch (Exception)
+        {
+        }
+        finally
+        {
+            try
+            {
+                _writer?.Dispose();
+            }
+            catch (IOException)
+            {
+            }
+
+            _writer = null;
+        }
+    }
+
+    private void WriteLineCore(string line)
+    {
+        EnsureWriter(Encoding.UTF8.GetByteCount(line) + Encoding.UTF8.GetByteCount(Environment.NewLine));
+        _writer!.WriteLine(line);
+        if (_writeConsole)
+        {
+            Console.WriteLine(line);
         }
     }
 
@@ -106,7 +172,7 @@ public sealed class SafeJsonLoggerProvider : ILoggerProvider
             FileAccess.Write,
             FileShare.Read,
             16 * 1024,
-            FileOptions.WriteThrough),
+            FileOptions.Asynchronous),
             new UTF8Encoding(false));
 
         foreach (FileInfo oldFile in new DirectoryInfo(_directory)

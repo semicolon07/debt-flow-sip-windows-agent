@@ -44,7 +44,8 @@ SQLite outbox/journalเก็บ full remote partyเฉพาะที่จ�
 {
   "agent": {
     "isAllowAllOrigins": true,
-    "allowedOrigins": []
+    "allowedOrigins": [],
+    "acceptRtpFromAny": false
   }
 }
 ```
@@ -53,6 +54,12 @@ SQLite outbox/journalเก็บ full remote partyเฉพาะที่จ�
 หากตั้ง false ต้องมี exact `http/https` originอย่างน้อยหนึ่งค่า. เมื่อ configไม่มี Agent copy packaged example
 แบบ atomicโดยไม่ overwrite; example/target invalidจะเปิด setup dialogก่อน listener. Legacy configที่มี listไม่ว่าง
 inferเป็น exact mode ส่วน listว่าง/หาย inferเป็น allow-all.
+RTP ใช้ strict source policyโดย default. เปิด `acceptRtpFromAny=true` ได้เฉพาะเมื่อ PBX/NAT compatibility
+matrixยืนยันว่าจำเป็นและ ownerรับความเสี่ยง source switchingแล้ว.
+
+ก่อน upgrade ให้ Exit Agent แล้วรัน `DebtFlow.SipAgent.Host.exe --storage-preflight`: exit 0 ไปต่อได้,
+exit 20 ต้องใช้ migration procedure และ exit 21 ต้องหยุดเพื่อรักษา DB/WALสำหรับวิเคราะห์. คำสั่งนี้อ่าน storage
+อย่างเดียวและไม่เริ่ม TLS, UI, WSS หรือ SIP.
 
 ## Build, test และ publish
 
@@ -62,7 +69,7 @@ Windows:
 ./scripts/verify-p2-windows.ps1
 ```
 
-Script นี้รัน locked restore, Release build, tests ทั้ง solution (ขั้นต่ำ 109 cases ตาม source ปัจจุบัน),
+Script นี้รัน locked restore, Release build, core + Windows host tests ทั้ง solution,
 vulnerability gate, self-contained publish, ZIP integrity/checksum และสร้าง `p2-windows-evidence.json`
 ใน `artifacts/p2-windows/<run-id>`. P1 verifier เดิมยังใช้ได้และ default เป็น P1 evidence.
 

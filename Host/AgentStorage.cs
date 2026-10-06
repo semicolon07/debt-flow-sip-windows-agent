@@ -13,6 +13,7 @@ public static class AgentStoragePaths
     public static string TlsCertificateMetadataPath => Path.Combine(RootDirectory, "tls-certificate.json");
     public static string TlsCertificateConsentPath => Path.Combine(RootDirectory, "tls-certificate-consent-v1");
     public static string AudioPreferencesPath => Path.Combine(RootDirectory, "audio-preferences.json");
+    public static string CommandFingerprintKeyPath => Path.Combine(RootDirectory, "command-fingerprint-key-v1.bin");
 
     private static string ResolveLocalApplicationData()
     {

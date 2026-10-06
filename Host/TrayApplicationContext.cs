@@ -161,7 +161,7 @@ public sealed class TrayApplicationContext : ApplicationContext
 
         try
         {
-            AgentSnapshotPayload snapshot = await _coordinator.GetSnapshotAsync(CancellationToken.None);
+            AgentSnapshotPayload snapshot = await GetSnapshotWithTimeoutAsync();
             string agentState = _options.IsOperational ? snapshot.AgentState : "degraded";
             string localizedAgentState = TrayText.State(agentState);
             string agentStatus = snapshot.AgentStateCode == null
@@ -184,7 +184,7 @@ public sealed class TrayApplicationContext : ApplicationContext
                 Notify("registration_failed", TrayText.Get("RegistrationFailed"));
             }
         }
-        catch (Exception exception) when (exception is not OperationCanceledException)
+        catch (Exception exception)
         {
             _logger.LogWarning("Tray status refresh failed with {ErrorType}", exception.GetType().Name);
         }
@@ -201,8 +201,16 @@ public sealed class TrayApplicationContext : ApplicationContext
             return;
         }
 
-        AgentSnapshotPayload snapshot = await _coordinator.GetSnapshotAsync(CancellationToken.None);
-        if (confirmActiveCall && snapshot.ActiveCalls.Count > 0 &&
+        AgentSnapshotPayload? snapshot = null;
+        try
+        {
+            snapshot = await GetSnapshotWithTimeoutAsync();
+        }
+        catch (Exception exception)
+        {
+            _logger.LogWarning("Tray exit status check failed with {ErrorType}; shutdown will continue", exception.GetType().Name);
+        }
+        if (confirmActiveCall && snapshot?.ActiveCalls.Count > 0 &&
             MessageBox.Show(
                 TrayText.Get("ExitActiveCall"),
                 TrayText.Get("ExitTitle"),
@@ -232,7 +240,16 @@ public sealed class TrayApplicationContext : ApplicationContext
     {
         if (_exitStarted) return;
 
-        AgentSnapshotPayload snapshot = await _coordinator.GetSnapshotAsync(CancellationToken.None);
+        AgentSnapshotPayload snapshot;
+        try
+        {
+            snapshot = await GetSnapshotWithTimeoutAsync();
+        }
+        catch (Exception exception)
+        {
+            _logger.LogWarning("Certificate maintenance status check failed with {ErrorType}", exception.GetType().Name);
+            return;
+        }
         if (snapshot.ActiveCalls.Count > 0)
         {
             MessageBox.Show(
@@ -302,8 +319,9 @@ public sealed class TrayApplicationContext : ApplicationContext
     {
         try
         {
-            AgentSnapshotPayload snapshot = await _coordinator.GetSnapshotAsync(CancellationToken.None);
-            EventStoreHealth health = await _eventStore.GetHealthAsync(CancellationToken.None);
+            using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+            AgentSnapshotPayload snapshot = await _coordinator.GetSnapshotAsync(timeout.Token);
+            EventStoreHealth health = await _eventStore.GetHealthAsync(timeout.Token);
             string outputPath = Path.Combine(
                 AgentStoragePaths.DiagnosticDirectory,
                 $"debt-flow-sip-agent-diagnostics-{DateTime.UtcNow:yyyyMMdd-HHmmss}.zip");
@@ -314,7 +332,7 @@ public sealed class TrayApplicationContext : ApplicationContext
                 WaveIn.DeviceCount,
                 WaveOut.DeviceCount,
                 _options.IsOperational,
-                CancellationToken.None,
+                timeout.Token,
                 LocalTlsCertificateProfile.Version,
                 _tlsDaysRemaining,
                 _tlsWarningCode);
@@ -324,7 +342,7 @@ public sealed class TrayApplicationContext : ApplicationContext
                 MessageBoxButtons.OK,
                 MessageBoxIcon.Information);
         }
-        catch (Exception exception) when (exception is not OperationCanceledException)
+        catch (Exception exception)
         {
             _logger.LogWarning("Diagnostic export failed with {ErrorType}", exception.GetType().Name);
             MessageBox.Show(
@@ -344,6 +362,12 @@ public sealed class TrayApplicationContext : ApplicationContext
 
         _lastNotificationCode = code;
         _notifyIcon.ShowBalloonTip(5000, TrayText.Get("ActionRequired"), message, ToolTipIcon.Warning);
+    }
+
+    private async Task<AgentSnapshotPayload> GetSnapshotWithTimeoutAsync()
+    {
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(2));
+        return await _coordinator.GetSnapshotAsync(timeout.Token);
     }
 
     private static string TruncateTooltip(string value) => value.Length <= 63 ? value : value[..63];

@@ -87,6 +87,39 @@ public sealed class SqliteAgentEventStoreTests
     }
 
     [Fact]
+    public async Task RecoverExecutingCommands_MarksInterruptedCommandAbandonedForDeterministicReplay()
+    {
+        string directory = CreateTemporaryDirectory();
+        try
+        {
+            await using var store = new SqliteAgentEventStore(Path.Combine(directory, "agent.db"));
+            await store.InitializeAsync(CancellationToken.None);
+            DateTimeOffset recoveredAt = DateTimeOffset.Parse("2026-10-06T01:02:03Z");
+            await store.SaveCommandAsync(
+                new ProcessedCommand(
+                    "interrupted",
+                    "call.start",
+                    "v2:hash",
+                    "{\"errorCode\":\"command_outcome_unknown\"}",
+                    recoveredAt.AddMinutes(-1),
+                    "executing"),
+                CancellationToken.None);
+
+            await store.RecoverExecutingCommandsAsync(recoveredAt, CancellationToken.None);
+
+            ProcessedCommand? recovered = await store.FindCommandAsync("interrupted", CancellationToken.None);
+            Assert.NotNull(recovered);
+            Assert.Equal("abandoned", recovered.ExecutionState);
+            Assert.Equal(recoveredAt, recovered.ProcessedAtUtc);
+            Assert.Contains("command_outcome_unknown", recovered.ResultJson, StringComparison.Ordinal);
+        }
+        finally
+        {
+            Directory.Delete(directory, true);
+        }
+    }
+
+    [Fact]
     public async Task Initialize_MigratesV1AndPreservesExecutingCommandIntent()
     {
         string directory = CreateTemporaryDirectory();

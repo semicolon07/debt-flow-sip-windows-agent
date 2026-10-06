@@ -1,4 +1,5 @@
 using System.Text.Json;
+using System.Threading.Channels;
 using DebtFlow.SipAgent.Protocol;
 
 namespace DebtFlow.SipAgent.Application;
@@ -130,7 +131,9 @@ public interface IAgentEventStore : IAsyncDisposable
     Task<CallSessionState?> LoadActiveCallAsync(CancellationToken cancellationToken);
     Task AcknowledgeThroughAsync(long sequence, CancellationToken cancellationToken);
     Task<ProcessedCommand?> FindCommandAsync(string commandId, CancellationToken cancellationToken);
+    Task<bool> HasCommandRequestHashPrefixAsync(string prefix, CancellationToken cancellationToken);
     Task SaveCommandAsync(ProcessedCommand command, CancellationToken cancellationToken);
+    Task RecoverExecutingCommandsAsync(DateTimeOffset recoveredAtUtc, CancellationToken cancellationToken);
     Task PruneCommandsAsync(DateTimeOffset olderThanUtc, int maximumRetained, CancellationToken cancellationToken);
     Task CheckpointAsync(CancellationToken cancellationToken);
 }
@@ -143,23 +146,23 @@ public interface IAgentEventPublisher
 
 public interface ISipRuntime : IAsyncDisposable
 {
-    event Func<SipSignal, Task>? Signal;
+    ChannelReader<SipSignal> Signals { get; }
     string AudioState { get; }
     bool IsMicrophoneMuted { get; }
     int OutputVolume { get; }
     int InputVolume { get; }
     Task ConfigureAsync(SipConfiguration configuration, CancellationToken cancellationToken);
-    Task StartRegistrationAsync(CancellationToken cancellationToken);
-    Task StopRegistrationAsync(CancellationToken cancellationToken);
-    Task StartCallAsync(string destination, CancellationToken cancellationToken);
-    Task AnswerAsync(CancellationToken cancellationToken);
-    Task RejectAsync(CancellationToken cancellationToken);
-    Task RejectUnavailableAsync(CancellationToken cancellationToken);
-    Task HangupAsync(CancellationToken cancellationToken);
-    Task SendDtmfAsync(char digit, CancellationToken cancellationToken);
-    Task SetMicrophoneMutedAsync(bool muted, CancellationToken cancellationToken);
-    Task SetOutputVolumeAsync(int volume, CancellationToken cancellationToken);
-    Task SetInputVolumeAsync(int volume, CancellationToken cancellationToken);
+    Task StartRegistrationAsync(long generation, CancellationToken cancellationToken);
+    Task StopRegistrationAsync(long generation, CancellationToken cancellationToken);
+    Task StartCallAsync(SipCallHandle call, string destination, CancellationToken cancellationToken);
+    Task AnswerAsync(SipCallHandle call, CancellationToken cancellationToken);
+    Task RejectAsync(SipCallHandle call, CancellationToken cancellationToken);
+    Task RejectUnavailableAsync(SipCallHandle call, CancellationToken cancellationToken);
+    Task HangupAsync(SipCallHandle call, CancellationToken cancellationToken);
+    Task SendDtmfAsync(SipCallHandle call, char digit, CancellationToken cancellationToken);
+    Task SetMicrophoneMutedAsync(SipCallHandle call, bool muted, CancellationToken cancellationToken);
+    Task SetOutputVolumeAsync(SipCallHandle call, int volume, CancellationToken cancellationToken);
+    Task SetInputVolumeAsync(SipCallHandle call, int volume, CancellationToken cancellationToken);
 }
 
 public sealed record AudioPreferences(int OutputVolume, int InputVolume)
@@ -190,6 +193,8 @@ public sealed class JitteredRegistrationRetryPolicy : IRegistrationRetryPolicy
 
 public sealed record SipConfiguration(string Host, int Port, string Username, string Password);
 
+public sealed record SipCallHandle(string RuntimeCallId, long Generation, string? PublicCallId = null);
+
 public enum SipSignalType
 {
     RegistrationRegistering,
@@ -206,7 +211,8 @@ public enum SipSignalType
     MediaReady,
     MediaDegraded,
     AudioInventoryChanged,
-    DtmfReceived
+    DtmfReceived,
+    RuntimeFailed
 }
 
 public sealed record SipSignal(
@@ -215,4 +221,7 @@ public sealed record SipSignal(
     string? SafeCode = null,
     string? Caller = null,
     string? Codec = null,
-    bool Retryable = false);
+    bool Retryable = false,
+    SipCallHandle? Call = null,
+    long? RegistrationGeneration = null,
+    TaskCompletionSource<bool>? ProcessingCompletion = null);

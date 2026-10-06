@@ -1,6 +1,7 @@
 using DebtFlow.SipAgent.Application;
 using DebtFlow.SipAgent.Persistence;
 using DebtFlow.SipAgent.Protocol;
+using System.Threading.Channels;
 
 namespace DebtFlow.SipAgent.Core.Tests;
 
@@ -114,6 +115,53 @@ public sealed class AgentCoordinatorTests
             events,
             item => item.EventType == "call.state_changed" && item.State == "answering");
         Assert.Contains("inbound", answering.DataJson, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Answer_IncomingCall_CompletesWhenRuntimeEmitsConnectedBeforeReturning()
+    {
+        await using CoordinatorFixture fixture = await CoordinatorFixture.CreateAsync();
+        await fixture.RegisterAsync();
+        await fixture.Coordinator.PortalConnectedAsync(CancellationToken.None);
+        await fixture.Runtime.EmitAsync(new SipSignal(SipSignalType.IncomingCall, Caller: "0812345678"));
+        string callId = Assert.Single(
+            (await fixture.Coordinator.GetSnapshotAsync(CancellationToken.None)).ActiveCalls).CallId;
+        fixture.Runtime.AnswerBehavior = call =>
+            fixture.Runtime.EmitAsync(new SipSignal(SipSignalType.CallConnected, Call: call));
+
+        await fixture.Coordinator.AnswerAsync(
+                new CallCommand(NewId(), callId),
+                CancellationToken.None)
+            .WaitAsync(TimeSpan.FromSeconds(1));
+
+        AgentSnapshotPayload snapshot = await fixture.Coordinator.GetSnapshotAsync(CancellationToken.None);
+        Assert.Equal("connected", Assert.Single(snapshot.ActiveCalls).State);
+    }
+
+    [Fact]
+    public async Task StaleTerminalSignal_FromPreviousCall_DoesNotEndCurrentCall()
+    {
+        await using CoordinatorFixture fixture = await CoordinatorFixture.CreateAsync();
+        await fixture.RegisterAsync();
+        await fixture.Coordinator.PortalConnectedAsync(CancellationToken.None);
+        await fixture.Runtime.EmitAsync(new SipSignal(SipSignalType.IncomingCall, Caller: "0812345678"));
+        SipCallHandle firstCall = Assert.IsType<SipCallHandle>(fixture.Runtime.ActiveCall);
+        await fixture.Runtime.EmitAsync(new SipSignal(SipSignalType.CallRemoteEnded, Call: firstCall));
+
+        await fixture.Runtime.EmitAsync(new SipSignal(SipSignalType.IncomingCall, Caller: "0899999999"));
+        SipCallHandle secondCall = Assert.IsType<SipCallHandle>(fixture.Runtime.ActiveCall);
+        string currentCallId = Assert.Single(
+            (await fixture.Coordinator.GetSnapshotAsync(CancellationToken.None)).ActiveCalls).CallId;
+
+        await fixture.Runtime.EmitAsync(new SipSignal(
+            SipSignalType.CallFailed,
+            SafeCode: "stale_failure",
+            Call: firstCall));
+
+        AgentSnapshotPayload snapshot = await fixture.Coordinator.GetSnapshotAsync(CancellationToken.None);
+        Assert.Equal(currentCallId, Assert.Single(snapshot.ActiveCalls).CallId);
+        Assert.Equal("incoming", Assert.Single(snapshot.ActiveCalls).State);
+        Assert.NotEqual(firstCall.RuntimeCallId, secondCall.RuntimeCallId);
     }
 
     [Fact]
@@ -964,7 +1012,12 @@ public sealed class AgentCoordinatorTests
 
     private sealed class FakeSipRuntime : ISipRuntime
     {
-        public event Func<SipSignal, Task>? Signal;
+        private readonly Channel<SipSignal> _signals = Channel.CreateUnbounded<SipSignal>();
+        private SipCallHandle? _activeCall;
+        private long _generation;
+        public ChannelReader<SipSignal> Signals => _signals.Reader;
+        public SipCallHandle? ActiveCall => _activeCall;
+        public Func<SipCallHandle, Task>? AnswerBehavior { get; set; }
         public string AudioState => "ready";
         public bool IsMicrophoneMuted { get; private set; }
         public int OutputVolume { get; private set; } = 100;
@@ -979,74 +1032,114 @@ public sealed class AgentCoordinatorTests
         public int AnswerCount { get; private set; }
         public int RejectCount { get; private set; }
 
-        public Task EmitAsync(SipSignal signal) => Signal?.Invoke(signal) ?? Task.CompletedTask;
+        public async Task EmitAsync(SipSignal signal)
+        {
+            if (signal.Type == SipSignalType.IncomingCall && signal.Call == null)
+            {
+                _activeCall = new SipCallHandle(NewId(), ++_generation);
+                signal = signal with { Call = _activeCall };
+            }
+            else if (signal.Call == null && signal.Type is
+                     SipSignalType.CallTrying or
+                     SipSignalType.CallRinging or
+                     SipSignalType.CallConnected or
+                     SipSignalType.CallFailed or
+                     SipSignalType.CallRemoteEnded or
+                     SipSignalType.IncomingCancelled or
+                     SipSignalType.MediaReady or
+                     SipSignalType.MediaDegraded or
+                     SipSignalType.DtmfReceived)
+            {
+                signal = signal with { Call = _activeCall };
+            }
+            var completion = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+            await _signals.Writer.WriteAsync(signal with { ProcessingCompletion = completion });
+            await completion.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        }
         public Task ConfigureAsync(SipConfiguration configuration, CancellationToken cancellationToken)
         {
             ConfigureCount++;
             return Task.CompletedTask;
         }
-        public Task StartRegistrationAsync(CancellationToken cancellationToken)
+        public Task StartRegistrationAsync(long generation, CancellationToken cancellationToken)
         {
             StartRegistrationCount++;
             return Task.CompletedTask;
         }
-        public Task StopRegistrationAsync(CancellationToken cancellationToken)
+        public Task StopRegistrationAsync(long generation, CancellationToken cancellationToken)
         {
             StopRegistrationCount++;
             return Task.CompletedTask;
         }
-        public Task StartCallAsync(string destination, CancellationToken cancellationToken)
+        public Task StartCallAsync(
+            SipCallHandle call,
+            string destination,
+            CancellationToken cancellationToken)
         {
             StartCallCount++;
+            _activeCall = call;
             return Task.CompletedTask;
         }
-        public Task AnswerAsync(CancellationToken cancellationToken)
+        public Task AnswerAsync(SipCallHandle call, CancellationToken cancellationToken)
         {
             AnswerCount++;
-            return Task.CompletedTask;
+            return AnswerBehavior?.Invoke(call) ?? Task.CompletedTask;
         }
 
-        public Task RejectAsync(CancellationToken cancellationToken)
+        public Task RejectAsync(SipCallHandle call, CancellationToken cancellationToken)
         {
             RejectCount++;
             return Task.CompletedTask;
         }
-        public Task RejectUnavailableAsync(CancellationToken cancellationToken)
+        public Task RejectUnavailableAsync(SipCallHandle call, CancellationToken cancellationToken)
         {
             RejectUnavailableCount++;
             return Task.CompletedTask;
         }
 
-        public Task HangupAsync(CancellationToken cancellationToken)
+        public Task HangupAsync(SipCallHandle call, CancellationToken cancellationToken)
         {
             HangupCount++;
             return Task.CompletedTask;
         }
-        public Task SendDtmfAsync(char digit, CancellationToken cancellationToken)
+        public Task SendDtmfAsync(SipCallHandle call, char digit, CancellationToken cancellationToken)
         {
             LastDtmf = digit;
             return Task.CompletedTask;
         }
 
-        public Task SetMicrophoneMutedAsync(bool muted, CancellationToken cancellationToken)
+        public Task SetMicrophoneMutedAsync(
+            SipCallHandle call,
+            bool muted,
+            CancellationToken cancellationToken)
         {
             IsMicrophoneMuted = muted;
             return Task.CompletedTask;
         }
 
-        public Task SetOutputVolumeAsync(int volume, CancellationToken cancellationToken)
+        public Task SetOutputVolumeAsync(
+            SipCallHandle call,
+            int volume,
+            CancellationToken cancellationToken)
         {
             OutputVolume = volume;
             return Task.CompletedTask;
         }
 
-        public Task SetInputVolumeAsync(int volume, CancellationToken cancellationToken)
+        public Task SetInputVolumeAsync(
+            SipCallHandle call,
+            int volume,
+            CancellationToken cancellationToken)
         {
             InputVolume = volume;
             return Task.CompletedTask;
         }
 
-        public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+        public ValueTask DisposeAsync()
+        {
+            _signals.Writer.TryComplete();
+            return ValueTask.CompletedTask;
+        }
     }
 
     private sealed class FailingAppendEventStore(IAgentEventStore inner) : IAgentEventStore
@@ -1102,8 +1195,18 @@ public sealed class AgentCoordinatorTests
         public Task<ProcessedCommand?> FindCommandAsync(string commandId, CancellationToken cancellationToken) =>
             inner.FindCommandAsync(commandId, cancellationToken);
 
+        public Task<bool> HasCommandRequestHashPrefixAsync(
+            string prefix,
+            CancellationToken cancellationToken) =>
+            inner.HasCommandRequestHashPrefixAsync(prefix, cancellationToken);
+
         public Task SaveCommandAsync(ProcessedCommand command, CancellationToken cancellationToken) =>
             inner.SaveCommandAsync(command, cancellationToken);
+
+        public Task RecoverExecutingCommandsAsync(
+            DateTimeOffset recoveredAtUtc,
+            CancellationToken cancellationToken) =>
+            inner.RecoverExecutingCommandsAsync(recoveredAtUtc, cancellationToken);
 
         public Task PruneCommandsAsync(
             DateTimeOffset olderThanUtc,

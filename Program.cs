@@ -1,4 +1,5 @@
 using System.Net;
+using System.Text.Json;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Server.Kestrel.Https;
@@ -36,6 +37,38 @@ public static class Program
         else
         {
             ApplicationConfiguration.Initialize();
+        }
+
+        if (command == AgentLaunchCommand.PrintReleaseMetadata)
+        {
+            Console.WriteLine(JsonSerializer.Serialize(
+                AgentReleaseMetadata.Current(),
+                new JsonSerializerOptions(JsonSerializerDefaults.Web)));
+            return 0;
+        }
+
+        if (command == AgentLaunchCommand.StoragePreflight)
+        {
+            StoragePreflightResult result = StoragePreflight.InspectAsync(
+                    AgentStoragePaths.DatabasePath,
+                    CancellationToken.None)
+                .GetAwaiter()
+                .GetResult();
+            Console.WriteLine(StoragePreflight.Serialize(result));
+            return StoragePreflight.ExitCode(result);
+        }
+
+        try
+        {
+            AgentStorageSecurity.EnsureRestricted(AgentStoragePaths.RootDirectory);
+        }
+        catch (Exception exception) when (exception is UnauthorizedAccessException or IOException or InvalidOperationException)
+        {
+            Console.Error.WriteLine("storage_acl_unavailable");
+            return 2;
+        }
+        if (!consoleRequested)
+        {
             _ = AgentSettingsProvisioner.EnsureFromPackagedExample();
         }
 
@@ -127,7 +160,7 @@ public static class Program
             new SystemLocalTlsClock(),
             new FileLocalTlsConsentStore(AgentStoragePaths.TlsCertificateConsentPath));
 
-        if (command != AgentLaunchCommand.Run)
+        if (command is AgentLaunchCommand.RepairLocalCertificate or AgentLaunchCommand.RemoveLocalCertificate)
         {
             LocalTlsCertificateResult maintenanceResult = command == AgentLaunchCommand.RepairLocalCertificate
                 ? await certificateManager.RepairAsync(CancellationToken.None)
@@ -266,6 +299,8 @@ public static class Program
             new FileAudioPreferencesStore(AgentStoragePaths.AudioPreferencesPath));
         builder.Services.AddSingleton<SipRuntime>();
         builder.Services.AddSingleton<ISipRuntime>(provider => provider.GetRequiredService<SipRuntime>());
+        builder.Services.AddSingleton<ICommandFingerprintService>(
+            new DpapiCommandFingerprintService(AgentStoragePaths.CommandFingerprintKeyPath));
         builder.Services.AddSingleton(provider => new AgentCoordinator(
             provider.GetRequiredService<ISipRuntime>(),
             provider.GetRequiredService<IAgentEventStore>(),

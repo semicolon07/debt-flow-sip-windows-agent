@@ -26,9 +26,31 @@ public sealed class AgentRuntimeOptionsTests
         Assert.True(options.ConsoleMode);
         Assert.True(options.IsOperational);
         Assert.False(options.IsAllowAllOrigins);
+        Assert.False(options.AcceptRtpFromAny);
         Assert.Equal(
             ["http://127.0.0.1:8765", "http://localhost:8765"],
             options.AllowedOrigins.Order(StringComparer.Ordinal));
+    }
+
+    [Fact]
+    public void TrayMode_RtpCompatibilityMode_MustBeExplicitlyEnabled()
+    {
+        string path = Path.Combine(Path.GetTempPath(), $"sip-agent-settings-{Guid.NewGuid():N}.json");
+        try
+        {
+            File.WriteAllText(path, """
+                {"agent":{"isAllowAllOrigins":true,"allowedOrigins":[],"acceptRtpFromAny":true}}
+                """);
+
+            AgentRuntimeOptions options = AgentRuntimeOptions.Load([], path);
+
+            Assert.True(options.IsOperational);
+            Assert.True(options.AcceptRtpFromAny);
+        }
+        finally
+        {
+            File.Delete(path);
+        }
     }
 
     [Fact]

@@ -1,6 +1,7 @@
 {
   "agent": {
     "isAllowAllOrigins": true,
-    "allowedOrigins": []
+    "allowedOrigins": [],
+    "acceptRtpFromAny": false
   }
 }

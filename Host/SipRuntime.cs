@@ -1,4 +1,6 @@
 using System.Net;
+using System.Collections.Concurrent;
+using System.Threading.Channels;
 using Microsoft.Extensions.Logging;
 using NAudio.CoreAudioApi;
 using NAudio.Wave;
@@ -18,15 +20,31 @@ public sealed class SipRuntime : ISipRuntime
     private static readonly TimeSpan AnswerTimeout = TimeSpan.FromSeconds(30);
     private readonly ILogger<SipRuntime> _logger;
     private readonly IAudioPreferencesStore _audioPreferencesStore;
+    private readonly bool _acceptRtpFromAny;
     private readonly SIPTransport _transport;
     private readonly SIPUserAgent _userAgent;
     private readonly SemaphoreSlim _mediaGate = new(1, 1);
+    private readonly object _callGate = new();
     private readonly object _audioNotificationGate = new();
+    private readonly Channel<SipSignal> _signals = Channel.CreateBounded<SipSignal>(
+        new BoundedChannelOptions(512)
+        {
+            SingleReader = true,
+            SingleWriter = false,
+            FullMode = BoundedChannelFullMode.Wait,
+            AllowSynchronousContinuations = false
+        });
+    private readonly ConcurrentDictionary<long, Task> _backgroundTasks = new();
+    private readonly Dictionary<string, SipCallHandle> _callHandlesBySipCallId = new(StringComparer.Ordinal);
+    private readonly Dictionary<ISIPServerUserAgent, SipCallHandle> _incomingHandles = new();
     private readonly AudioSessionVolumeController _volumeController = new();
     private readonly MMDeviceEnumerator? _audioDeviceEnumerator;
     private readonly MMDeviceNotificationClient? _audioNotificationClient;
     private SIPRegistrationUserAgent? _registrationAgent;
     private SIPServerUserAgent? _pendingIncomingCall;
+    private SipCallHandle? _pendingIncomingHandle;
+    private SipCallHandle? _activeCallHandle;
+    private SipCallHandle? _unmappedOutboundHandle;
     private WindowsAudioEndPoint? _audioEndPoint;
     private VoIPMediaSession? _mediaSession;
     private AudioExtrasSource? _fallbackAudioSource;
@@ -36,13 +54,20 @@ public sealed class SipRuntime : ISipRuntime
     private int _microphoneMuted;
     private int _outputVolume;
     private int _inputVolume;
-    private int _registrationGeneration;
+    private long _registrationGeneration;
+    private long _callGeneration;
+    private long _backgroundTaskId;
+    private int _signalOverflow;
     private bool _disposed;
 
-    public SipRuntime(ILogger<SipRuntime> logger, IAudioPreferencesStore audioPreferencesStore)
+    public SipRuntime(
+        ILogger<SipRuntime> logger,
+        IAudioPreferencesStore audioPreferencesStore,
+        AgentRuntimeOptions options)
     {
         _logger = logger;
         _audioPreferencesStore = audioPreferencesStore;
+        _acceptRtpFromAny = options.AcceptRtpFromAny;
         AudioPreferences preferences = audioPreferencesStore.Load();
         _outputVolume = preferences.OutputVolume;
         _inputVolume = preferences.InputVolume;
@@ -73,7 +98,7 @@ public sealed class SipRuntime : ISipRuntime
             WaveOut.DeviceCount);
     }
 
-    public event Func<SipSignal, Task>? Signal;
+    public ChannelReader<SipSignal> Signals => _signals.Reader;
 
     public string AudioState { get; private set; }
     public bool IsMicrophoneMuted => Volatile.Read(ref _microphoneMuted) != 0;
@@ -90,13 +115,13 @@ public sealed class SipRuntime : ISipRuntime
         return Task.CompletedTask;
     }
 
-    public Task StartRegistrationAsync(CancellationToken cancellationToken)
+    public Task StartRegistrationAsync(long generation, CancellationToken cancellationToken)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
         cancellationToken.ThrowIfCancellationRequested();
         SipConfiguration configuration = RequireConfiguration();
         _registrationAgent?.Stop();
-        int generation = ++_registrationGeneration;
+        _registrationGeneration = generation;
         var registrationAgent = new SIPRegistrationUserAgent(
             _transport,
             configuration.Username,
@@ -105,11 +130,11 @@ public sealed class SipRuntime : ISipRuntime
             180);
         _registrationAgent = registrationAgent;
 
-        registrationAgent.RegistrationFailed += async (_, _, _) =>
-            await EmitRegistrationSignalAsync(
+        registrationAgent.RegistrationFailed += (_, _, _) =>
+            EmitRegistrationSignal(
                 generation,
                 new SipSignal(SipSignalType.RegistrationFailed, SafeCode: "registration_failed"));
-        registrationAgent.RegistrationTemporaryFailure += async (_, _, _) =>
+        registrationAgent.RegistrationTemporaryFailure += (_, _, _) =>
         {
             if (generation == _registrationGeneration && !_useTcp)
             {
@@ -117,46 +142,54 @@ public sealed class SipRuntime : ISipRuntime
                 _logger.LogInformation("SIP registration transport changed to {Transport}", "tcp");
             }
 
-            await EmitRegistrationSignalAsync(
+            EmitRegistrationSignal(
                 generation,
                 new SipSignal(
                     SipSignalType.RegistrationFailed,
                     SafeCode: "registration_transport_failure",
                     Retryable: true));
         };
-        registrationAgent.RegistrationRemoved += async (_, _) =>
-            await EmitRegistrationSignalAsync(
+        registrationAgent.RegistrationRemoved += (_, _) =>
+            EmitRegistrationSignal(
                 generation,
                 new SipSignal(
                     SipSignalType.RegistrationFailed,
                     SafeCode: "registration_transport_lost",
                     Retryable: true));
-        registrationAgent.RegistrationSuccessful += async (_, _) =>
+        registrationAgent.RegistrationSuccessful += (_, _) =>
         {
             _logger.LogInformation("SIP registration succeeded over {Transport}", _useTcp ? "tcp" : "udp");
-            await EmitRegistrationSignalAsync(generation, new SipSignal(SipSignalType.RegistrationRegistered));
+            EmitRegistrationSignal(generation, new SipSignal(SipSignalType.RegistrationRegistered));
         };
 
-        _ = EmitAsync(new SipSignal(SipSignalType.RegistrationRegistering));
+        Emit(new SipSignal(SipSignalType.RegistrationRegistering, RegistrationGeneration: generation));
         _registrationAgent.Start();
         return Task.CompletedTask;
     }
 
-    public Task StopRegistrationAsync(CancellationToken cancellationToken)
+    public Task StopRegistrationAsync(long generation, CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
-        _registrationGeneration++;
+        _registrationGeneration = generation;
         _registrationAgent?.Stop();
         _registrationAgent = null;
         _configuration = null;
         return Task.CompletedTask;
     }
 
-    public async Task StartCallAsync(string destination, CancellationToken cancellationToken)
+    public async Task StartCallAsync(
+        SipCallHandle call,
+        string destination,
+        CancellationToken cancellationToken)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
         SipConfiguration configuration = RequireConfiguration();
-        VoIPMediaSession mediaSession = CreateMediaSession();
+        SetActiveCall(call);
+        lock (_callGate)
+        {
+            _unmappedOutboundHandle = call;
+        }
+        VoIPMediaSession mediaSession = CreateMediaSession(call);
         string destinationUri = SipEndpointFormatter.FormatDestination(configuration, destination, _useTcp);
 
         bool result;
@@ -173,78 +206,102 @@ public sealed class SipRuntime : ISipRuntime
         {
             _userAgent.Cancel();
             await CleanupMediaAsync();
-            await EmitAsync(new SipSignal(SipSignalType.CallFailed, SafeCode: "call_timeout"));
+            ClearActiveCall(call);
+            Emit(new SipSignal(SipSignalType.CallFailed, SafeCode: "call_timeout", Call: call));
             return;
         }
         catch (OperationCanceledException)
         {
             _userAgent.Cancel();
             await CleanupMediaAsync();
+            ClearActiveCall(call);
+            throw;
+        }
+        catch
+        {
+            await CleanupMediaAsync();
+            ClearActiveCall(call);
             throw;
         }
 
         if (result)
         {
-            await EmitAsync(new SipSignal(SipSignalType.CallConnected));
+            Emit(new SipSignal(SipSignalType.CallConnected, Call: call));
         }
         else
         {
             await CleanupMediaAsync();
-            await EmitAsync(new SipSignal(SipSignalType.CallFailed, SafeCode: "call_unavailable"));
+            ClearActiveCall(call);
+            Emit(new SipSignal(SipSignalType.CallFailed, SafeCode: "call_unavailable", Call: call));
         }
     }
 
-    public async Task AnswerAsync(CancellationToken cancellationToken)
+    public async Task AnswerAsync(SipCallHandle call, CancellationToken cancellationToken)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
         cancellationToken.ThrowIfCancellationRequested();
-        SIPServerUserAgent incoming = _pendingIncomingCall
-            ?? throw new InvalidOperationException("No incoming call is pending.");
-        _pendingIncomingCall = null;
+        SIPServerUserAgent incoming = TakePendingIncoming(call);
         bool answered;
         try
         {
-            answered = await _userAgent.Answer(incoming, CreateMediaSession())
+            answered = await _userAgent.Answer(incoming, CreateMediaSession(call))
                 .WaitAsync(AnswerTimeout, cancellationToken);
         }
         catch (TimeoutException)
         {
             await CleanupMediaAsync();
-            await EmitAsync(new SipSignal(SipSignalType.CallFailed, SafeCode: "answer_timeout"));
+            ClearActiveCall(call);
+            Emit(new SipSignal(SipSignalType.CallFailed, SafeCode: "answer_timeout", Call: call));
             return;
         }
-        await EmitAsync(answered
-            ? new SipSignal(SipSignalType.CallConnected)
-            : new SipSignal(SipSignalType.CallFailed, SafeCode: "answer_failed"));
-    }
-
-    public Task RejectAsync(CancellationToken cancellationToken)
-    {
-        cancellationToken.ThrowIfCancellationRequested();
-        SIPServerUserAgent incoming = _pendingIncomingCall
-            ?? throw new InvalidOperationException("No incoming call is pending.");
-        incoming.Reject(SIPResponseStatusCodesEnum.BusyHere, "Rejected");
-        _pendingIncomingCall = null;
-        return Task.CompletedTask;
-    }
-
-    public Task RejectUnavailableAsync(CancellationToken cancellationToken)
-    {
-        cancellationToken.ThrowIfCancellationRequested();
-        SIPServerUserAgent incoming = _pendingIncomingCall
-            ?? throw new InvalidOperationException("No incoming call is pending.");
-        incoming.Reject(SIPResponseStatusCodesEnum.TemporarilyUnavailable, "Temporarily unavailable");
-        _pendingIncomingCall = null;
-        return Task.CompletedTask;
-    }
-
-    public async Task HangupAsync(CancellationToken cancellationToken)
-    {
-        cancellationToken.ThrowIfCancellationRequested();
-        if (_pendingIncomingCall != null)
+        catch
         {
-            _pendingIncomingCall.Reject(SIPResponseStatusCodesEnum.BusyHere, "Rejected");
+            await CleanupMediaAsync();
+            ClearActiveCall(call);
+            throw;
+        }
+        if (!answered)
+        {
+            await CleanupMediaAsync();
+            ClearActiveCall(call);
+        }
+        Emit(answered
+            ? new SipSignal(SipSignalType.CallConnected, Call: call)
+            : new SipSignal(SipSignalType.CallFailed, SafeCode: "answer_failed", Call: call));
+    }
+
+    public Task RejectAsync(SipCallHandle call, CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        SIPServerUserAgent incoming = TakePendingIncoming(call);
+        incoming.Reject(SIPResponseStatusCodesEnum.BusyHere, "Rejected");
+        ClearActiveCall(call);
+        return Task.CompletedTask;
+    }
+
+    public Task RejectUnavailableAsync(SipCallHandle call, CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        SIPServerUserAgent incoming = TakePendingIncoming(call);
+        incoming.Reject(SIPResponseStatusCodesEnum.TemporarilyUnavailable, "Temporarily unavailable");
+        ClearActiveCall(call);
+        return Task.CompletedTask;
+    }
+
+    public async Task HangupAsync(SipCallHandle call, CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        EnsureActiveCall(call);
+        SIPServerUserAgent? pending;
+        lock (_callGate)
+        {
+            pending = SameCall(_pendingIncomingHandle, call) ? _pendingIncomingCall : null;
             _pendingIncomingCall = null;
+            _pendingIncomingHandle = null;
+        }
+        if (pending != null)
+        {
+            pending.Reject(SIPResponseStatusCodesEnum.BusyHere, "Rejected");
         }
         else if (_userAgent.IsCalling || _userAgent.IsRinging)
         {
@@ -256,11 +313,13 @@ public sealed class SipRuntime : ISipRuntime
         }
 
         await CleanupMediaAsync();
+        ClearActiveCall(call);
     }
 
-    public Task SendDtmfAsync(char digit, CancellationToken cancellationToken)
+    public Task SendDtmfAsync(SipCallHandle call, char digit, CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
+        EnsureActiveCall(call);
         byte tone = digit switch
         {
             >= '0' and <= '9' => (byte)(digit - '0'),
@@ -275,9 +334,13 @@ public sealed class SipRuntime : ISipRuntime
         return _userAgent.SendDtmf(tone);
     }
 
-    public async Task SetMicrophoneMutedAsync(bool muted, CancellationToken cancellationToken)
+    public async Task SetMicrophoneMutedAsync(
+        SipCallHandle call,
+        bool muted,
+        CancellationToken cancellationToken)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
+        EnsureActiveCall(call);
         await _mediaGate.WaitAsync(cancellationToken);
         try
         {
@@ -300,17 +363,25 @@ public sealed class SipRuntime : ISipRuntime
         }
     }
 
-    public async Task SetOutputVolumeAsync(int volume, CancellationToken cancellationToken)
+    public async Task SetOutputVolumeAsync(
+        SipCallHandle call,
+        int volume,
+        CancellationToken cancellationToken)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
+        EnsureActiveCall(call);
         await SetSessionVolumeAsync(DataFlow.Render, volume, cancellationToken);
         Volatile.Write(ref _outputVolume, volume);
         PersistAudioPreferences();
     }
 
-    public async Task SetInputVolumeAsync(int volume, CancellationToken cancellationToken)
+    public async Task SetInputVolumeAsync(
+        SipCallHandle call,
+        int volume,
+        CancellationToken cancellationToken)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
+        EnsureActiveCall(call);
         await SetSessionVolumeAsync(DataFlow.Capture, volume, cancellationToken);
         Volatile.Write(ref _inputVolume, volume);
         PersistAudioPreferences();
@@ -332,6 +403,8 @@ public sealed class SipRuntime : ISipRuntime
         }
 
         await CleanupMediaAsync();
+        SipCallHandle? active = GetActiveCall();
+        if (active != null) ClearActiveCall(active);
         lock (_audioNotificationGate)
         {
             _audioNotificationDebounce?.Cancel();
@@ -342,55 +415,134 @@ public sealed class SipRuntime : ISipRuntime
         _audioDeviceEnumerator?.Dispose();
         _transport.Shutdown();
         _configuration = null;
+        Task[] background = _backgroundTasks.Values.ToArray();
+        if (background.Length > 0)
+        {
+            try
+            {
+                await Task.WhenAll(background).WaitAsync(TimeSpan.FromSeconds(2));
+            }
+            catch (Exception exception) when (exception is TimeoutException or OperationCanceledException)
+            {
+            }
+        }
+        _signals.Writer.TryComplete();
         _mediaGate.Dispose();
     }
 
     private void WireUserAgentEvents()
     {
-        _userAgent.OnIncomingCall += async (agent, request) =>
+        _userAgent.OnIncomingCall += (agent, request) =>
         {
-            if (_pendingIncomingCall != null || agent.IsCallActive)
+            try
             {
-                SIPServerUserAgent busyCall = agent.AcceptCall(request);
-                busyCall.Reject(SIPResponseStatusCodesEnum.BusyHere, "Busy");
-                return;
+                if (!IsExpectedSipPeer(request))
+                {
+                    SIPServerUserAgent forbidden = agent.AcceptCall(request);
+                    forbidden.Reject(SIPResponseStatusCodesEnum.Forbidden, "Unexpected SIP peer");
+                    _logger.LogWarning("Rejected incoming SIP request from an unexpected peer");
+                    return;
+                }
+
+                SIPServerUserAgent? accepted = null;
+                SipCallHandle? call = null;
+                lock (_callGate)
+                {
+                    if (_pendingIncomingCall == null &&
+                        _activeCallHandle == null &&
+                        !agent.IsCallActive &&
+                        !agent.IsCalling &&
+                        !agent.IsRinging)
+                    {
+                        accepted = agent.AcceptCall(request);
+                        call = new SipCallHandle(
+                            Guid.NewGuid().ToString("D").ToLowerInvariant(),
+                            ++_callGeneration);
+                        _pendingIncomingCall = accepted;
+                        _pendingIncomingHandle = call;
+                        _activeCallHandle = call;
+                        _incomingHandles[accepted] = call;
+                        RememberSipCallId(request.Header?.CallId, call);
+                    }
+                }
+
+                if (accepted == null || call == null)
+                {
+                    SIPServerUserAgent busyCall = agent.AcceptCall(request);
+                    busyCall.Reject(SIPResponseStatusCodesEnum.BusyHere, "Busy");
+                    return;
+                }
+
+                string caller = request.Header?.From?.FromURI?.User ?? "unknown";
+                Emit(new SipSignal(SipSignalType.IncomingCall, Caller: caller, Call: call));
             }
-
-            _pendingIncomingCall = agent.AcceptCall(request);
-            string caller = request.Header?.From?.FromURI?.User ?? "unknown";
-            await EmitAsync(new SipSignal(SipSignalType.IncomingCall, Caller: caller));
+            catch (Exception exception)
+            {
+                _logger.LogWarning(
+                    "Incoming SIP call callback failed because of {ErrorType}",
+                    exception.GetType().Name);
+            }
         };
 
-        _userAgent.ServerCallCancelled += async (_, _) =>
+        _userAgent.ServerCallCancelled += (incoming, _) =>
         {
-            _pendingIncomingCall = null;
-            await EmitAsync(new SipSignal(SipSignalType.IncomingCancelled));
+            SipCallHandle? call = ResolveIncomingHandle(incoming);
+            if (call == null) return;
+            ClearPendingIncoming(call);
+            TrackBackground(CleanupMediaForCallAsync(call));
+            Emit(new SipSignal(SipSignalType.IncomingCancelled, Call: call));
         };
-        _userAgent.OnDtmfTone += async (_, _) =>
-            await EmitAsync(new SipSignal(SipSignalType.DtmfReceived));
-        _userAgent.OnCallHungup += async _ =>
+        _userAgent.ServerCallRingTimeout += incoming =>
         {
-            await CleanupMediaAsync();
-            _pendingIncomingCall = null;
-            await EmitAsync(new SipSignal(SipSignalType.CallRemoteEnded));
+            SipCallHandle? call = ResolveIncomingHandle(incoming);
+            if (call == null) return;
+            ClearPendingIncoming(call);
+            TrackBackground(CleanupMediaForCallAsync(call));
+            Emit(new SipSignal(SipSignalType.CallFailed, SafeCode: "answer_ack_timeout", Call: call));
         };
-        _userAgent.ClientCallTrying += async (_, response) =>
-            await EmitAsync(new SipSignal(SipSignalType.CallTrying, (int)response.Status));
-        _userAgent.ClientCallRinging += async (_, response) =>
-            await EmitAsync(new SipSignal(SipSignalType.CallRinging, (int)response.Status));
-        _userAgent.ClientCallAnswered += async (_, response) =>
-            await EmitAsync(new SipSignal(SipSignalType.CallConnected, (int)response.Status));
-        _userAgent.ClientCallFailed += async (_, _, response) =>
+        _userAgent.OnDtmfTone += (_, _) =>
         {
-            await CleanupMediaAsync();
-            await EmitAsync(new SipSignal(
+            SipCallHandle? call = GetActiveCall();
+            if (call != null) Emit(new SipSignal(SipSignalType.DtmfReceived, Call: call));
+        };
+        _userAgent.OnCallHungup += dialogue =>
+        {
+            SipCallHandle? call = ResolveSipCallId(dialogue.CallId);
+            if (call == null) return;
+            TrackBackground(CleanupMediaForCallAsync(call));
+            Emit(new SipSignal(SipSignalType.CallRemoteEnded, Call: call));
+        };
+        _userAgent.ClientCallTrying += (_, response) =>
+        {
+            SipCallHandle? call = ResolveOrRememberOutboundHandle(response.Header?.CallId);
+            if (call != null) Emit(new SipSignal(SipSignalType.CallTrying, (int)response.Status, Call: call));
+        };
+        _userAgent.ClientCallRinging += (_, response) =>
+        {
+            SipCallHandle? call = ResolveOrRememberOutboundHandle(response.Header?.CallId);
+            if (call != null) Emit(new SipSignal(SipSignalType.CallRinging, (int)response.Status, Call: call));
+        };
+        _userAgent.ClientCallAnswered += (_, response) =>
+        {
+            SipCallHandle? call = ResolveOrRememberOutboundHandle(response.Header?.CallId);
+            if (call != null) Emit(new SipSignal(SipSignalType.CallConnected, (int)response.Status, Call: call));
+        };
+        _userAgent.ClientCallFailed += (_, _, response) =>
+        {
+            SipCallHandle? call = response == null
+                ? GetUnmappedOutboundCall()
+                : ResolveOrRememberOutboundHandle(response.Header?.CallId);
+            if (call == null) return;
+            TrackBackground(CleanupMediaForCallAsync(call));
+            Emit(new SipSignal(
                 SipSignalType.CallFailed,
                 response == null ? null : (int)response.Status,
-                "sip_call_failed"));
+                "sip_call_failed",
+                Call: call));
         };
     }
 
-    private VoIPMediaSession CreateMediaSession()
+    private VoIPMediaSession CreateMediaSession(SipCallHandle call)
     {
         var encoder = new AudioEncoder();
         bool hasCapture = WaveIn.DeviceCount > 0;
@@ -405,10 +557,10 @@ public sealed class SipRuntime : ISipRuntime
             disableSink: !hasPlayback);
         Volatile.Write(ref _microphoneMuted, 0);
 
-        _audioEndPoint.OnAudioSourceError += error =>
-            _ = EmitAsync(new SipSignal(SipSignalType.MediaDegraded, SafeCode: "audio_source_error"));
-        _audioEndPoint.OnAudioSinkError += error =>
-            _ = EmitAsync(new SipSignal(SipSignalType.MediaDegraded, SafeCode: "audio_sink_error"));
+        _audioEndPoint.OnAudioSourceError += _ =>
+            Emit(new SipSignal(SipSignalType.MediaDegraded, SafeCode: "audio_source_error", Call: call));
+        _audioEndPoint.OnAudioSinkError += _ =>
+            Emit(new SipSignal(SipSignalType.MediaDegraded, SafeCode: "audio_sink_error", Call: call));
 
         IAudioSource source;
         if (hasCapture)
@@ -428,7 +580,7 @@ public sealed class SipRuntime : ISipRuntime
         if (!hasCapture || !hasPlayback)
         {
             AudioState = "degraded";
-            _ = EmitAsync(new SipSignal(SipSignalType.MediaDegraded, SafeCode: "audio_device_unavailable"));
+            Emit(new SipSignal(SipSignalType.MediaDegraded, SafeCode: "audio_device_unavailable", Call: call));
         }
 
         _mediaSession = new VoIPMediaSession(new MediaEndPoints
@@ -437,14 +589,14 @@ public sealed class SipRuntime : ISipRuntime
             AudioSink = sink
         })
         {
-            AcceptRtpFromAny = true
+            AcceptRtpFromAny = _acceptRtpFromAny
         };
 
         _mediaSession.OnAudioFormatsNegotiated += formats =>
         {
             string codec = string.Join(",", formats.Select(format => $"{format.Codec}/{format.ClockRate}"));
-            _ = ApplyRememberedVolumesAsync();
-            _ = EmitAsync(new SipSignal(SipSignalType.MediaReady, Codec: codec));
+            TrackBackground(ApplyRememberedVolumesAsync());
+            Emit(new SipSignal(SipSignalType.MediaReady, Codec: codec, Call: call));
         };
         return _mediaSession;
     }
@@ -594,10 +746,13 @@ public sealed class SipRuntime : ISipRuntime
                 WaveIn.DeviceCount,
                 WaveOut.DeviceCount,
                 AudioState);
-            await EmitAsync(new SipSignal(SipSignalType.AudioInventoryChanged, SafeCode: "audio_devices_changed"));
+            Emit(new SipSignal(SipSignalType.AudioInventoryChanged, SafeCode: "audio_devices_changed"));
             if (AudioState == "degraded" && previous != AudioState && _userAgent.IsCallActive)
             {
-                await EmitAsync(new SipSignal(SipSignalType.MediaDegraded, SafeCode: "audio_device_removed"));
+                Emit(new SipSignal(
+                    SipSignalType.MediaDegraded,
+                    SafeCode: "audio_device_removed",
+                    Call: GetActiveCall()));
             }
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
@@ -611,34 +766,247 @@ public sealed class SipRuntime : ISipRuntime
         }
     }
 
-    private Task EmitRegistrationSignalAsync(int generation, SipSignal signal) =>
-        generation == _registrationGeneration && !_disposed
-            ? EmitAsync(signal)
-            : Task.CompletedTask;
+    private void EmitRegistrationSignal(long generation, SipSignal signal)
+    {
+        if (generation == _registrationGeneration && !_disposed)
+        {
+            Emit(signal with { RegistrationGeneration = generation });
+        }
+    }
 
     private static string GetAudioState() =>
         WaveIn.DeviceCount > 0 && WaveOut.DeviceCount > 0 ? "ready" : "degraded";
 
-    private async Task EmitAsync(SipSignal signal)
+    private void Emit(SipSignal signal)
     {
-        Func<SipSignal, Task>? handler = Signal;
-        if (handler == null)
+        if (_disposed)
         {
             return;
         }
 
+        if (_signals.Writer.TryWrite(signal))
+        {
+            return;
+        }
+
+        if (Interlocked.Exchange(ref _signalOverflow, 1) == 0)
+        {
+            _logger.LogError("SIP signal channel overflowed; runtime is entering a degraded state");
+            TrackBackground(ReportSignalOverflowAsync());
+        }
+    }
+
+    private async Task ReportSignalOverflowAsync()
+    {
         try
         {
-            await handler(signal);
+            await _signals.Writer.WriteAsync(new SipSignal(
+                SipSignalType.RuntimeFailed,
+                SafeCode: "sip_signal_overflow"));
+        }
+        catch (ChannelClosedException)
+        {
+        }
+    }
+
+    private bool IsExpectedSipPeer(SIPRequest request)
+    {
+        SipConfiguration? configuration = _configuration;
+        IPAddress? remote = request.RemoteSIPEndPoint?.Address;
+        if (configuration == null || remote == null || !IPAddress.TryParse(configuration.Host, out IPAddress? expected))
+        {
+            return false;
+        }
+
+        if (remote.IsIPv4MappedToIPv6) remote = remote.MapToIPv4();
+        if (expected.IsIPv4MappedToIPv6) expected = expected.MapToIPv4();
+        return remote.Equals(expected);
+    }
+
+    private void SetActiveCall(SipCallHandle call)
+    {
+        lock (_callGate)
+        {
+            if (_activeCallHandle != null && !SameCall(_activeCallHandle, call))
+            {
+                throw new InvalidOperationException("Another SIP call is active.");
+            }
+
+            _activeCallHandle = call;
+            _callGeneration = Math.Max(_callGeneration, call.Generation);
+        }
+    }
+
+    private SipCallHandle? GetActiveCall()
+    {
+        lock (_callGate)
+        {
+            return _activeCallHandle;
+        }
+    }
+
+    private void EnsureActiveCall(SipCallHandle call)
+    {
+        lock (_callGate)
+        {
+            if (!SameCall(_activeCallHandle, call))
+            {
+                throw new InvalidOperationException("The SIP call handle is stale.");
+            }
+        }
+    }
+
+    private SIPServerUserAgent TakePendingIncoming(SipCallHandle call)
+    {
+        lock (_callGate)
+        {
+            if (_pendingIncomingCall == null ||
+                !SameCall(_pendingIncomingHandle, call) ||
+                !SameCall(_activeCallHandle, call))
+            {
+                throw new InvalidOperationException("No matching incoming call is pending.");
+            }
+
+            SIPServerUserAgent incoming = _pendingIncomingCall;
+            _pendingIncomingCall = null;
+            _pendingIncomingHandle = null;
+            return incoming;
+        }
+    }
+
+    private SipCallHandle? ResolveIncomingHandle(ISIPServerUserAgent incoming)
+    {
+        lock (_callGate)
+        {
+            return _incomingHandles.GetValueOrDefault(incoming);
+        }
+    }
+
+    private void ClearPendingIncoming(SipCallHandle call)
+    {
+        lock (_callGate)
+        {
+            if (SameCall(_pendingIncomingHandle, call))
+            {
+                _pendingIncomingCall = null;
+                _pendingIncomingHandle = null;
+            }
+        }
+    }
+
+    private void ClearActiveCall(SipCallHandle call)
+    {
+        lock (_callGate)
+        {
+            if (!SameCall(_activeCallHandle, call)) return;
+            _activeCallHandle = null;
+            if (SameCall(_unmappedOutboundHandle, call))
+            {
+                _unmappedOutboundHandle = null;
+            }
+            if (SameCall(_pendingIncomingHandle, call))
+            {
+                _pendingIncomingCall = null;
+                _pendingIncomingHandle = null;
+            }
+
+            foreach (string key in _callHandlesBySipCallId
+                         .Where(pair => SameCall(pair.Value, call))
+                         .Select(pair => pair.Key)
+                         .ToArray())
+            {
+                _callHandlesBySipCallId.Remove(key);
+            }
+
+            foreach (ISIPServerUserAgent key in _incomingHandles
+                         .Where(pair => SameCall(pair.Value, call))
+                         .Select(pair => pair.Key)
+                         .ToArray())
+            {
+                _incomingHandles.Remove(key);
+            }
+        }
+    }
+
+    private void RememberSipCallId(string? sipCallId, SipCallHandle call)
+    {
+        if (!string.IsNullOrWhiteSpace(sipCallId))
+        {
+            _callHandlesBySipCallId[sipCallId] = call;
+        }
+    }
+
+    private SipCallHandle? ResolveSipCallId(string? sipCallId)
+    {
+        if (string.IsNullOrWhiteSpace(sipCallId)) return null;
+        lock (_callGate)
+        {
+            return _callHandlesBySipCallId.GetValueOrDefault(sipCallId);
+        }
+    }
+
+    private SipCallHandle? ResolveOrRememberOutboundHandle(string? sipCallId)
+    {
+        lock (_callGate)
+        {
+            if (!string.IsNullOrWhiteSpace(sipCallId) &&
+                _callHandlesBySipCallId.TryGetValue(sipCallId, out SipCallHandle? known))
+            {
+                return known;
+            }
+
+            if (string.IsNullOrWhiteSpace(sipCallId)) return null;
+
+            SipCallHandle? outbound = _unmappedOutboundHandle;
+            if (outbound == null || !SameCall(outbound, _activeCallHandle)) return null;
+            RememberSipCallId(sipCallId, outbound);
+            _unmappedOutboundHandle = null;
+            return outbound;
+        }
+    }
+
+    private SipCallHandle? GetUnmappedOutboundCall()
+    {
+        lock (_callGate)
+        {
+            return SameCall(_unmappedOutboundHandle, _activeCallHandle)
+                ? _unmappedOutboundHandle
+                : null;
+        }
+    }
+
+    private async Task CleanupMediaForCallAsync(SipCallHandle call)
+    {
+        try
+        {
+            EnsureActiveCall(call);
+            await CleanupMediaAsync();
+            ClearActiveCall(call);
+        }
+        catch (InvalidOperationException)
+        {
         }
         catch (Exception exception)
         {
-            _logger.LogWarning(
-                "SIP signal {SignalType} could not be processed because of {ErrorType}",
-                signal.Type,
-                exception.GetType().Name);
+            _logger.LogWarning("Media cleanup callback failed because of {ErrorType}", exception.GetType().Name);
         }
     }
+
+    private void TrackBackground(Task task)
+    {
+        long id = Interlocked.Increment(ref _backgroundTaskId);
+        _backgroundTasks[id] = task;
+        _ = task.ContinueWith(
+            completed => _backgroundTasks.TryRemove(id, out _),
+            CancellationToken.None,
+            TaskContinuationOptions.ExecuteSynchronously,
+            TaskScheduler.Default);
+    }
+
+    private static bool SameCall(SipCallHandle? left, SipCallHandle? right) =>
+        left != null && right != null &&
+        left.Generation == right.Generation &&
+        string.Equals(left.RuntimeCallId, right.RuntimeCallId, StringComparison.Ordinal);
 
     private SipConfiguration RequireConfiguration() =>
         _configuration ?? throw new InvalidOperationException("SIP runtime is not configured.");

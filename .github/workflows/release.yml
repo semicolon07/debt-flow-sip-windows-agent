@@ -9,19 +9,19 @@ jobs:
   portable-win-x64:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
-      - uses: actions/setup-dotnet@v4
+      - uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4
         with:
           dotnet-version: 10.0.x
       - shell: pwsh
         run: ./scripts/verify-p5-release.ps1 -OutputRoot artifacts/p5-release
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: debt-flow-sip-agent-1.0.0-win-x64
+          name: debt-flow-sip-agent-win-x64
           path: |
-            artifacts/p5-release/**/debt-flow-sip-agent-1.0.0-win-x64.zip
-            artifacts/p5-release/**/debt-flow-sip-agent-1.0.0-win-x64.zip.sha256
+            artifacts/p5-release/**/debt-flow-sip-agent-*-win-x64.zip
+            artifacts/p5-release/**/debt-flow-sip-agent-*-win-x64.zip.sha256
             artifacts/p5-release/**/verification/**/*.json
             artifacts/p5-release/**/logs/**

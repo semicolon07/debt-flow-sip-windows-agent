@@ -12,7 +12,9 @@ public sealed record EventStoreLimits(long MaximumPendingEvents, long MaximumSto
 
 public sealed class SqliteAgentEventStore : IAgentEventStore
 {
-    private const int CurrentSchemaVersion = 4;
+    public const int CurrentSchemaVersion = 4;
+    private const int MaximumCommandRows = 50_000;
+    private const int MaximumExecutingCommandRows = 1_024;
     private readonly string _databasePath;
     private readonly EventStoreLimits _limits;
     private readonly SemaphoreSlim _gate = new(1, 1);
@@ -61,6 +63,7 @@ public sealed class SqliteAgentEventStore : IAgentEventStore
             await ExecuteNonQueryAsync("PRAGMA synchronous=FULL;", cancellationToken);
             await ExecuteNonQueryAsync("PRAGMA busy_timeout=5000;", cancellationToken);
             await ExecuteNonQueryAsync("PRAGMA foreign_keys=ON;", cancellationToken);
+            await ExecuteNonQueryAsync("PRAGMA secure_delete=ON;", cancellationToken);
             await MigrateAsync(cancellationToken);
             await ValidateIntegrityAsync(cancellationToken);
 
@@ -285,7 +288,7 @@ public sealed class SqliteAgentEventStore : IAgentEventStore
             await delete.ExecuteNonQueryAsync(cancellationToken);
             await transaction.CommitAsync(cancellationToken);
             LastAcknowledgedSequence = sequence;
-            await CheckpointCoreAsync(cancellationToken);
+            await CheckpointCoreAsync(truncate: false, cancellationToken);
         }
         finally
         {
@@ -326,9 +329,31 @@ public sealed class SqliteAgentEventStore : IAgentEventStore
         }
     }
 
+    public async Task<bool> HasCommandRequestHashPrefixAsync(
+        string prefix,
+        CancellationToken cancellationToken)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(prefix);
+        await _gate.WaitAsync(cancellationToken);
+        try
+        {
+            await using SqliteCommand command = RequireConnection().CreateCommand();
+            command.CommandText =
+                "SELECT EXISTS(SELECT 1 FROM ProcessedCommands WHERE RequestHash LIKE $prefix LIMIT 1);";
+            command.Parameters.AddWithValue("$prefix", $"{prefix}%");
+            return Convert.ToInt64(
+                await command.ExecuteScalarAsync(cancellationToken),
+                CultureInfo.InvariantCulture) != 0;
+        }
+        finally
+        {
+            _gate.Release();
+        }
+    }
+
     public async Task SaveCommandAsync(ProcessedCommand command, CancellationToken cancellationToken)
     {
-        if (command.ExecutionState is not "executing" and not "completed" and not "failed")
+        if (command.ExecutionState is not "executing" and not "completed" and not "failed" and not "abandoned")
         {
             throw new ArgumentOutOfRangeException(nameof(command));
         }
@@ -336,6 +361,11 @@ public sealed class SqliteAgentEventStore : IAgentEventStore
         await _gate.WaitAsync(cancellationToken);
         try
         {
+            if (command.ExecutionState == "executing")
+            {
+                await EnsureCommandCapacityAsync(command.CommandId, cancellationToken);
+            }
+
             await using SqliteCommand sqliteCommand = RequireConnection().CreateCommand();
             sqliteCommand.CommandText =
                 """
@@ -359,6 +389,31 @@ public sealed class SqliteAgentEventStore : IAgentEventStore
                 command.ProcessedAtUtc.ToString("O", CultureInfo.InvariantCulture));
             sqliteCommand.Parameters.AddWithValue("$executionState", command.ExecutionState);
             await sqliteCommand.ExecuteNonQueryAsync(cancellationToken);
+        }
+        finally
+        {
+            _gate.Release();
+        }
+    }
+
+    public async Task RecoverExecutingCommandsAsync(
+        DateTimeOffset recoveredAtUtc,
+        CancellationToken cancellationToken)
+    {
+        await _gate.WaitAsync(cancellationToken);
+        try
+        {
+            await using SqliteCommand command = RequireConnection().CreateCommand();
+            command.CommandText =
+                """
+                UPDATE ProcessedCommands
+                SET ExecutionState = 'abandoned', ProcessedAtUtc = $recoveredAtUtc
+                WHERE ExecutionState = 'executing';
+                """;
+            command.Parameters.AddWithValue(
+                "$recoveredAtUtc",
+                recoveredAtUtc.ToString("O", CultureInfo.InvariantCulture));
+            await command.ExecuteNonQueryAsync(cancellationToken);
         }
         finally
         {
@@ -409,12 +464,39 @@ public sealed class SqliteAgentEventStore : IAgentEventStore
         }
     }
 
+    private async Task EnsureCommandCapacityAsync(string commandId, CancellationToken cancellationToken)
+    {
+        await using SqliteCommand command = RequireConnection().CreateCommand();
+        command.CommandText =
+            """
+            SELECT
+                COUNT(*),
+                COALESCE(SUM(CASE WHEN ExecutionState = 'executing' THEN 1 ELSE 0 END), 0),
+                EXISTS(SELECT 1 FROM ProcessedCommands WHERE CommandId = $commandId)
+            FROM ProcessedCommands;
+            """;
+        command.Parameters.AddWithValue("$commandId", commandId);
+        await using SqliteDataReader reader = await command.ExecuteReaderAsync(cancellationToken);
+        if (!await reader.ReadAsync(cancellationToken))
+        {
+            throw new AgentStoreException("command_journal_capacity");
+        }
+
+        long total = reader.GetInt64(0);
+        long executing = reader.GetInt64(1);
+        bool exists = reader.GetInt64(2) != 0;
+        if (!exists && (total >= MaximumCommandRows || executing >= MaximumExecutingCommandRows))
+        {
+            throw new AgentStoreException("command_journal_capacity");
+        }
+    }
+
     public async Task CheckpointAsync(CancellationToken cancellationToken)
     {
         await _gate.WaitAsync(cancellationToken);
         try
         {
-            await CheckpointCoreAsync(cancellationToken);
+            await CheckpointCoreAsync(truncate: true, cancellationToken);
         }
         finally
         {
@@ -431,7 +513,7 @@ public sealed class SqliteAgentEventStore : IAgentEventStore
             {
                 try
                 {
-                    await CheckpointCoreAsync(CancellationToken.None);
+                    await CheckpointCoreAsync(truncate: true, CancellationToken.None);
                 }
                 catch (Exception exception) when (exception is SqliteException or InvalidOperationException)
                 {
@@ -753,8 +835,10 @@ public sealed class SqliteAgentEventStore : IAgentEventStore
         return Convert.ToInt64(await command.ExecuteScalarAsync(cancellationToken), CultureInfo.InvariantCulture);
     }
 
-    private Task CheckpointCoreAsync(CancellationToken cancellationToken) =>
-        ExecuteNonQueryAsync("PRAGMA wal_checkpoint(PASSIVE);", cancellationToken);
+    private Task CheckpointCoreAsync(bool truncate, CancellationToken cancellationToken) =>
+        ExecuteNonQueryAsync(
+            truncate ? "PRAGMA wal_checkpoint(TRUNCATE);" : "PRAGMA wal_checkpoint(PASSIVE);",
+            cancellationToken);
 
     private SqliteConnection RequireConnection() =>
         _connection ?? throw new InvalidOperationException("Event store has not been initialized.");

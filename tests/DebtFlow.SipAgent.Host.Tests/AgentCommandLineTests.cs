@@ -5,6 +5,19 @@ namespace DebtFlow.SipAgent.Host.Tests;
 public sealed class AgentCommandLineTests
 {
     [Fact]
+    public void ReleaseMetadata_UsesRuntimeProtocolStorageAndCapabilitySources()
+    {
+        AgentReleaseMetadata metadata = AgentReleaseMetadata.Current();
+
+        Assert.Equal("1.0.0", metadata.Version);
+        Assert.Equal(DebtFlow.SipAgent.Protocol.ProtocolConstants.Version, metadata.ProtocolVersion);
+        Assert.Equal(DebtFlow.SipAgent.Persistence.SqliteAgentEventStore.CurrentSchemaVersion, metadata.SqliteSchemaVersion);
+        Assert.Contains("call.mute", metadata.Capabilities);
+        Assert.Contains("audio.output.volume", metadata.Capabilities);
+        Assert.Contains("audio.input.volume", metadata.Capabilities);
+    }
+
+    [Fact]
     public void Parses_each_explicit_certificate_maintenance_command()
     {
         Assert.Equal(
@@ -13,6 +26,12 @@ public sealed class AgentCommandLineTests
         Assert.Equal(
             AgentLaunchCommand.RemoveLocalCertificate,
             AgentCommandLine.Parse(["--remove-local-certificate"]));
+        Assert.Equal(
+            AgentLaunchCommand.StoragePreflight,
+            AgentCommandLine.Parse(["--storage-preflight"]));
+        Assert.Equal(
+            AgentLaunchCommand.PrintReleaseMetadata,
+            AgentCommandLine.Parse(["--print-release-metadata"]));
     }
 
     [Theory]

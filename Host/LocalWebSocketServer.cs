@@ -197,17 +197,7 @@ public sealed class LocalWebSocketServer(
                 GetAgentVersion(),
                 eventStore.AgentInstanceId,
                 coordinator.AgentSessionId,
-                [
-                    "sip.register",
-                    "call.outbound",
-                    "call.inbound",
-                    "call.dtmf",
-                    "call.mute",
-                    "audio.output.volume",
-                    "audio.input.volume",
-                    "event.durable",
-                    "event.collection_binding.v1"
-                ],
+                AgentReleaseMetadata.CurrentCapabilities,
                 eventStore.LastSequence,
                 eventStore.LastAcknowledgedSequence),
             cancellationToken);
@@ -216,10 +206,7 @@ public sealed class LocalWebSocketServer(
 
     private static string GetAgentVersion()
     {
-        Version? version = typeof(LocalWebSocketServer).Assembly.GetName().Version;
-        return version == null
-            ? "1.0.0"
-            : $"{version.Major}.{version.Minor}.{Math.Max(0, version.Build)}";
+        return AgentReleaseMetadata.Current().Version;
     }
 
     private async Task SendSnapshotAsync(CancellationToken cancellationToken)

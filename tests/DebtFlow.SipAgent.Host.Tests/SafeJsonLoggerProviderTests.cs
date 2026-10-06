@@ -11,7 +11,7 @@ public sealed class SafeJsonLoggerProviderTests
         string directory = Path.Combine(Path.GetTempPath(), $"sip-agent-logs-{Guid.NewGuid():N}");
         try
         {
-            using var provider = new SafeJsonLoggerProvider(directory, writeConsole: false);
+            var provider = new SafeJsonLoggerProvider(directory, writeConsole: false);
             ILogger logger = provider.CreateLogger("test");
 
             logger.LogInformation(
@@ -33,6 +33,7 @@ public sealed class SafeJsonLoggerProviderTests
             using var sipProvider = new RedactingSipLoggerProvider(loggerFactory);
             ILogger sipLogger = sipProvider.CreateLogger("SIPSorcery.SIP");
             sipLogger.LogWarning("Raw library state {Authorization}", "Digest another-secret");
+            provider.Dispose();
 
             string content = File.ReadAllText(Assert.Single(Directory.GetFiles(directory, "*.jsonl")));
             Assert.DoesNotContain("secret-value", content, StringComparison.Ordinal);

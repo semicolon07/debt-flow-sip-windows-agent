@@ -49,7 +49,15 @@ public sealed class UnavailableAgentEventStore : IAgentEventStore
     public Task<ProcessedCommand?> FindCommandAsync(string commandId, CancellationToken cancellationToken) =>
         Task.FromException<ProcessedCommand?>(new AgentStoreException(_failureCode));
 
+    public Task<bool> HasCommandRequestHashPrefixAsync(string prefix, CancellationToken cancellationToken) =>
+        Task.FromException<bool>(new AgentStoreException(_failureCode));
+
     public Task SaveCommandAsync(ProcessedCommand command, CancellationToken cancellationToken) =>
+        Task.FromException(new AgentStoreException(_failureCode));
+
+    public Task RecoverExecutingCommandsAsync(
+        DateTimeOffset recoveredAtUtc,
+        CancellationToken cancellationToken) =>
         Task.FromException(new AgentStoreException(_failureCode));
 
     public Task PruneCommandsAsync(
