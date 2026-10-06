@@ -187,6 +187,28 @@ public sealed class AgentCoordinator : IAsyncDisposable
             (call, token) => _sipRuntime.SetInputVolumeAsync(call, command.Volume, token));
     }
 
+    public Task SetOutputVolumePreferenceAsync(
+        AudioVolumePreferenceCommand command,
+        CancellationToken cancellationToken)
+    {
+        ValidateVolume(command.Volume);
+        return ExecuteAudioPreferenceAsync(
+            cancellationToken,
+            (call, token) => _sipRuntime.SetOutputVolumeAsync(call, command.Volume, token),
+            token => _sipRuntime.SetOutputVolumePreferenceAsync(command.Volume, token));
+    }
+
+    public Task SetInputVolumePreferenceAsync(
+        AudioVolumePreferenceCommand command,
+        CancellationToken cancellationToken)
+    {
+        ValidateVolume(command.Volume);
+        return ExecuteAudioPreferenceAsync(
+            cancellationToken,
+            (call, token) => _sipRuntime.SetInputVolumeAsync(call, command.Volume, token),
+            token => _sipRuntime.SetInputVolumePreferenceAsync(command.Volume, token));
+    }
+
     public Task<AgentSnapshotPayload> GetSnapshotAsync(CancellationToken cancellationToken) =>
         EnqueueAsync(GetSnapshotCoreAsync, cancellationToken);
 
@@ -558,13 +580,13 @@ public sealed class AgentCoordinator : IAsyncDisposable
     }
 
     private Task PublishAudioControlsChangedAsync(
-        CallSessionState call,
+        CallSessionState? call,
         CancellationToken cancellationToken) =>
         PublishRealtimeAsync(
             "audio.controls_changed",
             new
             {
-                callId = call.CallId,
+                callId = call?.CallId,
                 microphoneMuted = _sipRuntime.IsMicrophoneMuted,
                 outputVolume = _sipRuntime.OutputVolume,
                 inputVolume = _sipRuntime.InputVolume
@@ -622,6 +644,54 @@ public sealed class AgentCoordinator : IAsyncDisposable
             CancellationToken.None);
     }
 
+    private async Task ExecuteAudioPreferenceAsync(
+        CancellationToken requestCancellationToken,
+        Func<SipCallHandle, CancellationToken, Task> activeCallAction,
+        Func<CancellationToken, Task> idleAction)
+    {
+        CallRuntimeOperation? operation = await EnqueueAsync(
+            PrepareOptionalAudioControlCoreAsync,
+            requestCancellationToken);
+        using var operationTimeout = CancellationTokenSource.CreateLinkedTokenSource(_lifetime.Token);
+        operationTimeout.CancelAfter(TimeSpan.FromSeconds(10));
+        try
+        {
+            if (operation is null)
+            {
+                await idleAction(operationTimeout.Token);
+            }
+            else
+            {
+                await activeCallAction(operation.Handle, operationTimeout.Token);
+            }
+        }
+        catch (OperationCanceledException) when (!_lifetime.IsCancellationRequested)
+        {
+            throw new AgentCommandException("sip_operation_timeout");
+        }
+        catch (Exception exception) when (exception is not AgentCommandException)
+        {
+            throw new AgentCommandException("audio_control_failed");
+        }
+
+        await EnqueueAsync(
+            token => PublishAudioControlsForOptionalHandleCoreAsync(operation?.Handle, token),
+            CancellationToken.None);
+    }
+
+    private Task<CallRuntimeOperation?> PrepareOptionalAudioControlCoreAsync(
+        CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        if (_call is not { State: CallState.Connected } call)
+        {
+            return Task.FromResult<CallRuntimeOperation?>(null);
+        }
+
+        return Task.FromResult<CallRuntimeOperation?>(
+            new CallRuntimeOperation(call, RequireActiveSipCall(call.CallId)));
+    }
+
     private async Task TryEndFailedOperationAsync(SipCallHandle call, string reason)
     {
         try
@@ -641,6 +711,18 @@ public sealed class AgentCoordinator : IAsyncDisposable
         IsActiveHandle(handle) && _call is { State: CallState.Connected } call
             ? PublishAudioControlsChangedAsync(call, cancellationToken)
             : Task.CompletedTask;
+
+    private Task PublishAudioControlsForOptionalHandleCoreAsync(
+        SipCallHandle? handle,
+        CancellationToken cancellationToken)
+    {
+        if (handle is not null)
+        {
+            return PublishAudioControlsForHandleCoreAsync(handle, cancellationToken);
+        }
+
+        return PublishAudioControlsChangedAsync(null, cancellationToken);
+    }
 
     private Task EmitForHandleCoreAsync(
         SipCallHandle handle,

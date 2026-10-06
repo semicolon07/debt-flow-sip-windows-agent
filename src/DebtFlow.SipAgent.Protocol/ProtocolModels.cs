@@ -51,6 +51,8 @@ public sealed record CallMuteCommand(string CommandId, string CallId, bool Muted
 
 public sealed record CallVolumeCommand(string CommandId, string CallId, int Volume);
 
+public sealed record AudioVolumePreferenceCommand(string CommandId, int Volume);
+
 public sealed record AckPayload(string AgentInstanceId, long AcknowledgedThroughSequence);
 
 public sealed record WelcomePayload(

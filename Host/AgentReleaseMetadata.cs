@@ -25,6 +25,7 @@ public sealed record AgentReleaseMetadata(
         "call.mute",
         "audio.output.volume",
         "audio.input.volume",
+        "audio.volume.preferences",
         "event.durable",
         "event.collection_binding.v1"
     ];

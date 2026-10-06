@@ -273,6 +273,16 @@ public sealed class V1CommandDispatcher(
                     ProtocolCodec.DeserializePayload<CallVolumeCommand>(envelope.Payload),
                     cancellationToken);
                 break;
+            case "audio.output.volume.preference.set":
+                await coordinator.SetOutputVolumePreferenceAsync(
+                    ProtocolCodec.DeserializePayload<AudioVolumePreferenceCommand>(envelope.Payload),
+                    cancellationToken);
+                break;
+            case "audio.input.volume.preference.set":
+                await coordinator.SetInputVolumePreferenceAsync(
+                    ProtocolCodec.DeserializePayload<AudioVolumePreferenceCommand>(envelope.Payload),
+                    cancellationToken);
+                break;
             case "state.get":
                 _ = ProtocolCodec.DeserializePayload<CommandHeader>(envelope.Payload);
                 break;
@@ -329,6 +339,9 @@ public sealed class V1CommandDispatcher(
             "call.mute.set" => ProtocolCodec.DeserializePayload<CallMuteCommand>(envelope.Payload),
             "audio.output.volume.set" or "audio.input.volume.set" => CanonicalizeVolume(
                 ProtocolCodec.DeserializePayload<CallVolumeCommand>(envelope.Payload)),
+            "audio.output.volume.preference.set" or "audio.input.volume.preference.set" =>
+                CanonicalizeVolumePreference(
+                    ProtocolCodec.DeserializePayload<AudioVolumePreferenceCommand>(envelope.Payload)),
             _ => throw new ProtocolException("invalid_message", "Command type is unsupported.")
         };
 
@@ -403,6 +416,17 @@ public sealed class V1CommandDispatcher(
     }
 
     private static CallVolumeCommand CanonicalizeVolume(CallVolumeCommand command)
+    {
+        if (command.Volume is < 0 or > 100)
+        {
+            throw new ProtocolException("invalid_message", "Volume is invalid.");
+        }
+
+        return command;
+    }
+
+    private static AudioVolumePreferenceCommand CanonicalizeVolumePreference(
+        AudioVolumePreferenceCommand command)
     {
         if (command.Volume is < 0 or > 100)
         {

@@ -34,6 +34,21 @@ public sealed class V1CommandDispatcherTests
     }
 
     [Fact]
+    public async Task AudioPreferenceCommand_DoesNotRequireCallId()
+    {
+        await using DispatcherFixture fixture = await DispatcherFixture.CreateAsync();
+        string commandId = ProtocolCodec.NewId();
+
+        byte[] response = await fixture.Dispatcher.DispatchAsync(
+            Envelope(
+                "audio.output.volume.preference.set",
+                new AudioVolumePreferenceCommand(commandId, 70)),
+            CancellationToken.None);
+
+        Assert.True(Result(response).Accepted);
+    }
+
+    [Fact]
     public async Task UnsupportedCommand_IsRejectedBeforeJournalInsertion()
     {
         await using DispatcherFixture fixture = await DispatcherFixture.CreateAsync();
@@ -146,6 +161,8 @@ public sealed class V1CommandDispatcherTests
         public Task SetMicrophoneMutedAsync(SipCallHandle call, bool muted, CancellationToken cancellationToken) => Task.CompletedTask;
         public Task SetOutputVolumeAsync(SipCallHandle call, int volume, CancellationToken cancellationToken) => Task.CompletedTask;
         public Task SetInputVolumeAsync(SipCallHandle call, int volume, CancellationToken cancellationToken) => Task.CompletedTask;
+        public Task SetOutputVolumePreferenceAsync(int volume, CancellationToken cancellationToken) => Task.CompletedTask;
+        public Task SetInputVolumePreferenceAsync(int volume, CancellationToken cancellationToken) => Task.CompletedTask;
         public ValueTask DisposeAsync()
         {
             _signals.Writer.TryComplete();

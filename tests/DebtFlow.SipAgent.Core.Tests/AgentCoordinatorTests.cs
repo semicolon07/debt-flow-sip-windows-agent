@@ -320,6 +320,24 @@ public sealed class AgentCoordinatorTests
     }
 
     [Fact]
+    public async Task AudioPreferences_UpdateWithoutActiveCall()
+    {
+        await using CoordinatorFixture fixture = await CoordinatorFixture.CreateAsync();
+
+        await fixture.Coordinator.SetOutputVolumePreferenceAsync(
+            new AudioVolumePreferenceCommand(NewId(), 55),
+            CancellationToken.None);
+        await fixture.Coordinator.SetInputVolumePreferenceAsync(
+            new AudioVolumePreferenceCommand(NewId(), 45),
+            CancellationToken.None);
+
+        AgentSnapshotPayload snapshot = await fixture.Coordinator.GetSnapshotAsync(CancellationToken.None);
+        AudioControlsSnapshot controls = Assert.IsType<AudioControlsSnapshot>(snapshot.AudioControls);
+        Assert.Equal(55, controls.OutputVolume);
+        Assert.Equal(45, controls.InputVolume);
+    }
+
+    [Fact]
     public async Task AudioControls_RejectInvalidStateAndOutOfRangeVolume()
     {
         await using CoordinatorFixture fixture = await CoordinatorFixture.CreateAsync();
@@ -1130,6 +1148,18 @@ public sealed class AgentCoordinatorTests
             SipCallHandle call,
             int volume,
             CancellationToken cancellationToken)
+        {
+            InputVolume = volume;
+            return Task.CompletedTask;
+        }
+
+        public Task SetOutputVolumePreferenceAsync(int volume, CancellationToken cancellationToken)
+        {
+            OutputVolume = volume;
+            return Task.CompletedTask;
+        }
+
+        public Task SetInputVolumePreferenceAsync(int volume, CancellationToken cancellationToken)
         {
             InputVolume = volume;
             return Task.CompletedTask;

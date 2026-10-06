@@ -162,6 +162,9 @@ public sealed class LocalWebSocketServerTests
             Assert.Contains(
                 "audio.input.volume",
                 ProtocolCodec.DeserializePayload<WelcomePayload>(welcome.Payload).Capabilities);
+            Assert.Contains(
+                "audio.volume.preferences",
+                ProtocolCodec.DeserializePayload<WelcomePayload>(welcome.Payload).Capabilities);
             Assert.Equal("snapshot", snapshot.Kind);
             Assert.Equal("agent.snapshot", snapshot.Type);
 
@@ -281,6 +284,8 @@ public sealed class LocalWebSocketServerTests
         public Task SetMicrophoneMutedAsync(SipCallHandle call, bool muted, CancellationToken cancellationToken) => Task.CompletedTask;
         public Task SetOutputVolumeAsync(SipCallHandle call, int volume, CancellationToken cancellationToken) => Task.CompletedTask;
         public Task SetInputVolumeAsync(SipCallHandle call, int volume, CancellationToken cancellationToken) => Task.CompletedTask;
+        public Task SetOutputVolumePreferenceAsync(int volume, CancellationToken cancellationToken) => Task.CompletedTask;
+        public Task SetInputVolumePreferenceAsync(int volume, CancellationToken cancellationToken) => Task.CompletedTask;
         public ValueTask DisposeAsync()
         {
             _signals.Writer.TryComplete();

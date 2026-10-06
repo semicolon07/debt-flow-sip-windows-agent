@@ -15,6 +15,7 @@ public sealed class AgentCommandLineTests
         Assert.Contains("call.mute", metadata.Capabilities);
         Assert.Contains("audio.output.volume", metadata.Capabilities);
         Assert.Contains("audio.input.volume", metadata.Capabilities);
+        Assert.Contains("audio.volume.preferences", metadata.Capabilities);
     }
 
     [Fact]

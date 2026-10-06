@@ -397,6 +397,22 @@ public sealed class SipRuntime : ISipRuntime
         }
     }
 
+    public Task SetOutputVolumePreferenceAsync(int volume, CancellationToken cancellationToken)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        cancellationToken.ThrowIfCancellationRequested();
+        UpdateOutputVolumePreference(volume);
+        return Task.CompletedTask;
+    }
+
+    public Task SetInputVolumePreferenceAsync(int volume, CancellationToken cancellationToken)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        cancellationToken.ThrowIfCancellationRequested();
+        UpdateInputVolumePreference(volume);
+        return Task.CompletedTask;
+    }
+
     public async ValueTask DisposeAsync()
     {
         if (_disposed)
@@ -663,6 +679,32 @@ public sealed class SipRuntime : ISipRuntime
             _logger.LogWarning(
                 "Audio preferences could not be saved because of {ErrorType}",
                 exception.GetType().Name);
+        }
+    }
+
+    private void UpdateOutputVolumePreference(int volume)
+    {
+        if (volume is < 0 or > 100)
+        {
+            throw new ArgumentOutOfRangeException(nameof(volume));
+        }
+
+        if (Interlocked.Exchange(ref _outputVolume, volume) != volume)
+        {
+            PersistAudioPreferences();
+        }
+    }
+
+    private void UpdateInputVolumePreference(int volume)
+    {
+        if (volume is < 0 or > 100)
+        {
+            throw new ArgumentOutOfRangeException(nameof(volume));
+        }
+
+        if (Interlocked.Exchange(ref _inputVolume, volume) != volume)
+        {
+            PersistAudioPreferences();
         }
     }
 

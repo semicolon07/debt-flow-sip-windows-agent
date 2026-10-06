@@ -163,6 +163,8 @@ public interface ISipRuntime : IAsyncDisposable
     Task SetMicrophoneMutedAsync(SipCallHandle call, bool muted, CancellationToken cancellationToken);
     Task SetOutputVolumeAsync(SipCallHandle call, int volume, CancellationToken cancellationToken);
     Task SetInputVolumeAsync(SipCallHandle call, int volume, CancellationToken cancellationToken);
+    Task SetOutputVolumePreferenceAsync(int volume, CancellationToken cancellationToken);
+    Task SetInputVolumePreferenceAsync(int volume, CancellationToken cancellationToken);
 }
 
 public sealed record AudioPreferences(int OutputVolume, int InputVolume)
