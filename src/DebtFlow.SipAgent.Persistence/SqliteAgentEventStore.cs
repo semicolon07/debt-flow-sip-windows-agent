@@ -1,4 +1,5 @@
 using System.Globalization;
+using System.Diagnostics;
 using DebtFlow.SipAgent.Application;
 using DebtFlow.SipAgent.Protocol;
 using Microsoft.Data.Sqlite;
@@ -15,10 +16,19 @@ public sealed class SqliteAgentEventStore : IAgentEventStore
     public const int CurrentSchemaVersion = 4;
     private const int MaximumCommandRows = 50_000;
     private const int MaximumExecutingCommandRows = 1_024;
+    private const int PassiveCheckpointAcknowledgementInterval = 250;
+    private static readonly TimeSpan PassiveCheckpointTimeInterval = TimeSpan.FromSeconds(30);
     private readonly string _databasePath;
     private readonly EventStoreLimits _limits;
     private readonly SemaphoreSlim _gate = new(1, 1);
     private SqliteConnection? _connection;
+    private long _pendingEventCount;
+    private DateTimeOffset? _oldestPendingAtUtc;
+    private long _storageBytes;
+    private int _commandRowCount;
+    private int _executingCommandRowCount;
+    private long _acknowledgedSinceCheckpoint;
+    private DateTimeOffset _lastPassiveCheckpointUtc;
 
     public SqliteAgentEventStore(string databasePath, EventStoreLimits? limits = null)
     {
@@ -86,6 +96,11 @@ public sealed class SqliteAgentEventStore : IAgentEventStore
                 await sequenceCommand.ExecuteScalarAsync(cancellationToken),
                 CultureInfo.InvariantCulture);
             await ValidateSequenceInvariantAsync(cancellationToken);
+            _pendingEventCount = LastSequence - LastAcknowledgedSequence;
+            _oldestPendingAtUtc = await ReadOldestPendingAtUtcAsync(cancellationToken);
+            RefreshStorageBytesCore();
+            await LoadCommandCountersAsync(cancellationToken);
+            _lastPassiveCheckpointUtc = DateTimeOffset.UtcNow;
         }
         catch (Exception exception)
         {
@@ -120,6 +135,7 @@ public sealed class SqliteAgentEventStore : IAgentEventStore
         int maximumCount,
         CancellationToken cancellationToken)
     {
+        long started = Stopwatch.GetTimestamp();
         if (maximumCount is < 1 or > 1000)
         {
             throw new ArgumentOutOfRangeException(nameof(maximumCount));
@@ -152,6 +168,9 @@ public sealed class SqliteAgentEventStore : IAgentEventStore
         finally
         {
             _gate.Release();
+            AgentPerformanceTelemetry.RecordStorageOperation(
+                "load_pending",
+                Stopwatch.GetElapsedTime(started));
         }
     }
 
@@ -160,7 +179,7 @@ public sealed class SqliteAgentEventStore : IAgentEventStore
         await _gate.WaitAsync(cancellationToken);
         try
         {
-            return await CountPendingCoreAsync(cancellationToken);
+            return _pendingEventCount;
         }
         finally
         {
@@ -170,6 +189,7 @@ public sealed class SqliteAgentEventStore : IAgentEventStore
 
     public async Task<EventStoreHealth> GetHealthAsync(CancellationToken cancellationToken)
     {
+        long started = Stopwatch.GetTimestamp();
         await _gate.WaitAsync(cancellationToken);
         try
         {
@@ -178,6 +198,9 @@ public sealed class SqliteAgentEventStore : IAgentEventStore
         finally
         {
             _gate.Release();
+            AgentPerformanceTelemetry.RecordStorageOperation(
+                "health",
+                Stopwatch.GetElapsedTime(started));
         }
     }
 
@@ -241,6 +264,7 @@ public sealed class SqliteAgentEventStore : IAgentEventStore
 
     public async Task AcknowledgeThroughAsync(long sequence, CancellationToken cancellationToken)
     {
+        long started = Stopwatch.GetTimestamp();
         await _gate.WaitAsync(cancellationToken);
         try
         {
@@ -260,7 +284,8 @@ public sealed class SqliteAgentEventStore : IAgentEventStore
                 "SELECT COUNT(*) FROM DurableEvents WHERE Sequence > $ack AND Sequence <= $sequence;";
             countCommand.Parameters.AddWithValue("$ack", LastAcknowledgedSequence);
             countCommand.Parameters.AddWithValue("$sequence", sequence);
-            long expected = sequence - LastAcknowledgedSequence;
+            long previousAcknowledgedSequence = LastAcknowledgedSequence;
+            long expected = sequence - previousAcknowledgedSequence;
             long actual = Convert.ToInt64(
                 await countCommand.ExecuteScalarAsync(cancellationToken),
                 CultureInfo.InvariantCulture);
@@ -288,11 +313,18 @@ public sealed class SqliteAgentEventStore : IAgentEventStore
             await delete.ExecuteNonQueryAsync(cancellationToken);
             await transaction.CommitAsync(cancellationToken);
             LastAcknowledgedSequence = sequence;
-            await CheckpointCoreAsync(truncate: false, cancellationToken);
+            _pendingEventCount = LastSequence - LastAcknowledgedSequence;
+            _oldestPendingAtUtc = await ReadOldestPendingAtUtcAsync(cancellationToken);
+            _acknowledgedSinceCheckpoint += sequence - previousAcknowledgedSequence;
+            RefreshStorageBytesCore();
+            await MaybeCheckpointAfterAcknowledgementAsync(cancellationToken);
         }
         finally
         {
             _gate.Release();
+            AgentPerformanceTelemetry.RecordStorageOperation(
+                "acknowledge",
+                Stopwatch.GetElapsedTime(started));
         }
     }
 
@@ -358,12 +390,22 @@ public sealed class SqliteAgentEventStore : IAgentEventStore
             throw new ArgumentOutOfRangeException(nameof(command));
         }
 
+        long started = Stopwatch.GetTimestamp();
         await _gate.WaitAsync(cancellationToken);
         try
         {
-            if (command.ExecutionState == "executing")
+            string? previousExecutionState = await ReadCommandExecutionStateAsync(
+                command.CommandId,
+                cancellationToken);
+            if (previousExecutionState == null && _commandRowCount >= MaximumCommandRows)
             {
-                await EnsureCommandCapacityAsync(command.CommandId, cancellationToken);
+                throw new AgentStoreException("command_journal_capacity");
+            }
+            if (command.ExecutionState == "executing" &&
+                previousExecutionState != "executing" &&
+                _executingCommandRowCount >= MaximumExecutingCommandRows)
+            {
+                throw new AgentStoreException("command_journal_capacity");
             }
 
             await using SqliteCommand sqliteCommand = RequireConnection().CreateCommand();
@@ -389,10 +431,25 @@ public sealed class SqliteAgentEventStore : IAgentEventStore
                 command.ProcessedAtUtc.ToString("O", CultureInfo.InvariantCulture));
             sqliteCommand.Parameters.AddWithValue("$executionState", command.ExecutionState);
             await sqliteCommand.ExecuteNonQueryAsync(cancellationToken);
+            if (previousExecutionState == null)
+            {
+                _commandRowCount++;
+            }
+            if (previousExecutionState == "executing" && command.ExecutionState != "executing")
+            {
+                _executingCommandRowCount = Math.Max(0, _executingCommandRowCount - 1);
+            }
+            else if (previousExecutionState != "executing" && command.ExecutionState == "executing")
+            {
+                _executingCommandRowCount++;
+            }
         }
         finally
         {
             _gate.Release();
+            AgentPerformanceTelemetry.RecordStorageOperation(
+                "save_command",
+                Stopwatch.GetElapsedTime(started));
         }
     }
 
@@ -414,6 +471,7 @@ public sealed class SqliteAgentEventStore : IAgentEventStore
                 "$recoveredAtUtc",
                 recoveredAtUtc.ToString("O", CultureInfo.InvariantCulture));
             await command.ExecuteNonQueryAsync(cancellationToken);
+            _executingCommandRowCount = 0;
         }
         finally
         {
@@ -456,38 +514,12 @@ public sealed class SqliteAgentEventStore : IAgentEventStore
                 "$olderThanUtc",
                 olderThanUtc.ToString("O", CultureInfo.InvariantCulture));
             command.Parameters.AddWithValue("$maximumRetained", maximumRetained);
-            await command.ExecuteNonQueryAsync(cancellationToken);
+            int deleted = await command.ExecuteNonQueryAsync(cancellationToken);
+            _commandRowCount = Math.Max(_executingCommandRowCount, _commandRowCount - deleted);
         }
         finally
         {
             _gate.Release();
-        }
-    }
-
-    private async Task EnsureCommandCapacityAsync(string commandId, CancellationToken cancellationToken)
-    {
-        await using SqliteCommand command = RequireConnection().CreateCommand();
-        command.CommandText =
-            """
-            SELECT
-                COUNT(*),
-                COALESCE(SUM(CASE WHEN ExecutionState = 'executing' THEN 1 ELSE 0 END), 0),
-                EXISTS(SELECT 1 FROM ProcessedCommands WHERE CommandId = $commandId)
-            FROM ProcessedCommands;
-            """;
-        command.Parameters.AddWithValue("$commandId", commandId);
-        await using SqliteDataReader reader = await command.ExecuteReaderAsync(cancellationToken);
-        if (!await reader.ReadAsync(cancellationToken))
-        {
-            throw new AgentStoreException("command_journal_capacity");
-        }
-
-        long total = reader.GetInt64(0);
-        long executing = reader.GetInt64(1);
-        bool exists = reader.GetInt64(2) != 0;
-        if (!exists && (total >= MaximumCommandRows || executing >= MaximumExecutingCommandRows))
-        {
-            throw new AgentStoreException("command_journal_capacity");
         }
     }
 
@@ -497,6 +529,9 @@ public sealed class SqliteAgentEventStore : IAgentEventStore
         try
         {
             await CheckpointCoreAsync(truncate: true, cancellationToken);
+            _acknowledgedSinceCheckpoint = 0;
+            _lastPassiveCheckpointUtc = DateTimeOffset.UtcNow;
+            RefreshStorageBytesCore();
         }
         finally
         {
@@ -537,9 +572,11 @@ public sealed class SqliteAgentEventStore : IAgentEventStore
         bool useReservedCapacity,
         CancellationToken cancellationToken)
     {
+        long started = Stopwatch.GetTimestamp();
         await _gate.WaitAsync(cancellationToken);
         try
         {
+            RefreshStorageBytesCore();
             EventStoreHealth health = await GetHealthCoreAsync(cancellationToken);
             if (health.CapacityState == EventStoreCapacityState.Full ||
                 !useReservedCapacity && health.CapacityState == EventStoreCapacityState.Critical)
@@ -568,6 +605,12 @@ public sealed class SqliteAgentEventStore : IAgentEventStore
 
             await transaction.CommitAsync(cancellationToken);
             LastSequence = Math.Max(LastSequence, sequence);
+            _pendingEventCount = LastSequence - LastAcknowledgedSequence;
+            if (_pendingEventCount == 1)
+            {
+                _oldestPendingAtUtc = draft.OccurredAtUtc;
+            }
+            RefreshStorageBytesCore();
             return new StoredDurableEvent(
                 sequence,
                 draft.EventId,
@@ -586,6 +629,9 @@ public sealed class SqliteAgentEventStore : IAgentEventStore
         finally
         {
             _gate.Release();
+            AgentPerformanceTelemetry.RecordStorageOperation(
+                "append",
+                Stopwatch.GetElapsedTime(started));
         }
     }
 
@@ -792,31 +838,14 @@ public sealed class SqliteAgentEventStore : IAgentEventStore
         }
     }
 
-    private async Task<EventStoreHealth> GetHealthCoreAsync(CancellationToken cancellationToken)
+    private Task<EventStoreHealth> GetHealthCoreAsync(CancellationToken cancellationToken)
     {
+        cancellationToken.ThrowIfCancellationRequested();
         _ = RequireConnection();
-        long pending = await CountPendingCoreAsync(cancellationToken);
-        DateTimeOffset? oldestPendingAtUtc = null;
-        if (pending > 0)
-        {
-            await using SqliteCommand oldestCommand = RequireConnection().CreateCommand();
-            oldestCommand.CommandText = "SELECT MIN(OccurredAtUtc) FROM DurableEvents WHERE Sequence > $ack;";
-            oldestCommand.Parameters.AddWithValue("$ack", LastAcknowledgedSequence);
-            object? oldest = await oldestCommand.ExecuteScalarAsync(cancellationToken);
-            if (oldest is string oldestText && DateTimeOffset.TryParse(
-                    oldestText,
-                    CultureInfo.InvariantCulture,
-                    DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal,
-                    out DateTimeOffset parsed))
-            {
-                oldestPendingAtUtc = parsed;
-            }
-        }
-
-        long storageBytes = GetFileSize(_databasePath) + GetFileSize($"{_databasePath}-wal");
+        long pending = _pendingEventCount;
         double ratio = Math.Max(
             (double)pending / _limits.MaximumPendingEvents,
-            (double)storageBytes / _limits.MaximumStorageBytes);
+            (double)_storageBytes / _limits.MaximumStorageBytes);
         EventStoreCapacityState state = ratio switch
         {
             >= 1 => EventStoreCapacityState.Full,
@@ -824,15 +853,80 @@ public sealed class SqliteAgentEventStore : IAgentEventStore
             >= 0.8 => EventStoreCapacityState.Warning,
             _ => EventStoreCapacityState.Healthy
         };
-        return new EventStoreHealth(pending, storageBytes, state, oldestPendingAtUtc);
+        return Task.FromResult(new EventStoreHealth(
+            pending,
+            _storageBytes,
+            state,
+            _oldestPendingAtUtc));
     }
 
-    private async Task<long> CountPendingCoreAsync(CancellationToken cancellationToken)
+    private async Task<DateTimeOffset?> ReadOldestPendingAtUtcAsync(CancellationToken cancellationToken)
+    {
+        if (_pendingEventCount == 0)
+        {
+            return null;
+        }
+
+        await using SqliteCommand command = RequireConnection().CreateCommand();
+        command.CommandText = "SELECT OccurredAtUtc FROM DurableEvents WHERE Sequence > $ack ORDER BY Sequence LIMIT 1;";
+        command.Parameters.AddWithValue("$ack", LastAcknowledgedSequence);
+        object? oldest = await command.ExecuteScalarAsync(cancellationToken);
+        return oldest is string oldestText && DateTimeOffset.TryParse(
+            oldestText,
+            CultureInfo.InvariantCulture,
+            DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal,
+            out DateTimeOffset parsed)
+            ? parsed
+            : null;
+    }
+
+    private async Task LoadCommandCountersAsync(CancellationToken cancellationToken)
     {
         await using SqliteCommand command = RequireConnection().CreateCommand();
-        command.CommandText = "SELECT COUNT(*) FROM DurableEvents WHERE Sequence > $ack;";
-        command.Parameters.AddWithValue("$ack", LastAcknowledgedSequence);
-        return Convert.ToInt64(await command.ExecuteScalarAsync(cancellationToken), CultureInfo.InvariantCulture);
+        command.CommandText =
+            """
+            SELECT COUNT(*),
+                   COALESCE(SUM(CASE WHEN ExecutionState = 'executing' THEN 1 ELSE 0 END), 0)
+            FROM ProcessedCommands;
+            """;
+        await using SqliteDataReader reader = await command.ExecuteReaderAsync(cancellationToken);
+        if (!await reader.ReadAsync(cancellationToken))
+        {
+            throw new AgentStoreException("command_journal_capacity");
+        }
+
+        _commandRowCount = checked((int)reader.GetInt64(0));
+        _executingCommandRowCount = checked((int)reader.GetInt64(1));
+    }
+
+    private async Task<string?> ReadCommandExecutionStateAsync(
+        string commandId,
+        CancellationToken cancellationToken)
+    {
+        await using SqliteCommand command = RequireConnection().CreateCommand();
+        command.CommandText = "SELECT ExecutionState FROM ProcessedCommands WHERE CommandId = $commandId;";
+        command.Parameters.AddWithValue("$commandId", commandId);
+        return (string?)await command.ExecuteScalarAsync(cancellationToken);
+    }
+
+    private async Task MaybeCheckpointAfterAcknowledgementAsync(CancellationToken cancellationToken)
+    {
+        DateTimeOffset now = DateTimeOffset.UtcNow;
+        if (_acknowledgedSinceCheckpoint < PassiveCheckpointAcknowledgementInterval &&
+            now - _lastPassiveCheckpointUtc < PassiveCheckpointTimeInterval)
+        {
+            return;
+        }
+
+        await CheckpointCoreAsync(truncate: false, cancellationToken);
+        _acknowledgedSinceCheckpoint = 0;
+        _lastPassiveCheckpointUtc = now;
+        RefreshStorageBytesCore();
+    }
+
+    private void RefreshStorageBytesCore()
+    {
+        _storageBytes = GetFileSize(_databasePath) + GetFileSize($"{_databasePath}-wal");
     }
 
     private Task CheckpointCoreAsync(bool truncate, CancellationToken cancellationToken) =>

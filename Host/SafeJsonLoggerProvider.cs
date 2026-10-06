@@ -1,8 +1,11 @@
+using System.Buffers;
+using System.Diagnostics;
 using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
 using System.Threading.Channels;
 using Microsoft.Extensions.Logging;
+using DebtFlow.SipAgent.Application;
 
 namespace DebtFlow.SipAgent.Host;
 
@@ -10,12 +13,13 @@ public sealed class SafeJsonLoggerProvider : ILoggerProvider
 {
     private const long MaximumFileBytes = 10 * 1024 * 1024;
     private const int RetainedFileCount = 7;
+    private static readonly TimeSpan FlushInterval = TimeSpan.FromSeconds(1);
+    private static readonly byte[] NewLine = Encoding.UTF8.GetBytes(Environment.NewLine);
     private readonly string _directory;
     private readonly bool _writeConsole;
-    private readonly Channel<string> _queue;
+    private readonly Channel<byte[]> _queue;
     private readonly Task _writerTask;
-    private StreamWriter? _writer;
-    private string? _currentPath;
+    private FileStream? _writer;
     private int _disposed;
     private long _droppedLines;
 
@@ -24,7 +28,7 @@ public sealed class SafeJsonLoggerProvider : ILoggerProvider
         _directory = directory;
         _writeConsole = writeConsole;
         Directory.CreateDirectory(directory);
-        _queue = Channel.CreateBounded<string>(new BoundedChannelOptions(2048)
+        _queue = Channel.CreateBounded<byte[]>(new BoundedChannelOptions(2048)
         {
             SingleReader = true,
             SingleWriter = false,
@@ -65,7 +69,7 @@ public sealed class SafeJsonLoggerProvider : ILoggerProvider
             ? Convert.ToString(original, System.Globalization.CultureInfo.InvariantCulture) ?? string.Empty
             : Convert.ToString(state, System.Globalization.CultureInfo.InvariantCulture) ?? string.Empty;
 
-        using var buffer = new MemoryStream();
+        var buffer = new ArrayBufferWriter<byte>(512);
         using (var json = new Utf8JsonWriter(buffer))
         {
             json.WriteStartObject();
@@ -97,7 +101,7 @@ public sealed class SafeJsonLoggerProvider : ILoggerProvider
             json.WriteEndObject();
         }
 
-        string line = Encoding.UTF8.GetString(buffer.ToArray());
+        byte[] line = buffer.WrittenSpan.ToArray();
         if (!_queue.Writer.TryWrite(line))
         {
             Interlocked.Increment(ref _droppedLines);
@@ -106,26 +110,72 @@ public sealed class SafeJsonLoggerProvider : ILoggerProvider
 
     private async Task WriteLoopAsync()
     {
+        long lastFlush = Stopwatch.GetTimestamp();
+        Task<bool>? pendingRead = null;
+        bool dirty = false;
         try
         {
-            while (await _queue.Reader.WaitToReadAsync())
+            while (true)
             {
                 int count = 0;
-                while (count < 64 && _queue.Reader.TryRead(out string? line))
+                while (count < 64 && _queue.Reader.TryRead(out byte[]? line))
                 {
                     WriteLineCore(line);
+                    dirty = true;
                     count++;
                 }
 
                 long dropped = Interlocked.Exchange(ref _droppedLines, 0);
                 if (dropped > 0)
                 {
-                    WriteLineCore($"{{\"timestampUtc\":\"{DateTimeOffset.UtcNow:O}\",\"level\":\"Warning\",\"category\":\"DebtFlow.SipAgent.Logging\",\"messageTemplate\":\"log_queue_overflow\",\"properties\":{{\"droppedLines\":{dropped}}}}}");
+                    AgentPerformanceTelemetry.RecordDroppedLogs(dropped);
+                    WriteLineCore(Encoding.UTF8.GetBytes(
+                        $"{{\"timestampUtc\":\"{DateTimeOffset.UtcNow:O}\",\"level\":\"Warning\",\"category\":\"DebtFlow.SipAgent.Logging\",\"messageTemplate\":\"log_queue_overflow\",\"properties\":{{\"droppedLines\":{dropped}}}}}"));
+                    dirty = true;
                 }
 
-                if (_writer != null)
+                TimeSpan sinceFlush = Stopwatch.GetElapsedTime(lastFlush);
+                if (_writer != null && dirty && sinceFlush >= FlushInterval)
                 {
                     await _writer.FlushAsync();
+                    lastFlush = Stopwatch.GetTimestamp();
+                    sinceFlush = TimeSpan.Zero;
+                    dirty = false;
+                }
+
+                if (_queue.Reader.Completion.IsCompleted && !_queue.Reader.TryPeek(out _))
+                {
+                    break;
+                }
+
+                pendingRead ??= _queue.Reader.WaitToReadAsync().AsTask();
+                if (_writer == null || !dirty)
+                {
+                    bool canRead = await pendingRead;
+                    pendingRead = null;
+                    if (!canRead)
+                    {
+                        break;
+                    }
+                    continue;
+                }
+
+                TimeSpan untilFlush = FlushInterval - sinceFlush;
+                Task flushDelay = Task.Delay(untilFlush > TimeSpan.Zero ? untilFlush : TimeSpan.Zero);
+                Task completed = await Task.WhenAny(pendingRead, flushDelay);
+                if (completed == flushDelay)
+                {
+                    await _writer.FlushAsync();
+                    lastFlush = Stopwatch.GetTimestamp();
+                }
+                else
+                {
+                    bool canRead = await pendingRead;
+                    pendingRead = null;
+                    if (!canRead)
+                    {
+                        break;
+                    }
                 }
             }
         }
@@ -136,6 +186,10 @@ public sealed class SafeJsonLoggerProvider : ILoggerProvider
         {
             try
             {
+                if (_writer != null)
+                {
+                    await _writer.FlushAsync();
+                }
                 _writer?.Dispose();
             }
             catch (IOException)
@@ -146,34 +200,34 @@ public sealed class SafeJsonLoggerProvider : ILoggerProvider
         }
     }
 
-    private void WriteLineCore(string line)
+    private void WriteLineCore(byte[] line)
     {
-        EnsureWriter(Encoding.UTF8.GetByteCount(line) + Encoding.UTF8.GetByteCount(Environment.NewLine));
-        _writer!.WriteLine(line);
+        EnsureWriter(line.Length + NewLine.Length);
+        _writer!.Write(line);
+        _writer.Write(NewLine);
         if (_writeConsole)
         {
-            Console.WriteLine(line);
+            Console.WriteLine(Encoding.UTF8.GetString(line));
         }
     }
 
     private void EnsureWriter(int nextBytes)
     {
-        if (_writer != null && _writer.BaseStream.Length + nextBytes <= MaximumFileBytes)
+        if (_writer != null && _writer.Length + nextBytes <= MaximumFileBytes)
         {
             return;
         }
 
         _writer?.Dispose();
         string stamp = DateTime.UtcNow.ToString("yyyyMMdd-HHmmssfff", System.Globalization.CultureInfo.InvariantCulture);
-        _currentPath = Path.Combine(_directory, $"agent-{stamp}.jsonl");
-        _writer = new StreamWriter(new FileStream(
-            _currentPath,
+        string currentPath = Path.Combine(_directory, $"agent-{stamp}.jsonl");
+        _writer = new FileStream(
+            currentPath,
             FileMode.Append,
             FileAccess.Write,
             FileShare.Read,
             16 * 1024,
-            FileOptions.Asynchronous),
-            new UTF8Encoding(false));
+            FileOptions.Asynchronous);
 
         foreach (FileInfo oldFile in new DirectoryInfo(_directory)
                      .GetFiles("agent-*.jsonl")

@@ -2,6 +2,7 @@ using System.Text.Json;
 using System.Threading.Channels;
 using System.Net;
 using System.Net.Sockets;
+using System.Diagnostics;
 using DebtFlow.SipAgent.Protocol;
 
 namespace DebtFlow.SipAgent.Application;
@@ -1268,6 +1269,8 @@ public sealed class AgentCoordinator : IAsyncDisposable
     {
         await foreach (CoordinatorWorkItem item in _work.Reader.ReadAllAsync())
         {
+            AgentPerformanceTelemetry.RecordCoordinatorQueueWait(
+                Stopwatch.GetElapsedTime(item.EnqueuedTimestamp));
             await item.ExecuteAsync(_lifetime.Token);
         }
     }
@@ -1289,7 +1292,12 @@ public sealed class AgentCoordinator : IAsyncDisposable
     {
         var completion = new TaskCompletionSource<T>(TaskCreationOptions.RunContinuationsAsynchronously);
         await _work.Writer.WriteAsync(
-            new CoordinatorWorkItem<T>(action, completion, cancellationToken, cancelExecution),
+            new CoordinatorWorkItem<T>(
+                action,
+                completion,
+                cancellationToken,
+                cancelExecution,
+                Stopwatch.GetTimestamp()),
             cancellationToken);
         return await completion.Task.WaitAsync(cancellationToken);
     }
@@ -1435,7 +1443,7 @@ public sealed class AgentCoordinator : IAsyncDisposable
     public static string ToWire<T>(T value) where T : struct, Enum =>
         value.ToString().Replace("NoAnswer", "no_answer", StringComparison.Ordinal).ToLowerInvariant();
 
-    private abstract record CoordinatorWorkItem
+    private abstract record CoordinatorWorkItem(long EnqueuedTimestamp)
     {
         public abstract Task ExecuteAsync(CancellationToken lifetimeToken);
     }
@@ -1446,7 +1454,8 @@ public sealed class AgentCoordinator : IAsyncDisposable
         Func<CancellationToken, Task<T>> Action,
         TaskCompletionSource<T> Completion,
         CancellationToken RequestCancellationToken,
-        bool CancelExecution) : CoordinatorWorkItem
+        bool CancelExecution,
+        long EnqueuedTimestamp) : CoordinatorWorkItem(EnqueuedTimestamp)
     {
         public override async Task ExecuteAsync(CancellationToken lifetimeToken)
         {

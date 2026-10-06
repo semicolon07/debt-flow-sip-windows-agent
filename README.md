@@ -91,6 +91,15 @@ CI เรียก P2 verifierและอัปโหลด ZIP, TRX, checksum/
 ผลลัพธ์คือ unsigned self-contained multi-file `debt-flow-sip-agent-1.0.0-win-x64.zip` พร้อม
 SPDX SBOM, release manifestและ SHA-256 checksum; target machineไม่ต้องติดตั้ง .NET Runtime/SDK.
 
+เก็บ P5 D baseline/optimized CPU, memory, handlesและ threadsจาก Agentที่กำลังทำงานด้วย:
+
+```powershell
+./scripts/measure-p5d-performance.ps1 -ProcessId <agent-pid> -DurationSeconds 900
+```
+
+บันทึก control latency, replay 250/1,000/10,000 events และ device-change evidenceใน
+[P5 D performance result template](docs/manual-verification/p5d-windows-performance-result-template.md).
+
 ## V1 diagnostic client
 
 หน้า `poc.html` เป็น development diagnostic เท่านั้น ไม่มี default PBX credential:
@@ -134,6 +143,8 @@ instance หลักกำลังทำงาน. Exit codeคือ `0` succ
 - outbox warning 80%, block สายใหม่ 90%, hard ceiling 10,000 pending events หรือ DB+WAL 100 MiB
 - registration retry ใช้ exponential full jitter 2–60 วินาที, cancel ด้วย generation และ reset หลัง registered 5 นาที
 - audio default-device change ถูก debounce; device loss ระหว่างสายแสดง degraded โดยไม่ตัด SIP call
+- snapshotใช้ cached storage health, replay batchทีละ 250 eventsและ audio device/session cacheถูก invalidate
+  เมื่อ Windows แจ้ง inventory change
 - outbox runtime failure ทำ Agent degraded/fail closed; shutdown checkpoint/hangup/unregister แบบ best effort
 - structured logger เก็บเฉพาะ template/safe properties และ redacts sensitive values
 - diagnostic ZIP มี safe summary และ bounded sanitized logs; ไม่รวม DB/config/credential/raw Origin
@@ -152,3 +163,6 @@ instance หลักกำลังทำงาน. Exit codeคือ `0` succ
   Windows host tests, UDP/TCP matrix, device change, diagnostic privacy review และ 2 ชั่วโมง/50 calls soak
 - P5 sourceเพิ่ม portable release pipelineและ additive outbox health snapshotแล้ว; Windows release runner,
   PBX/privacy matrix, owner migration readback, alert/rollback rehearsalและ full-target rolloutยัง pending
+- P5 D performance source resultอยู่ที่
+  [performance hardening result](docs/plan-results/2026-10-06-p5d-performance-hardening-result.md);
+  Windows baseline comparison, replay 10,000 events, device matrixและ soakยัง pending

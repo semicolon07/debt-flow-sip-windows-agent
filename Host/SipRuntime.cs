@@ -1,5 +1,6 @@
 using System.Net;
 using System.Collections.Concurrent;
+using System.Diagnostics;
 using System.Threading.Channels;
 using Microsoft.Extensions.Logging;
 using NAudio.CoreAudioApi;
@@ -50,6 +51,9 @@ public sealed class SipRuntime : ISipRuntime
     private AudioExtrasSource? _fallbackAudioSource;
     private SipConfiguration? _configuration;
     private CancellationTokenSource? _audioNotificationDebounce;
+    private int? _cachedPlaybackDevice;
+    private bool _playbackDeviceCacheValid;
+    private long _audioDeviceGeneration;
     private bool _useTcp;
     private int _microphoneMuted;
     private int _outputVolume;
@@ -371,8 +375,11 @@ public sealed class SipRuntime : ISipRuntime
         ObjectDisposedException.ThrowIf(_disposed, this);
         EnsureActiveCall(call);
         await SetSessionVolumeAsync(DataFlow.Render, volume, cancellationToken);
-        Volatile.Write(ref _outputVolume, volume);
-        PersistAudioPreferences();
+        int previous = Interlocked.Exchange(ref _outputVolume, volume);
+        if (previous != volume)
+        {
+            PersistAudioPreferences();
+        }
     }
 
     public async Task SetInputVolumeAsync(
@@ -383,8 +390,11 @@ public sealed class SipRuntime : ISipRuntime
         ObjectDisposedException.ThrowIf(_disposed, this);
         EnsureActiveCall(call);
         await SetSessionVolumeAsync(DataFlow.Capture, volume, cancellationToken);
-        Volatile.Write(ref _inputVolume, volume);
-        PersistAudioPreferences();
+        int previous = Interlocked.Exchange(ref _inputVolume, volume);
+        if (previous != volume)
+        {
+            PersistAudioPreferences();
+        }
     }
 
     public async ValueTask DisposeAsync()
@@ -546,7 +556,7 @@ public sealed class SipRuntime : ISipRuntime
     {
         var encoder = new AudioEncoder();
         bool hasCapture = WaveIn.DeviceCount > 0;
-        int? playbackDevice = FindWorkingPlaybackDevice();
+        int? playbackDevice = GetWorkingPlaybackDevice();
         bool hasPlayback = playbackDevice.HasValue;
 
         _audioEndPoint = new WindowsAudioEndPoint(
@@ -684,6 +694,39 @@ public sealed class SipRuntime : ISipRuntime
         return null;
     }
 
+    private int? GetWorkingPlaybackDevice()
+    {
+        long started = Stopwatch.GetTimestamp();
+        long generation;
+        lock (_audioNotificationGate)
+        {
+            if (_playbackDeviceCacheValid)
+            {
+                AgentPerformanceTelemetry.RecordAudioProbe(
+                    Stopwatch.GetElapsedTime(started),
+                    cacheHit: true);
+                return _cachedPlaybackDevice;
+            }
+
+            generation = _audioDeviceGeneration;
+        }
+
+        int? discovered = FindWorkingPlaybackDevice();
+        lock (_audioNotificationGate)
+        {
+            if (generation == _audioDeviceGeneration)
+            {
+                _cachedPlaybackDevice = discovered;
+                _playbackDeviceCacheValid = true;
+            }
+        }
+
+        AgentPerformanceTelemetry.RecordAudioProbe(
+            Stopwatch.GetElapsedTime(started),
+            cacheHit: false);
+        return discovered;
+    }
+
     private async Task CleanupMediaAsync()
     {
         await _mediaGate.WaitAsync();
@@ -725,6 +768,10 @@ public sealed class SipRuntime : ISipRuntime
         CancellationToken token;
         lock (_audioNotificationGate)
         {
+            _audioDeviceGeneration++;
+            _cachedPlaybackDevice = null;
+            _playbackDeviceCacheValid = false;
+            _volumeController.Invalidate();
             _audioNotificationDebounce?.Cancel();
             _audioNotificationDebounce?.Dispose();
             _audioNotificationDebounce = new CancellationTokenSource();

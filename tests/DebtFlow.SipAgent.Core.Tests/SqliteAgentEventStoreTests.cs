@@ -65,6 +65,41 @@ public sealed class SqliteAgentEventStoreTests
     }
 
     [Fact]
+    public async Task CachedHealth_TracksPendingCountAndOldestEventAcrossAcknowledgements()
+    {
+        string directory = CreateTemporaryDirectory();
+        string path = Path.Combine(directory, "agent.db");
+        DateTimeOffset firstAt = DateTimeOffset.Parse("2026-10-06T01:00:00Z");
+        DateTimeOffset secondAt = firstAt.AddSeconds(5);
+        try
+        {
+            await using var store = new SqliteAgentEventStore(path);
+            await store.InitializeAsync(CancellationToken.None);
+            await store.AppendAsync(CreateDraft() with { OccurredAtUtc = firstAt }, CancellationToken.None);
+            await store.AppendAsync(CreateDraft() with { OccurredAtUtc = secondAt }, CancellationToken.None);
+
+            EventStoreHealth initial = await store.GetHealthAsync(CancellationToken.None);
+            Assert.Equal(2, initial.PendingEventCount);
+            Assert.Equal(firstAt, initial.OldestPendingAtUtc);
+            Assert.True(initial.StorageBytes > 0);
+
+            await store.AcknowledgeThroughAsync(1, CancellationToken.None);
+            EventStoreHealth afterFirstAck = await store.GetHealthAsync(CancellationToken.None);
+            Assert.Equal(1, afterFirstAck.PendingEventCount);
+            Assert.Equal(secondAt, afterFirstAck.OldestPendingAtUtc);
+
+            await store.AcknowledgeThroughAsync(2, CancellationToken.None);
+            EventStoreHealth afterSecondAck = await store.GetHealthAsync(CancellationToken.None);
+            Assert.Equal(0, afterSecondAck.PendingEventCount);
+            Assert.Null(afterSecondAck.OldestPendingAtUtc);
+        }
+        finally
+        {
+            Directory.Delete(directory, true);
+        }
+    }
+
+    [Fact]
     public async Task ProcessedCommand_CanBeUpdatedWithoutCreatingDuplicate()
     {
         string directory = CreateTemporaryDirectory();

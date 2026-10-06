@@ -61,6 +61,36 @@ public sealed class WebSocketEventPublisher : IAgentEventPublisher, IAsyncDispos
             cancellationToken,
             waitForDelivery: true);
 
+    public async Task SendReplayPageAsync(
+        IReadOnlyList<StoredDurableEvent> storedEvents,
+        CancellationToken cancellationToken)
+    {
+        if (storedEvents.Count == 0)
+        {
+            return;
+        }
+
+        Session? session = Volatile.Read(ref _session);
+        if (session == null)
+        {
+            throw new WebSocketException("socket_not_open");
+        }
+
+        var deliveryBarrier = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        for (int index = 0; index < storedEvents.Count; index++)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            StoredDurableEvent storedEvent = storedEvents[index];
+            var message = new OutboundMessage(
+                ProtocolCodec.Serialize("event", storedEvent.EventType, storedEvent.ToPayload()),
+                index == storedEvents.Count - 1 ? deliveryBarrier : null,
+                null);
+            await session.EnqueueReplayAsync(message, cancellationToken);
+        }
+
+        await deliveryBarrier.Task.WaitAsync(cancellationToken);
+    }
+
     public Task SendControlAsync<T>(string kind, string type, T payload, CancellationToken cancellationToken) =>
         SendAsync(ProtocolCodec.Serialize(kind, type, payload), cancellationToken);
 
@@ -162,6 +192,9 @@ public sealed class WebSocketEventPublisher : IAgentEventPublisher, IAsyncDispos
                 return Outbound.Writer.TryWrite(message);
             }
         }
+
+        public ValueTask EnqueueReplayAsync(OutboundMessage message, CancellationToken cancellationToken) =>
+            Outbound.Writer.WriteAsync(message, cancellationToken);
 
         public void Activate(long replayedThroughSequence)
         {

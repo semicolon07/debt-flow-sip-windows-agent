@@ -1,0 +1,87 @@
+# SIP Windows Agent P5 D performance result
+
+## Test identity
+
+| Field | Value |
+| --- | --- |
+| Date and time | |
+| Tester | |
+| Commit and artifact checksum | |
+| Windows version and build | |
+| CPU and RAM | |
+| Audio capture and playback devices | |
+| PBX and network path | |
+| Portal and API version | |
+
+## Baseline and optimized runtime
+
+Run `scripts\measure-p5d-performance.ps1` against the same process workload before and after the change.
+Attach both generated summary JSON files and sample CSV files.
+On a validation host with the .NET diagnostic tools, collect `System.Runtime` and `DebtFlow.SipAgent`
+alongside the sampler so allocation rate, GC pauses, coordinator wait, storage latency, audio probes and replay
+duration can be compared without adding identifiers to application logs.
+
+| Scenario | Duration | Idle CPU average and p95 | Working set p95 | Private memory p95 | Maximum handles | Result |
+| --- | ---: | --- | ---: | ---: | ---: | --- |
+| Idle registered | 15 minutes | | | | | |
+| Active call | 15 minutes | | | | | |
+| 50 call or 2 hour soak | | | | | | |
+
+| Runtime counter | Baseline p50 and p95 | Optimized p50 and p95 | Result |
+| --- | --- | --- | --- |
+| Allocation rate | | | |
+| GC pause duration | | | |
+| Coordinator queue wait | | | |
+| SQLite operation duration by bounded operation tag | | | |
+| Replay duration and event throughput | | | |
+| Process disk read and write rate | | | |
+
+## Control latency
+
+Use one Windows machine, PBX account, network path and audio devices for both runs. Record at least 30 samples.
+
+| Measurement | Baseline p50 and p95 | Optimized p50 and p95 | Regression | Result |
+| --- | --- | --- | --- | --- |
+| Outbound command to SIP trying | | | | |
+| Inbound answer command to connected | | | | |
+| Audio media ready after connected | | | | |
+| Tray snapshot response | | | | |
+
+## Replay recovery
+
+| Pending events | Baseline duration | Optimized duration | Ordered and complete | Peak working set | Result |
+| ---: | ---: | ---: | --- | ---: | --- |
+| 250 | | | | | |
+| 1,000 | | | | | |
+| 10,000 | | | | | |
+
+Confirm that live events generated during replay appear after the replay boundary and that reconnect does not
+duplicate an acknowledged durable sequence.
+
+## Audio device cache
+
+| Scenario | Expected result | Evidence | Result |
+| --- | --- | --- | --- |
+| Second call with unchanged devices | Reuses cached playback device without full probe | | |
+| Default playback device changes | Cache invalidates and next call probes the new inventory | | |
+| Bluetooth disconnect during call | Media degradation is reported and cleanup completes | | |
+| Device returns before next call | New call initializes capture and playback successfully | | |
+
+## Durability and privacy checks
+
+- [ ] `PRAGMA synchronous=FULL` remains active.
+- [ ] `PRAGMA secure_delete=ON` remains active.
+- [ ] Clean shutdown truncates WAL.
+- [ ] Event ACK never advances across a missing sequence.
+- [ ] Performance metrics and evidence contain no phone number, SIP credential, Origin, call ID or command ID.
+- [ ] Logs remain redacted and bounded during replay and device-failure bursts.
+
+## Decision
+
+| Field | Value |
+| --- | --- |
+| Performance acceptance | PASS or FAIL |
+| Durability acceptance | PASS or FAIL |
+| Privacy acceptance | PASS or FAIL |
+| Remaining issue and owner | |
+| Release recommendation | |

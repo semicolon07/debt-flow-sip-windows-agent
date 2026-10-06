@@ -38,7 +38,7 @@ Owner risk acceptance เดิมเรื่อง allow-all Origin, unsigned 
 | รายการ | ผล |
 | --- | --- |
 | Release build | PASS, 0 warnings, 0 errors |
-| Core tests ณ implementation ล่าสุด | PASS, 78/78 |
+| Core tests ณ implementation ล่าสุด | PASS, 79/79 |
 | Inbound answer regression | PASS: connected callback ก่อน `AnswerAsync` return ไม่ deadlock |
 | Locked restore พร้อม `NuGetAuditMode=all` | PASS โดยไม่มี vulnerability advisory warning |
 | Windows host tests | COMPILE PASS; NOT RUN บน macOS เนื่องจากไม่มี Windows Desktop runtime |
@@ -60,6 +60,8 @@ Owner risk acceptance เดิมเรื่อง allow-all Origin, unsigned 
 - `--storage-preflight` อ่าน SQLite แบบ read-only พร้อม exit code 0/20/21 โดยไม่เริ่ม TLS/UI/WSS/SIP
 - `--print-release-metadata` เป็น source เดียวของ version/protocol/schema/capabilities สำหรับ welcome และ release manifest
 - release workflow pin action SHA และสร้าง artifact name จาก semantic tag; binary metadata ต้องตรงก่อน package
+- P5 D cache storage/audio state, batch ACK checkpointและ reconnect replay, ลด WebSocket/logging copies และเพิ่ม
+  bounded non-PII performance metrics; Windows baseline/benchmarkยัง pending
 
 ข้อยกเว้นที่ยืนยันและยังคงอยู่: unauthenticated allow-all WSS, unsigned ZIP, full-target rollout ไม่มี canary
 และ plaintext SQLite/WAL. สถานะสุดท้ายจึงใช้คำว่า `released with approved exceptions` เท่านั้น.
@@ -86,6 +88,7 @@ Owner risk acceptance เดิมเรื่อง allow-all Origin, unsigned 
 | SIP-PRR-008 | P1 | Full remote party อยู่ใน SQLite แบบ plaintext และ migration มี rollout trap | Plaintext approved; mitigations implemented; preflight rehearsal pending |
 | SIP-PRR-009 | P1 | Real SIP runtime ไม่มี automated lifecycle coverage เพียงพอ | Open external release gate |
 | SIP-PRR-010 | P2 | Release manifest, versioning และ artifact trust เริ่ม drift จาก runtime | Drift remediated; unsigned artifact approved exception |
+| SIP-PRR-011 | P2 | Control-plane ทำ SQLite scan, audio probe และ replay wait ถี่เกินจำเป็น | Remediated in source; Windows benchmark pending |
 
 รายละเอียด “ผลกระทบ/การแก้ไขที่ต้องการ” ด้านล่างบันทึก finding ณ baseline commit; ตารางสถานะและ
 Implementation update ด้านบนเป็น authority ของผลหลังแก้ไข.

@@ -26,6 +26,29 @@ public sealed class WebSocketEventPublisherTests
     }
 
     [Fact]
+    public async Task ReplayPage_UsesFinalDeliveryBarrierAndPreservesSequenceOrder()
+    {
+        await using var publisher = new WebSocketEventPublisher();
+        var sendRelease = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        using var socket = new RecordingWebSocket(sendRelease.Task);
+        Assert.True(publisher.TryAttach(socket, CancellationToken.None));
+
+        Task replay = publisher.SendReplayPageAsync(
+            [StoredEvent(1), StoredEvent(2), StoredEvent(3)],
+            CancellationToken.None);
+
+        Assert.False(replay.IsCompleted);
+        sendRelease.SetResult();
+        await replay.WaitAsync(TimeSpan.FromSeconds(2));
+
+        long[] sequences = socket.Messages
+            .Select(message => ProtocolCodec.Deserialize(message))
+            .Select(message => ProtocolCodec.DeserializePayload<DurableEventPayload>(message.Payload).Sequence)
+            .ToArray();
+        Assert.Equal([1, 2, 3], sequences);
+    }
+
+    [Fact]
     public async Task HandshakeBuffer_SendsWelcomeSnapshotReplayBeforeLiveEventsAndFiltersReplayDuplicate()
     {
         await using var publisher = new WebSocketEventPublisher();

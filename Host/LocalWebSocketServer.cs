@@ -1,5 +1,7 @@
 using System.Net;
 using System.Net.WebSockets;
+using System.Diagnostics;
+using System.Buffers;
 using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.Logging;
 using DebtFlow.SipAgent.Application;
@@ -217,6 +219,8 @@ public sealed class LocalWebSocketServer(
 
     private async Task<long> ReplayPendingEventsAsync(CancellationToken cancellationToken)
     {
+        long started = Stopwatch.GetTimestamp();
+        long replayedEventCount = 0;
         try
         {
             long afterSequence = eventStore.LastAcknowledgedSequence;
@@ -228,17 +232,21 @@ public sealed class LocalWebSocketServer(
                     return afterSequence;
                 }
 
-                foreach (StoredDurableEvent storedEvent in page)
-                {
-                    await publisher.SendReplayAsync(storedEvent, cancellationToken);
-                    afterSequence = storedEvent.Sequence;
-                }
+                await publisher.SendReplayPageAsync(page, cancellationToken);
+                replayedEventCount += page.Count;
+                afterSequence = page[^1].Sequence;
             }
         }
         catch (Exception exception) when (exception is not OperationCanceledException)
         {
             await coordinator.MarkDegradedAsync("outbox_unavailable", CancellationToken.None);
             throw;
+        }
+        finally
+        {
+            AgentPerformanceTelemetry.RecordReplay(
+                Stopwatch.GetElapsedTime(started),
+                replayedEventCount);
         }
     }
 
@@ -249,11 +257,11 @@ public sealed class LocalWebSocketServer(
     {
         using var timeout = CancellationTokenSource.CreateLinkedTokenSource(applicationToken);
         timeout.CancelAfter(ProtocolConstants.ClientTimeout);
-        byte[] chunk = new byte[8 * 1024];
-        using var buffer = new MemoryStream();
-        WebSocketReceiveResult result;
+        var buffer = new ArrayBufferWriter<byte>(8 * 1024);
+        ValueWebSocketReceiveResult result;
         do
         {
+            Memory<byte> chunk = buffer.GetMemory(8 * 1024);
             result = await socket.ReceiveAsync(chunk, timeout.Token);
             if (result.MessageType == WebSocketMessageType.Close)
             {
@@ -265,12 +273,12 @@ public sealed class LocalWebSocketServer(
                 throw new ProtocolException("invalid_message", "Only text messages are supported.");
             }
 
-            if (buffer.Length + result.Count > ProtocolConstants.MaximumMessageBytes)
+            if (buffer.WrittenCount + result.Count > ProtocolConstants.MaximumMessageBytes)
             {
                 throw new ProtocolException("message_too_large", "Message exceeds the maximum size.");
             }
 
-            buffer.Write(chunk, 0, result.Count);
+            buffer.Advance(result.Count);
         }
         while (!result.EndOfMessage);
 
@@ -286,7 +294,7 @@ public sealed class LocalWebSocketServer(
         }
 
         rateWindow.Enqueue(now);
-        return ProtocolCodec.Deserialize(buffer.ToArray());
+        return ProtocolCodec.Deserialize(buffer.WrittenMemory);
     }
 
     private static Task SendDirectAsync(WebSocket socket, byte[] message, CancellationToken cancellationToken) =>

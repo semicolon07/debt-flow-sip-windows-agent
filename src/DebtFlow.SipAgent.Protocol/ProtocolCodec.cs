@@ -14,7 +14,7 @@ public static class ProtocolCodec
     private static readonly HashSet<string> EnvelopeFields =
         ["protocolVersion", "kind", "messageId", "sentAtUtc", "type", "payload"];
 
-    public static ProtocolEnvelope Deserialize(ReadOnlySpan<byte> utf8)
+    public static ProtocolEnvelope Deserialize(ReadOnlyMemory<byte> utf8)
     {
         if (utf8.Length == 0 || utf8.Length > ProtocolConstants.MaximumMessageBytes)
         {
@@ -23,7 +23,7 @@ public static class ProtocolCodec
 
         try
         {
-            using JsonDocument document = JsonDocument.Parse(utf8.ToArray());
+            using JsonDocument document = JsonDocument.Parse(utf8);
             JsonElement root = document.RootElement;
             if (root.ValueKind != JsonValueKind.Object)
             {

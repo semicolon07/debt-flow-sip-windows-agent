@@ -10,6 +10,7 @@ namespace DebtFlow.SipAgent.Host;
 
 public sealed class TrayApplicationContext : ApplicationContext
 {
+    internal const int StatusRefreshIntervalMilliseconds = 5_000;
     private readonly AgentCoordinator _coordinator;
     private readonly LocalWebSocketServer _webSocketServer;
     private readonly IStartupRegistrationManager _startup;
@@ -112,7 +113,11 @@ public sealed class TrayApplicationContext : ApplicationContext
         };
         _notifyIcon.DoubleClick += async (_, _) => await RefreshStatusAsync();
 
-        _timer = new System.Windows.Forms.Timer { Interval = 1000, Enabled = true };
+        _timer = new System.Windows.Forms.Timer
+        {
+            Interval = StatusRefreshIntervalMilliseconds,
+            Enabled = true
+        };
         _timer.Tick += async (_, _) => await RefreshStatusAsync();
         _singleInstance.ActivationRequested += OnActivationRequested;
         SystemEvents.SessionEnding += OnSessionEnding;
@@ -131,6 +136,8 @@ public sealed class TrayApplicationContext : ApplicationContext
         {
             Notify(tlsWarningCode, TrayText.Format("TlsWarning", tlsWarningCode));
         }
+
+        _ = RefreshStatusAsync();
     }
 
     protected override void Dispose(bool disposing)
