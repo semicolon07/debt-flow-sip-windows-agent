@@ -38,8 +38,10 @@ public sealed class AgentCoordinator : IAsyncDisposable
     private long _ownerLeaseGeneration;
     private long _registrationGeneration;
     private long _callGeneration;
+    private long _audioDeviceOperationGeneration;
     private int _registrationRetryAttempt;
     private bool _registrationRequested;
+    private bool _audioDeviceOperationReserved;
     private int _disposeStarted;
 
     public AgentCoordinator(
@@ -231,22 +233,10 @@ public sealed class AgentCoordinator : IAsyncDisposable
         AudioDeviceTestCommand command,
         CancellationToken cancellationToken)
     {
-        await EnsureIdleAudioDeviceOperationAsync(cancellationToken);
-        using var operationTimeout = CancellationTokenSource.CreateLinkedTokenSource(_lifetime.Token);
-        operationTimeout.CancelAfter(TimeSpan.FromSeconds(5));
-        int level;
-        try
-        {
-            level = await _sipRuntime.TestInputDeviceAsync(command.DeviceId, operationTimeout.Token);
-        }
-        catch (OperationCanceledException) when (!_lifetime.IsCancellationRequested)
-        {
-            throw new AgentCommandException("sip_operation_timeout");
-        }
-        catch (Exception exception) when (exception is not AgentCommandException)
-        {
-            throw new AgentCommandException("audio_device_test_failed");
-        }
+        int level = await ExecuteIdleAudioDeviceOperationAsync(
+            cancellationToken,
+            token => _sipRuntime.TestInputDeviceAsync(command.DeviceId, token),
+            "audio_device_test_failed");
         await EnqueueAsync(
             token => PublishRealtimeAsync(
                 "audio.input.level",
@@ -486,6 +476,10 @@ public sealed class AgentCoordinator : IAsyncDisposable
         {
             throw new AgentCommandException("call_invalid_state");
         }
+        if (_audioDeviceOperationReserved)
+        {
+            throw new AgentCommandException("audio_device_busy");
+        }
 
         await EnsureCapacityForNewCallAsync(cancellationToken);
 
@@ -515,7 +509,7 @@ public sealed class AgentCoordinator : IAsyncDisposable
                 new { direction = "outbound" },
                 cancellationToken);
         }
-        catch (AgentCommandException exception) when (exception.ErrorCode == "outbox_unavailable")
+        catch (AgentCommandException)
         {
             _call = null;
             throw;
@@ -651,12 +645,37 @@ public sealed class AgentCoordinator : IAsyncDisposable
         Func<CancellationToken, Task> action,
         Func<CancellationToken, Task>? publish = null)
     {
-        await EnsureIdleAudioDeviceOperationAsync(requestCancellationToken);
+        _ = await ExecuteIdleAudioDeviceOperationAsync(
+            requestCancellationToken,
+            async token =>
+            {
+                await action(token);
+                return true;
+            },
+            "audio_device_control_failed");
+        if (publish is not null)
+        {
+            await EnqueueAsync(publish, CancellationToken.None);
+        }
+    }
+
+    private async Task<T> ExecuteIdleAudioDeviceOperationAsync<T>(
+        CancellationToken requestCancellationToken,
+        Func<CancellationToken, Task<T>> action,
+        string failureCode)
+    {
+        long reservation = await EnqueueAsync(
+            ReserveIdleAudioDeviceOperationCoreAsync,
+            requestCancellationToken);
         using var operationTimeout = CancellationTokenSource.CreateLinkedTokenSource(_lifetime.Token);
         operationTimeout.CancelAfter(TimeSpan.FromSeconds(5));
         try
         {
-            await action(operationTimeout.Token);
+            return await action(operationTimeout.Token);
+        }
+        catch (OperationCanceledException) when (_lifetime.IsCancellationRequested)
+        {
+            throw;
         }
         catch (OperationCanceledException) when (!_lifetime.IsCancellationRequested)
         {
@@ -664,26 +683,49 @@ public sealed class AgentCoordinator : IAsyncDisposable
         }
         catch (Exception exception) when (exception is not AgentCommandException)
         {
-            throw new AgentCommandException("audio_device_control_failed");
+            throw new AgentCommandException(failureCode);
         }
-        if (publish is not null)
+        finally
         {
-            await EnqueueAsync(publish, CancellationToken.None);
+            try
+            {
+                await EnqueueAsync(
+                    token => ReleaseAudioDeviceOperationCoreAsync(reservation, token),
+                    CancellationToken.None);
+            }
+            catch (Exception exception) when (
+                exception is ChannelClosedException ||
+                exception is OperationCanceledException && _lifetime.IsCancellationRequested)
+            {
+            }
         }
     }
 
-    private Task EnsureIdleAudioDeviceOperationAsync(CancellationToken cancellationToken) =>
-        EnqueueAsync(
-            token =>
-            {
-                token.ThrowIfCancellationRequested();
-                if (_call is { State: not CallState.Ended })
-                {
-                    throw new AgentCommandException("call_in_progress");
-                }
-                return Task.CompletedTask;
-            },
-            cancellationToken);
+    private Task<long> ReserveIdleAudioDeviceOperationCoreAsync(CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        if (_call is { State: not CallState.Ended })
+        {
+            throw new AgentCommandException("call_in_progress");
+        }
+        if (_audioDeviceOperationReserved)
+        {
+            throw new AgentCommandException("audio_device_busy");
+        }
+
+        _audioDeviceOperationReserved = true;
+        return Task.FromResult(++_audioDeviceOperationGeneration);
+    }
+
+    private Task ReleaseAudioDeviceOperationCoreAsync(long generation, CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        if (generation == _audioDeviceOperationGeneration)
+        {
+            _audioDeviceOperationReserved = false;
+        }
+        return Task.CompletedTask;
+    }
 
     private async Task ExecuteRuntimeOperationAsync(
         CallRuntimeOperation operation,
@@ -1086,6 +1128,11 @@ public sealed class AgentCoordinator : IAsyncDisposable
             await _sipRuntime.RejectAsync(incomingHandle, cancellationToken);
             return;
         }
+        if (_audioDeviceOperationReserved)
+        {
+            await _sipRuntime.RejectUnavailableAsync(incomingHandle, cancellationToken);
+            return;
+        }
 
         if (_collectionId is null || _collectionBindingId is null)
         {
@@ -1127,7 +1174,7 @@ public sealed class AgentCoordinator : IAsyncDisposable
                 new { direction = "inbound" },
                 cancellationToken);
         }
-        catch (AgentCommandException exception) when (exception.ErrorCode == "outbox_unavailable")
+        catch (AgentCommandException)
         {
             await _sipRuntime.RejectUnavailableAsync(incomingHandle, cancellationToken);
             _call = null;

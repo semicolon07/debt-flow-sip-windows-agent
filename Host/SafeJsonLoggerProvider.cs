@@ -14,10 +14,13 @@ public sealed class SafeJsonLoggerProvider : ILoggerProvider
     private const long MaximumFileBytes = 10 * 1024 * 1024;
     private const int RetainedFileCount = 7;
     private static readonly TimeSpan FlushInterval = TimeSpan.FromSeconds(1);
+    private static readonly TimeSpan InitialRetryDelay = TimeSpan.FromMilliseconds(100);
+    private static readonly TimeSpan MaximumRetryDelay = TimeSpan.FromSeconds(5);
     private static readonly byte[] NewLine = Encoding.UTF8.GetBytes(Environment.NewLine);
     private readonly string _directory;
     private readonly bool _writeConsole;
     private readonly Channel<byte[]> _queue;
+    private readonly CancellationTokenSource _shutdown = new();
     private readonly Task _writerTask;
     private FileStream? _writer;
     private int _disposed;
@@ -50,7 +53,11 @@ public sealed class SafeJsonLoggerProvider : ILoggerProvider
         _queue.Writer.TryComplete();
         try
         {
-            _writerTask.Wait(TimeSpan.FromSeconds(2));
+            if (!_writerTask.Wait(TimeSpan.FromSeconds(2)))
+            {
+                _shutdown.Cancel();
+                _writerTask.Wait(TimeSpan.FromMilliseconds(250));
+            }
         }
         catch (AggregateException)
         {
@@ -112,74 +119,107 @@ public sealed class SafeJsonLoggerProvider : ILoggerProvider
     {
         long lastFlush = Stopwatch.GetTimestamp();
         Task<bool>? pendingRead = null;
+        byte[]? pendingLine = null;
         bool dirty = false;
+        TimeSpan retryDelay = InitialRetryDelay;
         try
         {
             while (true)
             {
-                int count = 0;
-                while (count < 64 && _queue.Reader.TryRead(out byte[]? line))
+                try
                 {
-                    WriteLineCore(line);
-                    dirty = true;
-                    count++;
-                }
+                    int count = 0;
+                    while (count < 64)
+                    {
+                        pendingLine ??= _queue.Reader.TryRead(out byte[]? line) ? line : null;
+                        if (pendingLine == null)
+                        {
+                            break;
+                        }
 
-                long dropped = Interlocked.Exchange(ref _droppedLines, 0);
-                if (dropped > 0)
-                {
-                    AgentPerformanceTelemetry.RecordDroppedLogs(dropped);
-                    WriteLineCore(Encoding.UTF8.GetBytes(
-                        $"{{\"timestampUtc\":\"{DateTimeOffset.UtcNow:O}\",\"level\":\"Warning\",\"category\":\"DebtFlow.SipAgent.Logging\",\"messageTemplate\":\"log_queue_overflow\",\"properties\":{{\"droppedLines\":{dropped}}}}}"));
-                    dirty = true;
-                }
+                        WriteLineCore(pendingLine);
+                        pendingLine = null;
+                        dirty = true;
+                        retryDelay = InitialRetryDelay;
+                        count++;
+                    }
 
-                TimeSpan sinceFlush = Stopwatch.GetElapsedTime(lastFlush);
-                if (_writer != null && dirty && sinceFlush >= FlushInterval)
+                    long dropped = Interlocked.Exchange(ref _droppedLines, 0);
+                    if (dropped > 0)
+                    {
+                        AgentPerformanceTelemetry.RecordDroppedLogs(dropped);
+                        pendingLine = Encoding.UTF8.GetBytes(
+                            $"{{\"timestampUtc\":\"{DateTimeOffset.UtcNow:O}\",\"level\":\"Warning\",\"category\":\"DebtFlow.SipAgent.Logging\",\"messageTemplate\":\"log_queue_overflow\",\"properties\":{{\"droppedLines\":{dropped}}}}}");
+                        continue;
+                    }
+
+                    TimeSpan sinceFlush = Stopwatch.GetElapsedTime(lastFlush);
+                    if (_writer != null && dirty && sinceFlush >= FlushInterval)
+                    {
+                        await _writer.FlushAsync(_shutdown.Token);
+                        lastFlush = Stopwatch.GetTimestamp();
+                        sinceFlush = TimeSpan.Zero;
+                        dirty = false;
+                    }
+
+                    if (_queue.Reader.Completion.IsCompleted &&
+                        pendingLine == null &&
+                        !_queue.Reader.TryPeek(out _))
+                    {
+                        break;
+                    }
+
+                    pendingRead ??= _queue.Reader.WaitToReadAsync(_shutdown.Token).AsTask();
+                    if (_writer == null || !dirty)
+                    {
+                        bool canRead = await pendingRead;
+                        pendingRead = null;
+                        if (!canRead)
+                        {
+                            break;
+                        }
+                        continue;
+                    }
+
+                    TimeSpan untilFlush = FlushInterval - sinceFlush;
+                    Task flushDelay = Task.Delay(
+                        untilFlush > TimeSpan.Zero ? untilFlush : TimeSpan.Zero,
+                        _shutdown.Token);
+                    Task completed = await Task.WhenAny(pendingRead, flushDelay);
+                    if (completed == flushDelay)
+                    {
+                        await _writer.FlushAsync(_shutdown.Token);
+                        lastFlush = Stopwatch.GetTimestamp();
+                        dirty = false;
+                    }
+                    else
+                    {
+                        bool canRead = await pendingRead;
+                        pendingRead = null;
+                        if (!canRead)
+                        {
+                            break;
+                        }
+                    }
+                }
+                catch (Exception exception) when (exception is not OperationCanceledException)
                 {
-                    await _writer.FlushAsync();
-                    lastFlush = Stopwatch.GetTimestamp();
-                    sinceFlush = TimeSpan.Zero;
+                    AgentPerformanceTelemetry.RecordLogWriterFailure(exception.GetType().Name);
+                    ResetWriterAfterFailure();
                     dirty = false;
-                }
-
-                if (_queue.Reader.Completion.IsCompleted && !_queue.Reader.TryPeek(out _))
-                {
-                    break;
-                }
-
-                pendingRead ??= _queue.Reader.WaitToReadAsync().AsTask();
-                if (_writer == null || !dirty)
-                {
-                    bool canRead = await pendingRead;
                     pendingRead = null;
-                    if (!canRead)
+                    if (Volatile.Read(ref _disposed) != 0)
                     {
                         break;
                     }
-                    continue;
-                }
 
-                TimeSpan untilFlush = FlushInterval - sinceFlush;
-                Task flushDelay = Task.Delay(untilFlush > TimeSpan.Zero ? untilFlush : TimeSpan.Zero);
-                Task completed = await Task.WhenAny(pendingRead, flushDelay);
-                if (completed == flushDelay)
-                {
-                    await _writer.FlushAsync();
-                    lastFlush = Stopwatch.GetTimestamp();
-                }
-                else
-                {
-                    bool canRead = await pendingRead;
-                    pendingRead = null;
-                    if (!canRead)
-                    {
-                        break;
-                    }
+                    await Task.Delay(retryDelay, _shutdown.Token);
+                    retryDelay = TimeSpan.FromMilliseconds(
+                        Math.Min(MaximumRetryDelay.TotalMilliseconds, retryDelay.TotalMilliseconds * 2));
                 }
             }
         }
-        catch (Exception)
+        catch (OperationCanceledException) when (_shutdown.IsCancellationRequested)
         {
         }
         finally
@@ -192,10 +232,25 @@ public sealed class SafeJsonLoggerProvider : ILoggerProvider
                 }
                 _writer?.Dispose();
             }
-            catch (IOException)
+            catch (Exception exception) when (exception is not OperationCanceledException)
             {
             }
 
+            _writer = null;
+        }
+    }
+
+    private void ResetWriterAfterFailure()
+    {
+        try
+        {
+            _writer?.Dispose();
+        }
+        catch (Exception)
+        {
+        }
+        finally
+        {
             _writer = null;
         }
     }
@@ -219,6 +274,7 @@ public sealed class SafeJsonLoggerProvider : ILoggerProvider
         }
 
         _writer?.Dispose();
+        Directory.CreateDirectory(_directory);
         string stamp = DateTime.UtcNow.ToString("yyyyMMdd-HHmmssfff", System.Globalization.CultureInfo.InvariantCulture);
         string currentPath = Path.Combine(_directory, $"agent-{stamp}.jsonl");
         _writer = new FileStream(

@@ -25,6 +25,7 @@ public sealed class SqliteAgentEventStore : IAgentEventStore
     private long _pendingEventCount;
     private DateTimeOffset? _oldestPendingAtUtc;
     private long _storageBytes;
+    private bool _storageBytesDirty;
     private int _commandRowCount;
     private int _executingCommandRowCount;
     private long _acknowledgedSinceCheckpoint;
@@ -428,7 +429,7 @@ public sealed class SqliteAgentEventStore : IAgentEventStore
             sqliteCommand.Parameters.AddWithValue("$resultJson", command.ResultJson);
             sqliteCommand.Parameters.AddWithValue(
                 "$processedAtUtc",
-                command.ProcessedAtUtc.ToString("O", CultureInfo.InvariantCulture));
+                FormatTimestamp(command.ProcessedAtUtc));
             sqliteCommand.Parameters.AddWithValue("$executionState", command.ExecutionState);
             await sqliteCommand.ExecuteNonQueryAsync(cancellationToken);
             if (previousExecutionState == null)
@@ -443,6 +444,7 @@ public sealed class SqliteAgentEventStore : IAgentEventStore
             {
                 _executingCommandRowCount++;
             }
+            _storageBytesDirty = true;
         }
         finally
         {
@@ -469,9 +471,10 @@ public sealed class SqliteAgentEventStore : IAgentEventStore
                 """;
             command.Parameters.AddWithValue(
                 "$recoveredAtUtc",
-                recoveredAtUtc.ToString("O", CultureInfo.InvariantCulture));
+                FormatTimestamp(recoveredAtUtc));
             await command.ExecuteNonQueryAsync(cancellationToken);
             _executingCommandRowCount = 0;
+            _storageBytesDirty = true;
         }
         finally
         {
@@ -512,10 +515,14 @@ public sealed class SqliteAgentEventStore : IAgentEventStore
                 """;
             command.Parameters.AddWithValue(
                 "$olderThanUtc",
-                olderThanUtc.ToString("O", CultureInfo.InvariantCulture));
+                FormatTimestamp(olderThanUtc));
             command.Parameters.AddWithValue("$maximumRetained", maximumRetained);
             int deleted = await command.ExecuteNonQueryAsync(cancellationToken);
             _commandRowCount = Math.Max(_executingCommandRowCount, _commandRowCount - deleted);
+            if (deleted > 0)
+            {
+                _storageBytesDirty = true;
+            }
         }
         finally
         {
@@ -606,7 +613,7 @@ public sealed class SqliteAgentEventStore : IAgentEventStore
             await transaction.CommitAsync(cancellationToken);
             LastSequence = Math.Max(LastSequence, sequence);
             _pendingEventCount = LastSequence - LastAcknowledgedSequence;
-            if (_pendingEventCount == 1)
+            if (_oldestPendingAtUtc == null || draft.OccurredAtUtc < _oldestPendingAtUtc.Value)
             {
                 _oldestPendingAtUtc = draft.OccurredAtUtc;
             }
@@ -842,6 +849,10 @@ public sealed class SqliteAgentEventStore : IAgentEventStore
     {
         cancellationToken.ThrowIfCancellationRequested();
         _ = RequireConnection();
+        if (_storageBytesDirty)
+        {
+            RefreshStorageBytesCore();
+        }
         long pending = _pendingEventCount;
         double ratio = Math.Max(
             (double)pending / _limits.MaximumPendingEvents,
@@ -868,7 +879,7 @@ public sealed class SqliteAgentEventStore : IAgentEventStore
         }
 
         await using SqliteCommand command = RequireConnection().CreateCommand();
-        command.CommandText = "SELECT OccurredAtUtc FROM DurableEvents WHERE Sequence > $ack ORDER BY Sequence LIMIT 1;";
+        command.CommandText = "SELECT MIN(OccurredAtUtc) FROM DurableEvents WHERE Sequence > $ack;";
         command.Parameters.AddWithValue("$ack", LastAcknowledgedSequence);
         object? oldest = await command.ExecuteScalarAsync(cancellationToken);
         return oldest is string oldestText && DateTimeOffset.TryParse(
@@ -927,6 +938,7 @@ public sealed class SqliteAgentEventStore : IAgentEventStore
     private void RefreshStorageBytesCore()
     {
         _storageBytes = GetFileSize(_databasePath) + GetFileSize($"{_databasePath}-wal");
+        _storageBytesDirty = false;
     }
 
     private Task CheckpointCoreAsync(bool truncate, CancellationToken cancellationToken) =>
@@ -1010,7 +1022,7 @@ public sealed class SqliteAgentEventStore : IAgentEventStore
     }
 
     private static string FormatTimestamp(DateTimeOffset value) =>
-        value.ToString("O", CultureInfo.InvariantCulture);
+        value.ToUniversalTime().ToString("O", CultureInfo.InvariantCulture);
 
     private static object FormatNullableTimestamp(DateTimeOffset? value) =>
         value.HasValue ? FormatTimestamp(value.Value) : DBNull.Value;

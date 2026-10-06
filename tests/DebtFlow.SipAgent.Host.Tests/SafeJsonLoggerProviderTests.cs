@@ -1,4 +1,6 @@
+using System.Diagnostics.Metrics;
 using Microsoft.Extensions.Logging;
+using DebtFlow.SipAgent.Application;
 using DebtFlow.SipAgent.Host;
 
 namespace DebtFlow.SipAgent.Host.Tests;
@@ -56,5 +58,85 @@ public sealed class SafeJsonLoggerProviderTests
                 Directory.Delete(directory, recursive: true);
             }
         }
+    }
+
+    [Fact]
+    public async Task WriterFailure_IsObservableAndWriterRecoversWhenDirectoryReturns()
+    {
+        string root = Path.Combine(Path.GetTempPath(), $"sip-agent-logger-recovery-{Guid.NewGuid():N}");
+        string directory = Path.Combine(root, "logs");
+        SafeJsonLoggerProvider? provider = null;
+        try
+        {
+            var failureObserved = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            using var listener = new MeterListener();
+            listener.InstrumentPublished = (instrument, meterListener) =>
+            {
+                if (instrument.Meter.Name == AgentPerformanceTelemetry.MeterName &&
+                    instrument.Name == "sip_agent.logging.writer_failures")
+                {
+                    meterListener.EnableMeasurementEvents(instrument);
+                }
+            };
+            listener.SetMeasurementEventCallback<long>((instrument, measurement, _, _) =>
+            {
+                if (instrument.Name == "sip_agent.logging.writer_failures" && measurement > 0)
+                {
+                    failureObserved.TrySetResult();
+                }
+            });
+            listener.Start();
+
+            Directory.CreateDirectory(directory);
+            provider = new SafeJsonLoggerProvider(directory, writeConsole: false);
+            ILogger logger = provider.CreateLogger("test");
+            Directory.Delete(directory);
+            await File.WriteAllTextAsync(directory, "temporarily blocks the log directory");
+
+            logger.LogInformation("recoverable-log-line");
+            await failureObserved.Task.WaitAsync(TimeSpan.FromSeconds(2));
+
+            File.Delete(directory);
+            Directory.CreateDirectory(directory);
+            await WaitForLogLineAsync(directory, "recoverable-log-line");
+            provider.Dispose();
+            provider = null;
+
+            string content = string.Join(
+                Environment.NewLine,
+                Directory.GetFiles(directory, "*.jsonl").Select(File.ReadAllText));
+            Assert.Contains("recoverable-log-line", content, StringComparison.Ordinal);
+        }
+        finally
+        {
+            provider?.Dispose();
+            if (File.Exists(directory))
+            {
+                File.Delete(directory);
+            }
+            if (Directory.Exists(root))
+            {
+                Directory.Delete(root, recursive: true);
+            }
+        }
+    }
+
+    private static async Task WaitForLogLineAsync(string directory, string expected)
+    {
+        for (int attempt = 0; attempt < 50; attempt++)
+        {
+            foreach (string path in Directory.GetFiles(directory, "*.jsonl"))
+            {
+                string content = await File.ReadAllTextAsync(path);
+                if (content.Contains(expected, StringComparison.Ordinal))
+                {
+                    return;
+                }
+            }
+
+            await Task.Delay(TimeSpan.FromMilliseconds(50));
+        }
+
+        throw new TimeoutException("The recovered logger did not persist the pending log line.");
     }
 }

@@ -22,6 +22,9 @@ public sealed class SipRuntime : ISipRuntime
 {
     private static readonly TimeSpan OutboundCallTimeout = TimeSpan.FromSeconds(60);
     private static readonly TimeSpan AnswerTimeout = TimeSpan.FromSeconds(30);
+    private static readonly TimeSpan PlaybackDeviceCacheLifetime = TimeSpan.FromMinutes(5);
+    private static readonly TimeSpan MissingPlaybackDeviceCacheLifetime = TimeSpan.FromSeconds(10);
+    private static readonly TimeSpan AudioInventoryCacheLifetime = TimeSpan.FromSeconds(30);
     private readonly ILogger<SipRuntime> _logger;
     private readonly IAudioPreferencesStore _audioPreferencesStore;
     private readonly bool _acceptRtpFromAny;
@@ -56,6 +59,10 @@ public sealed class SipRuntime : ISipRuntime
     private CancellationTokenSource? _audioNotificationDebounce;
     private int? _cachedPlaybackDevice;
     private bool _playbackDeviceCacheValid;
+    private long _playbackDeviceCacheExpiresAt;
+    private AudioDevicesSnapshot _audioDevicesSnapshot = CreateFallbackAudioDevicesSnapshot();
+    private long _audioInventoryCacheExpiresAt;
+    private int _audioInventoryRefreshScheduled;
     private long _audioDeviceGeneration;
     private bool _useTcp;
     private int _microphoneMuted;
@@ -87,7 +94,7 @@ public sealed class SipRuntime : ISipRuntime
         _transport.AddSIPChannel(new SIPTCPChannel(new IPEndPoint(IPAddress.Any, 0)));
         _userAgent = new SIPUserAgent(_transport, null, true);
         WireUserAgentEvents();
-        AudioState = GetAudioState();
+        AudioState = "degraded";
         try
         {
             _audioDeviceEnumerator = new MMDeviceEnumerator();
@@ -103,10 +110,12 @@ public sealed class SipRuntime : ISipRuntime
                 "Audio device notifications are unavailable because of {ErrorType}",
                 exception.GetType().Name);
         }
+        AudioDevicesSnapshot inventory = RefreshAudioDevicesSnapshotCore();
+        AudioState = GetAudioState(inventory);
         _logger.LogInformation(
             "Audio inventory: captureDevices={CaptureCount}, playbackDevices={PlaybackCount}",
-            WaveIn.DeviceCount,
-            WaveOut.DeviceCount);
+            Math.Max(0, inventory.InputDevices.Count - 1),
+            Math.Max(0, inventory.OutputDevices.Count - 1));
     }
 
     public ChannelReader<SipSignal> Signals => _signals.Reader;
@@ -115,7 +124,14 @@ public sealed class SipRuntime : ISipRuntime
     public bool IsMicrophoneMuted => Volatile.Read(ref _microphoneMuted) != 0;
     public int OutputVolume => Volatile.Read(ref _outputVolume);
     public int InputVolume => Volatile.Read(ref _inputVolume);
-    public AudioDevicesSnapshot AudioDevices => CreateAudioDevicesSnapshot();
+    public AudioDevicesSnapshot AudioDevices
+    {
+        get
+        {
+            ScheduleAudioInventoryFallbackRefreshIfExpired();
+            return Volatile.Read(ref _audioDevicesSnapshot);
+        }
+    }
 
     public Task ConfigureAsync(SipConfiguration configuration, CancellationToken cancellationToken)
     {
@@ -443,9 +459,15 @@ public sealed class SipRuntime : ISipRuntime
                 _inputDeviceId = inputDeviceId;
                 changed = true;
             }
-            _cachedPlaybackDevice = null;
-            _playbackDeviceCacheValid = false;
-            _volumeController.Invalidate();
+            InvalidateAudioDeviceCachesCore();
+            AudioDevicesSnapshot snapshot = Volatile.Read(ref _audioDevicesSnapshot);
+            Volatile.Write(
+                ref _audioDevicesSnapshot,
+                snapshot with
+                {
+                    SelectedOutputDeviceId = outputDeviceId,
+                    SelectedInputDeviceId = inputDeviceId
+                });
         }
         if (changed) PersistAudioPreferences();
         return Task.CompletedTask;
@@ -662,17 +684,24 @@ public sealed class SipRuntime : ISipRuntime
     private VoIPMediaSession CreateMediaSession(SipCallHandle call)
     {
         var encoder = new AudioEncoder();
-        int? captureDevice = ResolveInputDeviceIndex(_inputDeviceId, requireAvailable: false);
-        bool hasCapture = captureDevice.HasValue;
-        int? playbackDevice = ResolveOutputDeviceIndex(_outputDeviceId, requireAvailable: false);
-        bool hasPlayback = playbackDevice.HasValue;
+        string outputDeviceId;
+        string inputDeviceId;
+        lock (_audioNotificationGate)
+        {
+            outputDeviceId = _outputDeviceId;
+            inputDeviceId = _inputDeviceId;
+        }
 
-        _audioEndPoint = new WindowsAudioEndPoint(
-            encoder,
-            audioOutDeviceIndex: hasPlayback ? playbackDevice!.Value : -1,
-            audioInDeviceIndex: hasCapture ? captureDevice!.Value : -1,
-            disableSource: !hasCapture,
-            disableSink: !hasPlayback);
+        (
+            WindowsAudioEndPoint endpoint,
+            int? captureDevice,
+            int? playbackDevice) = CreateResilientAudioEndPoint(
+                encoder,
+                inputDeviceId,
+                outputDeviceId);
+        _audioEndPoint = endpoint;
+        bool hasCapture = captureDevice.HasValue;
+        bool hasPlayback = playbackDevice.HasValue;
         Volatile.Write(ref _microphoneMuted, 0);
 
         _audioEndPoint.OnAudioSourceError += _ =>
@@ -717,6 +746,96 @@ public sealed class SipRuntime : ISipRuntime
             Emit(new SipSignal(SipSignalType.MediaReady, Codec: codec, Call: call));
         };
         return _mediaSession;
+    }
+
+    private static WindowsAudioEndPoint CreateWindowsAudioEndPoint(
+        AudioEncoder encoder,
+        int? captureDevice,
+        int? playbackDevice) =>
+        new(
+            encoder,
+            audioOutDeviceIndex: playbackDevice ?? -1,
+            audioInDeviceIndex: captureDevice ?? -1,
+            disableSource: !captureDevice.HasValue,
+            disableSink: !playbackDevice.HasValue);
+
+    private (WindowsAudioEndPoint Endpoint, int? CaptureDevice, int? PlaybackDevice)
+        CreateResilientAudioEndPoint(
+            AudioEncoder encoder,
+            string inputDeviceId,
+            string outputDeviceId)
+    {
+        int? captureDevice = ResolveInputDeviceIndex(inputDeviceId, requireAvailable: false);
+        int? playbackDevice = ResolveOutputDeviceIndex(outputDeviceId, requireAvailable: false);
+        try
+        {
+            return (
+                CreateWindowsAudioEndPoint(encoder, captureDevice, playbackDevice),
+                captureDevice,
+                playbackDevice);
+        }
+        catch (Exception exception)
+        {
+            _logger.LogWarning(
+                "Audio endpoint initialization is retrying after {ErrorType}",
+                exception.GetType().Name);
+        }
+
+        InvalidatePlaybackDeviceCache();
+        captureDevice = ResolveInputDeviceIndex(inputDeviceId, requireAvailable: false);
+        playbackDevice = ResolveOutputDeviceIndex(outputDeviceId, requireAvailable: false);
+        try
+        {
+            return (
+                CreateWindowsAudioEndPoint(encoder, captureDevice, playbackDevice),
+                captureDevice,
+                playbackDevice);
+        }
+        catch (Exception exception)
+        {
+            _logger.LogWarning(
+                "Audio endpoint initialization is falling back to a single device after {ErrorType}",
+                exception.GetType().Name);
+        }
+
+        if (captureDevice.HasValue)
+        {
+            try
+            {
+                return (
+                    CreateWindowsAudioEndPoint(encoder, captureDevice, playbackDevice: null),
+                    captureDevice,
+                    null);
+            }
+            catch (Exception exception)
+            {
+                _logger.LogWarning(
+                    "Audio capture fallback is unavailable because of {ErrorType}",
+                    exception.GetType().Name);
+            }
+        }
+
+        if (playbackDevice.HasValue)
+        {
+            try
+            {
+                return (
+                    CreateWindowsAudioEndPoint(
+                        encoder,
+                        captureDevice: null,
+                        playbackDevice: playbackDevice),
+                    null,
+                    playbackDevice);
+            }
+            catch (Exception exception)
+            {
+                _logger.LogWarning(
+                    "Audio playback fallback is unavailable because of {ErrorType}",
+                    exception.GetType().Name);
+            }
+        }
+
+        return (CreateWindowsAudioEndPoint(encoder, null, null), null, null);
     }
 
     private async Task SetSessionVolumeAsync(
@@ -810,12 +929,13 @@ public sealed class SipRuntime : ISipRuntime
 
     private int? FindWorkingPlaybackDevice()
     {
-        if (WaveOut.DeviceCount <= 0)
+        int deviceCount = GetOutputDeviceCount();
+        if (deviceCount <= 0)
         {
             return null;
         }
 
-        foreach (int deviceIndex in new[] { -1 }.Concat(Enumerable.Range(0, WaveOut.DeviceCount)).Distinct())
+        foreach (int deviceIndex in new[] { -1 }.Concat(Enumerable.Range(0, deviceCount)).Distinct())
         {
             try
             {
@@ -854,11 +974,98 @@ public sealed class SipRuntime : ISipRuntime
             ? requestedInput
             : AudioPreferences.SystemDefaultDeviceId;
         return new AudioDevicesSnapshot(
-            outputDevices.Select(ToSnapshot).ToArray(),
-            inputDevices.Select(ToSnapshot).ToArray(),
+            Array.AsReadOnly(outputDevices.Select(ToSnapshot).ToArray()),
+            Array.AsReadOnly(inputDevices.Select(ToSnapshot).ToArray()),
             selectedOutput,
             selectedInput);
     }
+
+    private static AudioDevicesSnapshot CreateFallbackAudioDevicesSnapshot()
+    {
+        var systemDefault = new AudioDeviceSnapshot(
+            AudioPreferences.SystemDefaultDeviceId,
+            "System default",
+            true);
+        return new AudioDevicesSnapshot(
+            Array.AsReadOnly(new[] { systemDefault }),
+            Array.AsReadOnly(new[] { systemDefault }),
+            AudioPreferences.SystemDefaultDeviceId,
+            AudioPreferences.SystemDefaultDeviceId);
+    }
+
+    private AudioDevicesSnapshot RefreshAudioDevicesSnapshotCore()
+    {
+        AudioDevicesSnapshot snapshot = CreateAudioDevicesSnapshot();
+        Volatile.Write(ref _audioDevicesSnapshot, snapshot);
+        Volatile.Write(
+            ref _audioInventoryCacheExpiresAt,
+            GetExpirationTimestamp(AudioInventoryCacheLifetime));
+        return snapshot;
+    }
+
+    private void ScheduleAudioInventoryFallbackRefreshIfExpired()
+    {
+        if (_disposed || Stopwatch.GetTimestamp() < Volatile.Read(ref _audioInventoryCacheExpiresAt))
+        {
+            return;
+        }
+
+        if (Interlocked.CompareExchange(ref _audioInventoryRefreshScheduled, 1, 0) != 0)
+        {
+            return;
+        }
+
+        TrackBackground(RefreshAudioInventoryFallbackAsync());
+    }
+
+    private async Task RefreshAudioInventoryFallbackAsync()
+    {
+        try
+        {
+            await Task.Yield();
+            if (_disposed)
+            {
+                return;
+            }
+
+            AudioDevicesSnapshot previousInventory = Volatile.Read(ref _audioDevicesSnapshot);
+            string previousState = AudioState;
+            AudioDevicesSnapshot inventory = RefreshAudioDevicesSnapshotCore();
+            AudioState = GetAudioState(inventory);
+            if (!AudioInventoriesEqual(previousInventory, inventory) || previousState != AudioState)
+            {
+                Emit(new SipSignal(SipSignalType.AudioInventoryChanged, SafeCode: "audio_devices_changed"));
+                if (AudioState == "degraded" && previousState != AudioState && _userAgent.IsCallActive)
+                {
+                    Emit(new SipSignal(
+                        SipSignalType.MediaDegraded,
+                        SafeCode: "audio_device_removed",
+                        Call: GetActiveCall()));
+                }
+            }
+        }
+        catch (Exception exception)
+        {
+            Volatile.Write(
+                ref _audioInventoryCacheExpiresAt,
+                GetExpirationTimestamp(MissingPlaybackDeviceCacheLifetime));
+            _logger.LogWarning(
+                "Fallback audio inventory refresh failed because of {ErrorType}",
+                exception.GetType().Name);
+        }
+        finally
+        {
+            Volatile.Write(ref _audioInventoryRefreshScheduled, 0);
+        }
+    }
+
+    private static bool AudioInventoriesEqual(
+        AudioDevicesSnapshot left,
+        AudioDevicesSnapshot right) =>
+        string.Equals(left.SelectedOutputDeviceId, right.SelectedOutputDeviceId, StringComparison.Ordinal) &&
+        string.Equals(left.SelectedInputDeviceId, right.SelectedInputDeviceId, StringComparison.Ordinal) &&
+        left.OutputDevices.SequenceEqual(right.OutputDevices) &&
+        left.InputDevices.SequenceEqual(right.InputDevices);
 
     private int? ResolveOutputDeviceIndex(string deviceId, bool requireAvailable)
     {
@@ -876,11 +1083,11 @@ public sealed class SipRuntime : ISipRuntime
         throw new InvalidOperationException("Audio output device is unavailable.");
     }
 
-    private static int? ResolveInputDeviceIndex(string deviceId, bool requireAvailable)
+    private int? ResolveInputDeviceIndex(string deviceId, bool requireAvailable)
     {
         if (deviceId == AudioPreferences.SystemDefaultDeviceId)
         {
-            if (WaveIn.DeviceCount > 0) return 0;
+            if (GetInputDeviceCount() > 0) return 0;
             if (!requireAvailable) return null;
             throw new InvalidOperationException("Audio input device is unavailable.");
         }
@@ -888,44 +1095,104 @@ public sealed class SipRuntime : ISipRuntime
         WaveDeviceEntry? selected = EnumerateInputDevices()
             .FirstOrDefault(device => device.DeviceId == deviceId);
         if (selected is not null) return selected.DeviceIndex;
-        if (!requireAvailable) return WaveIn.DeviceCount > 0 ? 0 : null;
+        if (!requireAvailable) return GetInputDeviceCount() > 0 ? 0 : null;
         throw new InvalidOperationException("Audio input device is unavailable.");
     }
 
-    private static IReadOnlyList<WaveDeviceEntry> EnumerateOutputDevices()
+    private IReadOnlyList<WaveDeviceEntry> EnumerateOutputDevices()
     {
         var devices = new List<WaveDeviceEntry>
         {
             new(AudioPreferences.SystemDefaultDeviceId, "System default", -1, true)
         };
-        for (int index = 0; index < WaveOut.DeviceCount; index++)
+        var identifierCounts = new Dictionary<string, int>(StringComparer.Ordinal);
+        int deviceCount = GetOutputDeviceCount();
+        for (int index = 0; index < deviceCount; index++)
         {
-            WaveOutCapabilities capabilities = WaveOut.GetCapabilities(index);
-            devices.Add(new WaveDeviceEntry(
-                CreateDeviceId("output", capabilities.ProductGuid, capabilities.NameGuid, capabilities.ProductName),
-                capabilities.ProductName,
-                index,
-                false));
+            try
+            {
+                WaveOutCapabilities capabilities = WaveOut.GetCapabilities(index);
+                string identifier = EnsureUniqueDeviceId(
+                    CreateDeviceId("output", capabilities.ProductGuid, capabilities.NameGuid, capabilities.ProductName),
+                    identifierCounts);
+                devices.Add(new WaveDeviceEntry(
+                    identifier,
+                    capabilities.ProductName,
+                    index,
+                    false));
+            }
+            catch (Exception exception)
+            {
+                _logger.LogWarning(
+                    "Audio output device enumeration skipped index {DeviceIndex} because of {ErrorType}",
+                    index,
+                    exception.GetType().Name);
+            }
         }
         return devices;
     }
 
-    private static IReadOnlyList<WaveDeviceEntry> EnumerateInputDevices()
+    private IReadOnlyList<WaveDeviceEntry> EnumerateInputDevices()
     {
         var devices = new List<WaveDeviceEntry>
         {
             new(AudioPreferences.SystemDefaultDeviceId, "System default", 0, true)
         };
-        for (int index = 0; index < WaveIn.DeviceCount; index++)
+        var identifierCounts = new Dictionary<string, int>(StringComparer.Ordinal);
+        int deviceCount = GetInputDeviceCount();
+        for (int index = 0; index < deviceCount; index++)
         {
-            WaveInCapabilities capabilities = WaveIn.GetCapabilities(index);
-            devices.Add(new WaveDeviceEntry(
-                CreateDeviceId("input", capabilities.ProductGuid, capabilities.NameGuid, capabilities.ProductName),
-                capabilities.ProductName,
-                index,
-                false));
+            try
+            {
+                WaveInCapabilities capabilities = WaveIn.GetCapabilities(index);
+                string identifier = EnsureUniqueDeviceId(
+                    CreateDeviceId("input", capabilities.ProductGuid, capabilities.NameGuid, capabilities.ProductName),
+                    identifierCounts);
+                devices.Add(new WaveDeviceEntry(
+                    identifier,
+                    capabilities.ProductName,
+                    index,
+                    false));
+            }
+            catch (Exception exception)
+            {
+                _logger.LogWarning(
+                    "Audio input device enumeration skipped index {DeviceIndex} because of {ErrorType}",
+                    index,
+                    exception.GetType().Name);
+            }
         }
         return devices;
+    }
+
+    private int GetOutputDeviceCount()
+    {
+        try
+        {
+            return Math.Max(0, WaveOut.DeviceCount);
+        }
+        catch (Exception exception)
+        {
+            _logger.LogWarning(
+                "Audio output device count is unavailable because of {ErrorType}",
+                exception.GetType().Name);
+            return 0;
+        }
+    }
+
+    private int GetInputDeviceCount()
+    {
+        try
+        {
+            return Math.Max(0, WaveIn.DeviceCount);
+        }
+        catch (Exception exception)
+        {
+            _logger.LogWarning(
+                "Audio input device count is unavailable because of {ErrorType}",
+                exception.GetType().Name);
+            return 0;
+        }
     }
 
     private static AudioDeviceSnapshot ToSnapshot(WaveDeviceEntry device) =>
@@ -936,6 +1203,15 @@ public sealed class SipRuntime : ISipRuntime
         byte[] hash = SHA256.HashData(
             Encoding.UTF8.GetBytes($"{kind}\n{productGuid:D}\n{nameGuid:D}\n{label}"));
         return $"{kind}-{Convert.ToHexString(hash.AsSpan(0, 12)).ToLowerInvariant()}";
+    }
+
+    private static string EnsureUniqueDeviceId(
+        string identifier,
+        Dictionary<string, int> identifierCounts)
+    {
+        int occurrence = identifierCounts.GetValueOrDefault(identifier) + 1;
+        identifierCounts[identifier] = occurrence;
+        return occurrence == 1 ? identifier : $"{identifier}-{occurrence}";
     }
 
     private static byte[] CreateTestTone(WaveFormat format, TimeSpan duration)
@@ -963,9 +1239,10 @@ public sealed class SipRuntime : ISipRuntime
     {
         long started = Stopwatch.GetTimestamp();
         long generation;
+        long now = Stopwatch.GetTimestamp();
         lock (_audioNotificationGate)
         {
-            if (_playbackDeviceCacheValid)
+            if (_playbackDeviceCacheValid && now < _playbackDeviceCacheExpiresAt)
             {
                 AgentPerformanceTelemetry.RecordAudioProbe(
                     Stopwatch.GetElapsedTime(started),
@@ -983,6 +1260,10 @@ public sealed class SipRuntime : ISipRuntime
             {
                 _cachedPlaybackDevice = discovered;
                 _playbackDeviceCacheValid = true;
+                _playbackDeviceCacheExpiresAt = GetExpirationTimestamp(
+                    discovered.HasValue
+                        ? PlaybackDeviceCacheLifetime
+                        : MissingPlaybackDeviceCacheLifetime);
             }
         }
 
@@ -991,6 +1272,31 @@ public sealed class SipRuntime : ISipRuntime
             cacheHit: false);
         return discovered;
     }
+
+    private void InvalidatePlaybackDeviceCache()
+    {
+        lock (_audioNotificationGate)
+        {
+            _audioDeviceGeneration++;
+            _cachedPlaybackDevice = null;
+            _playbackDeviceCacheValid = false;
+            _playbackDeviceCacheExpiresAt = 0;
+            _volumeController.Invalidate();
+        }
+    }
+
+    private void InvalidateAudioDeviceCachesCore()
+    {
+        _audioDeviceGeneration++;
+        _cachedPlaybackDevice = null;
+        _playbackDeviceCacheValid = false;
+        _playbackDeviceCacheExpiresAt = 0;
+        Volatile.Write(ref _audioInventoryCacheExpiresAt, 0);
+        _volumeController.Invalidate();
+    }
+
+    private static long GetExpirationTimestamp(TimeSpan lifetime) =>
+        Stopwatch.GetTimestamp() + (long)(lifetime.TotalSeconds * Stopwatch.Frequency);
 
     private async Task CleanupMediaAsync()
     {
@@ -1033,17 +1339,17 @@ public sealed class SipRuntime : ISipRuntime
         CancellationToken token;
         lock (_audioNotificationGate)
         {
-            _audioDeviceGeneration++;
-            _cachedPlaybackDevice = null;
-            _playbackDeviceCacheValid = false;
-            _volumeController.Invalidate();
+            InvalidateAudioDeviceCachesCore();
+            Volatile.Write(
+                ref _audioInventoryCacheExpiresAt,
+                GetExpirationTimestamp(TimeSpan.FromSeconds(1)));
             _audioNotificationDebounce?.Cancel();
             _audioNotificationDebounce?.Dispose();
             _audioNotificationDebounce = new CancellationTokenSource();
             token = _audioNotificationDebounce.Token;
         }
 
-        _ = RefreshAudioInventoryAfterDebounceAsync(token);
+        TrackBackground(RefreshAudioInventoryAfterDebounceAsync(token));
     }
 
     private async Task RefreshAudioInventoryAfterDebounceAsync(CancellationToken cancellationToken)
@@ -1051,12 +1357,18 @@ public sealed class SipRuntime : ISipRuntime
         try
         {
             await Task.Delay(TimeSpan.FromMilliseconds(500), cancellationToken);
+            if (_disposed)
+            {
+                return;
+            }
+
             string previous = AudioState;
-            AudioState = GetAudioState();
+            AudioDevicesSnapshot inventory = RefreshAudioDevicesSnapshotCore();
+            AudioState = GetAudioState(inventory);
             _logger.LogInformation(
                 "Audio inventory changed: captureDevices={CaptureCount}, playbackDevices={PlaybackCount}, state={State}",
-                WaveIn.DeviceCount,
-                WaveOut.DeviceCount,
+                Math.Max(0, inventory.InputDevices.Count - 1),
+                Math.Max(0, inventory.OutputDevices.Count - 1),
                 AudioState);
             Emit(new SipSignal(SipSignalType.AudioInventoryChanged, SafeCode: "audio_devices_changed"));
             if (AudioState == "degraded" && previous != AudioState && _userAgent.IsCallActive)
@@ -1086,8 +1398,10 @@ public sealed class SipRuntime : ISipRuntime
         }
     }
 
-    private static string GetAudioState() =>
-        WaveIn.DeviceCount > 0 && WaveOut.DeviceCount > 0 ? "ready" : "degraded";
+    private static string GetAudioState(AudioDevicesSnapshot inventory) =>
+        inventory.InputDevices.Count > 1 && inventory.OutputDevices.Count > 1
+            ? "ready"
+            : "degraded";
 
     private void Emit(SipSignal signal)
     {

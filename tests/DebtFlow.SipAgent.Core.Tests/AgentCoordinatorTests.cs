@@ -373,6 +373,56 @@ public sealed class AgentCoordinatorTests
     }
 
     [Fact]
+    public async Task AudioDeviceTest_ReservesIdleStateAndRejectsConcurrentCalls()
+    {
+        await using CoordinatorFixture fixture = await CoordinatorFixture.CreateAsync();
+        await fixture.RegisterAsync();
+        fixture.Runtime.BlockInputDeviceTest = true;
+
+        Task test = fixture.Coordinator.TestInputDeviceAsync(
+            new AudioDeviceTestCommand(NewId(), "input-jabra"),
+            CancellationToken.None);
+        await fixture.Runtime.InputDeviceTestStarted.Task.WaitAsync(TimeSpan.FromSeconds(1));
+
+        AgentCommandException outbound = await Assert.ThrowsAsync<AgentCommandException>(
+            () => fixture.Coordinator.StartCallAsync(
+                new CallStartCommand(NewId(), NewId(), "1001", "diagnostic-only"),
+                CancellationToken.None));
+        Assert.Equal("audio_device_busy", outbound.ErrorCode);
+
+        await fixture.Runtime.EmitAsync(new SipSignal(SipSignalType.IncomingCall, Caller: "1002"));
+        Assert.Equal(1, fixture.Runtime.RejectUnavailableCount);
+        Assert.Empty((await fixture.Coordinator.GetSnapshotAsync(CancellationToken.None)).ActiveCalls);
+
+        fixture.Runtime.ReleaseInputDeviceTest();
+        await test.WaitAsync(TimeSpan.FromSeconds(1));
+
+        await fixture.Coordinator.StartCallAsync(
+            new CallStartCommand(NewId(), NewId(), "1003", "diagnostic-only"),
+            CancellationToken.None);
+        Assert.Equal(1, fixture.Runtime.StartCallCount);
+    }
+
+    [Fact]
+    public async Task AudioDeviceTest_WhenRuntimeCancels_ReleasesReservation()
+    {
+        await using CoordinatorFixture fixture = await CoordinatorFixture.CreateAsync();
+        await fixture.RegisterAsync();
+        fixture.Runtime.CancelInputDeviceTest = true;
+
+        AgentCommandException exception = await Assert.ThrowsAsync<AgentCommandException>(
+            () => fixture.Coordinator.TestInputDeviceAsync(
+                new AudioDeviceTestCommand(NewId(), "input-jabra"),
+                CancellationToken.None));
+        Assert.Equal("sip_operation_timeout", exception.ErrorCode);
+
+        await fixture.Coordinator.StartCallAsync(
+            new CallStartCommand(NewId(), NewId(), "1004", "diagnostic-only"),
+            CancellationToken.None);
+        Assert.Equal(1, fixture.Runtime.StartCallCount);
+    }
+
+    [Fact]
     public async Task AudioControls_RejectInvalidStateAndOutOfRangeVolume()
     {
         await using CoordinatorFixture fixture = await CoordinatorFixture.CreateAsync();
@@ -960,6 +1010,51 @@ public sealed class AgentCoordinatorTests
     }
 
     [Fact]
+    public async Task StartCall_WhenAppendDetectsCapacity_RollsBackInMemoryCallState()
+    {
+        string directory = Path.Combine(Path.GetTempPath(), $"sip-agent-capacity-race-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(directory);
+        var store = new SqliteAgentEventStore(Path.Combine(directory, "agent.db"));
+        await store.InitializeAsync(CancellationToken.None);
+        var failingStore = new FailingAppendEventStore(store)
+        {
+            FailAppends = true,
+            AppendFailure = new AgentStoreException("outbox_capacity_critical")
+        };
+        var runtime = new FakeSipRuntime();
+        await using var coordinator = new AgentCoordinator(
+            runtime,
+            failingStore,
+            new NullPublisher(),
+            new FixedClock(),
+            new GuidAgentIdGenerator());
+
+        try
+        {
+            await coordinator.ConfigureAsync(
+                new ConfigureCommand(NewId(), "192.0.2.10", 5060, "user", "password"),
+                CancellationToken.None);
+            await coordinator.StartRegistrationAsync(CancellationToken.None);
+            await runtime.EmitAsync(new SipSignal(SipSignalType.RegistrationRegistered));
+
+            AgentCommandException exception = await Assert.ThrowsAsync<AgentCommandException>(
+                () => coordinator.StartCallAsync(
+                    new CallStartCommand(NewId(), NewId(), "1001", "context"),
+                    CancellationToken.None));
+
+            Assert.Equal("outbox_capacity_critical", exception.ErrorCode);
+            Assert.Empty((await coordinator.GetSnapshotAsync(CancellationToken.None)).ActiveCalls);
+            Assert.Equal(0, runtime.StartCallCount);
+        }
+        finally
+        {
+            await coordinator.DisposeAsync();
+            await store.DisposeAsync();
+            Directory.Delete(directory, true);
+        }
+    }
+
+    [Fact]
     public async Task FakeLifecycle_OneThousandSequentialCalls_HasOneTerminalEventPerCall()
     {
         await using CoordinatorFixture fixture = await CoordinatorFixture.CreateAsync();
@@ -1091,6 +1186,12 @@ public sealed class AgentCoordinatorTests
         public int RejectCount { get; private set; }
         public string? LastTestedOutputDeviceId { get; private set; }
         public string? LastTestedInputDeviceId { get; private set; }
+        public bool BlockInputDeviceTest { get; set; }
+        public bool CancelInputDeviceTest { get; set; }
+        public TaskCompletionSource InputDeviceTestStarted { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private TaskCompletionSource InputDeviceTestReleased { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
 
         public async Task EmitAsync(SipSignal signal)
         {
@@ -1226,11 +1327,22 @@ public sealed class AgentCoordinatorTests
             return Task.CompletedTask;
         }
 
-        public Task<int> TestInputDeviceAsync(string deviceId, CancellationToken cancellationToken)
+        public async Task<int> TestInputDeviceAsync(string deviceId, CancellationToken cancellationToken)
         {
             LastTestedInputDeviceId = deviceId;
-            return Task.FromResult(42);
+            InputDeviceTestStarted.TrySetResult();
+            if (CancelInputDeviceTest)
+            {
+                throw new OperationCanceledException(cancellationToken);
+            }
+            if (BlockInputDeviceTest)
+            {
+                await InputDeviceTestReleased.Task.WaitAsync(cancellationToken);
+            }
+            return 42;
         }
+
+        public void ReleaseInputDeviceTest() => InputDeviceTestReleased.TrySetResult();
 
         public ValueTask DisposeAsync()
         {
@@ -1244,6 +1356,7 @@ public sealed class AgentCoordinatorTests
         private int _appendAttempts;
         public bool FailAppends { get; set; }
         public int? FailOnAppendAttempt { get; init; }
+        public Exception? AppendFailure { get; init; }
         public string AgentInstanceId => inner.AgentInstanceId;
         public long LastSequence => inner.LastSequence;
         public long LastAcknowledgedSequence => inner.LastAcknowledgedSequence;
@@ -1255,7 +1368,8 @@ public sealed class AgentCoordinatorTests
         {
             int attempt = Interlocked.Increment(ref _appendAttempts);
             return FailAppends || attempt == FailOnAppendAttempt
-                ? Task.FromException<StoredDurableEvent>(new IOException("simulated_outbox_failure"))
+                ? Task.FromException<StoredDurableEvent>(
+                    AppendFailure ?? new IOException("simulated_outbox_failure"))
                 : inner.AppendAsync(draft, cancellationToken);
         }
 
@@ -1267,7 +1381,8 @@ public sealed class AgentCoordinatorTests
         {
             int attempt = Interlocked.Increment(ref _appendAttempts);
             return FailAppends || attempt == FailOnAppendAttempt
-                ? Task.FromException<StoredDurableEvent>(new IOException("simulated_outbox_failure"))
+                ? Task.FromException<StoredDurableEvent>(
+                    AppendFailure ?? new IOException("simulated_outbox_failure"))
                 : inner.AppendCallEventAsync(draft, callState, terminal, cancellationToken);
         }
 

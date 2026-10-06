@@ -69,8 +69,8 @@ public sealed class SqliteAgentEventStoreTests
     {
         string directory = CreateTemporaryDirectory();
         string path = Path.Combine(directory, "agent.db");
-        DateTimeOffset firstAt = DateTimeOffset.Parse("2026-10-06T01:00:00Z");
-        DateTimeOffset secondAt = firstAt.AddSeconds(5);
+        DateTimeOffset firstAt = DateTimeOffset.Parse("2026-10-06T08:00:05+07:00");
+        DateTimeOffset secondAt = firstAt.AddSeconds(-5).ToOffset(TimeSpan.FromHours(-5));
         try
         {
             await using var store = new SqliteAgentEventStore(path);
@@ -80,7 +80,7 @@ public sealed class SqliteAgentEventStoreTests
 
             EventStoreHealth initial = await store.GetHealthAsync(CancellationToken.None);
             Assert.Equal(2, initial.PendingEventCount);
-            Assert.Equal(firstAt, initial.OldestPendingAtUtc);
+            Assert.Equal(secondAt, initial.OldestPendingAtUtc);
             Assert.True(initial.StorageBytes > 0);
 
             await store.AcknowledgeThroughAsync(1, CancellationToken.None);
@@ -92,6 +92,35 @@ public sealed class SqliteAgentEventStoreTests
             EventStoreHealth afterSecondAck = await store.GetHealthAsync(CancellationToken.None);
             Assert.Equal(0, afterSecondAck.PendingEventCount);
             Assert.Null(afterSecondAck.OldestPendingAtUtc);
+        }
+        finally
+        {
+            Directory.Delete(directory, true);
+        }
+    }
+
+    [Fact]
+    public async Task CachedHealth_RefreshesStorageBytesAfterCommandJournalMutation()
+    {
+        string directory = CreateTemporaryDirectory();
+        string path = Path.Combine(directory, "agent.db");
+        try
+        {
+            await using var store = new SqliteAgentEventStore(path);
+            await store.InitializeAsync(CancellationToken.None);
+            EventStoreHealth before = await store.GetHealthAsync(CancellationToken.None);
+
+            await store.SaveCommandAsync(
+                new ProcessedCommand(
+                    Guid.NewGuid().ToString("D"),
+                    "state.get",
+                    new string('a', 64),
+                    new string('x', 512 * 1024),
+                    DateTimeOffset.UtcNow),
+                CancellationToken.None);
+
+            EventStoreHealth after = await store.GetHealthAsync(CancellationToken.None);
+            Assert.True(after.StorageBytes > before.StorageBytes);
         }
         finally
         {

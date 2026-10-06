@@ -94,7 +94,7 @@ SPDX SBOM, release manifestและ SHA-256 checksum; target machineไม่�
 เก็บ P5 D baseline/optimized CPU, memory, handlesและ threadsจาก Agentที่กำลังทำงานด้วย:
 
 ```powershell
-./scripts/measure-p5d-performance.ps1 -ProcessId <agent-pid> -DurationSeconds 900
+./scripts/measure-p5d-performance.ps1 -ProcessId <agent-pid> -DurationSeconds 900 -CollectRuntimeCounters
 ```
 
 บันทึก control latency, replay 250/1,000/10,000 events และ device-change evidenceใน
@@ -143,8 +143,10 @@ instance หลักกำลังทำงาน. Exit codeคือ `0` succ
 - outbox warning 80%, block สายใหม่ 90%, hard ceiling 10,000 pending events หรือ DB+WAL 100 MiB
 - registration retry ใช้ exponential full jitter 2–60 วินาที, cancel ด้วย generation และ reset หลัง registered 5 นาที
 - audio default-device change ถูก debounce; device loss ระหว่างสายแสดง degraded โดยไม่ตัด SIP call
-- snapshotใช้ cached storage health, replay batchทีละ 250 eventsและ audio device/session cacheถูก invalidate
-  เมื่อ Windows แจ้ง inventory change
+- snapshotใช้ cached storage health, replay batchทีละ 250 events และ cached immutable audio inventory;
+  Windows notification หรือ fallback 30 วินาที refresh cache นอก coordinator hot path
+- audio preference/test reserve idle state เพื่อไม่ชน inbound/outbound call; playback cache มี bounded TTL และ
+  endpoint create retry/fallback เมื่อ device หายระหว่าง enumeration
 - outbox runtime failure ทำ Agent degraded/fail closed; shutdown checkpoint/hangup/unregister แบบ best effort
 - structured logger เก็บเฉพาะ template/safe properties และ redacts sensitive values
 - diagnostic ZIP มี safe summary และ bounded sanitized logs; ไม่รวม DB/config/credential/raw Origin
@@ -166,3 +168,6 @@ instance หลักกำลังทำงาน. Exit codeคือ `0` succ
 - P5 D performance source resultอยู่ที่
   [performance hardening result](docs/plan-results/2026-10-06-p5d-performance-hardening-result.md);
   Windows baseline comparison, replay 10,000 events, device matrixและ soakยัง pending
+- meticulous follow-up plan/resultอยู่ที่
+  [07/10/2026 hardening result](docs/plan-results/2026-10-07-sip-agent-meticulous-hardening-result.md);
+  source fixes ครบแล้ว แต่ logger/audio fault evidence ยังต้องรันบน Windows

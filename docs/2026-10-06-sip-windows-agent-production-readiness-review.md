@@ -38,7 +38,7 @@ Owner risk acceptance เดิมเรื่อง allow-all Origin, unsigned 
 | รายการ | ผล |
 | --- | --- |
 | Release build | PASS, 0 warnings, 0 errors |
-| Core tests ณ implementation ล่าสุด | PASS, 79/79 |
+| Core tests ณ implementation ล่าสุด | PASS, 86/86 |
 | Inbound answer regression | PASS: connected callback ก่อน `AnswerAsync` return ไม่ deadlock |
 | Locked restore พร้อม `NuGetAuditMode=all` | PASS โดยไม่มี vulnerability advisory warning |
 | Windows host tests | COMPILE PASS; NOT RUN บน macOS เนื่องจากไม่มี Windows Desktop runtime |
@@ -65,6 +65,26 @@ Owner risk acceptance เดิมเรื่อง allow-all Origin, unsigned 
 
 ข้อยกเว้นที่ยืนยันและยังคงอยู่: unauthenticated allow-all WSS, unsigned ZIP, full-target rollout ไม่มี canary
 และ plaintext SQLite/WAL. สถานะสุดท้ายจึงใช้คำว่า `released with approved exceptions` เท่านั้น.
+
+## Meticulous follow-up — 07/10/2026
+
+การ recheck หลัง P5 D ปิด source gaps เพิ่มเติมโดยไม่เปลี่ยน protocol/schema/version:
+
+- coordinator reserve audio preference/test ตลอด operation; outbound ได้ `audio_device_busy` และ inbound
+  ตอบ unavailable แทนการชนกับ device I/O
+- tray/snapshot อ่าน immutable audio inventory cache; Windows notification หรือ bounded 30-second fallback
+  refresh นอก coordinator hot path
+- playback cache มี positive/negative TTL, duplicate device ID ถูกแยกใน inventory เดียวกัน และ endpoint
+  initialization retry/fallback เมื่ออุปกรณ์หายระหว่าง enumeration
+- command-journal mutation ทำ cached DB+WAL size dirty ก่อน capacity health; oldest-pending ใช้เวลาที่เก่าจริง
+  พร้อม canonical UTC persistence
+- call start rollback in-memory state เมื่อ durable append พบ capacity/store failure ก่อน SIP side effect
+- logger writer เก็บ pending line, retry 100 ms–5 s และเพิ่ม `sip_agent.logging.writer_failures`
+- Windows sampler schema v2 เก็บ resource growth และเปิด `dotnet-counters` ได้ด้วย
+  `-CollectRuntimeCounters`
+
+รายละเอียด plan/result และ residual Windows gates อยู่ที่
+[`2026-10-07-sip-agent-meticulous-hardening-result.md`](plan-results/2026-10-07-sip-agent-meticulous-hardening-result.md).
 
 ## ระดับความรุนแรง
 

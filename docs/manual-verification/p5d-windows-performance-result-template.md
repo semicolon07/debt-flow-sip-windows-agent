@@ -15,14 +15,19 @@
 
 ## Baseline and optimized runtime
 
-Run `scripts\measure-p5d-performance.ps1` against the same process workload before and after the change.
-Attach both generated summary JSON files and sample CSV files.
-On a validation host with the .NET diagnostic tools, collect `System.Runtime` and `DebtFlow.SipAgent`
-alongside the sampler so allocation rate, GC pauses, coordinator wait, storage latency, audio probes and replay
-duration can be compared without adding identifiers to application logs.
+Run the following command against the same process workload before and after the change:
 
-| Scenario | Duration | Idle CPU average and p95 | Working set p95 | Private memory p95 | Maximum handles | Result |
-| --- | ---: | --- | ---: | ---: | ---: | --- |
+```powershell
+scripts\measure-p5d-performance.ps1 -ProcessId <agent-pid> -DurationSeconds 900 -CollectRuntimeCounters
+```
+
+The optional switch requires `dotnet-counters`. Attach the generated summary JSON, process sample CSV and
+runtime counter CSV. Confirm `runtimeCounterCollectionSucceeded=true`; the counter file must contain
+`System.Runtime` and `DebtFlow.SipAgent` so allocation rate, GC pauses, coordinator wait, storage latency,
+audio probes, replay duration and logging failures can be compared without adding identifiers to application logs.
+
+| Scenario | Duration | CPU average and p95 | Working/private growth | Handle/thread change | Result |
+| --- | ---: | --- | --- | --- | --- |
 | Idle registered | 15 minutes | | | | | |
 | Active call | 15 minutes | | | | | |
 | 50 call or 2 hour soak | | | | | | |
@@ -35,6 +40,7 @@ duration can be compared without adding identifiers to application logs.
 | SQLite operation duration by bounded operation tag | | | |
 | Replay duration and event throughput | | | |
 | Process disk read and write rate | | | |
+| Logger dropped records and writer failures | | | |
 
 ## Control latency
 
@@ -66,6 +72,17 @@ duplicate an acknowledged durable sequence.
 | Default playback device changes | Cache invalidates and next call probes the new inventory | | |
 | Bluetooth disconnect during call | Media degradation is reported and cleanup completes | | |
 | Device returns before next call | New call initializes capture and playback successfully | | |
+| Inventory notification unavailable | Cached snapshot refreshes within 30 seconds without blocking tray/coordinator | | |
+| Audio test overlaps outbound call | Call command gets `audio_device_busy`; no SIP side effect | | |
+| Audio test overlaps inbound call | INVITE is rejected unavailable; test finishes and reservation releases | | |
+
+## Logger failure recovery
+
+| Scenario | Expected result | Evidence | Result |
+| --- | --- | --- | --- |
+| Log directory temporarily denied | Call control remains responsive; writer-failure counter increases | | |
+| Directory becomes writable | Pending line is persisted after bounded retry | | |
+| Disk remains unavailable during Exit | Shutdown remains bounded; process does not hang | | |
 
 ## Durability and privacy checks
 

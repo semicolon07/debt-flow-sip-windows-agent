@@ -6,7 +6,9 @@ public static class AgentPerformanceTelemetry
 {
     public const string MeterName = "DebtFlow.SipAgent";
 
-    private static readonly Meter Meter = new(MeterName, "1.0.0");
+    private static readonly Meter Meter = new(
+        MeterName,
+        typeof(AgentPerformanceTelemetry).Assembly.GetName().Version?.ToString() ?? "unknown");
     private static readonly Histogram<double> CoordinatorQueueWait = Meter.CreateHistogram<double>(
         "sip_agent.coordinator.queue_wait",
         unit: "ms");
@@ -25,6 +27,9 @@ public static class AgentPerformanceTelemetry
     private static readonly Counter<long> DroppedLogRecords = Meter.CreateCounter<long>(
         "sip_agent.logging.dropped_records",
         unit: "{record}");
+    private static readonly Counter<long> LogWriterFailures = Meter.CreateCounter<long>(
+        "sip_agent.logging.writer_failures",
+        unit: "{failure}");
 
     public static void RecordCoordinatorQueueWait(TimeSpan elapsed) =>
         CoordinatorQueueWait.Record(Math.Max(0, elapsed.TotalMilliseconds));
@@ -52,4 +57,9 @@ public static class AgentPerformanceTelemetry
             DroppedLogRecords.Add(count);
         }
     }
+
+    public static void RecordLogWriterFailure(string errorType) =>
+        LogWriterFailures.Add(
+            1,
+            new KeyValuePair<string, object?>("error_type", errorType));
 }
