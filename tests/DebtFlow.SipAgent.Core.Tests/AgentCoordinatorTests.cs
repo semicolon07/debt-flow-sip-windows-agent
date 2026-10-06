@@ -338,6 +338,41 @@ public sealed class AgentCoordinatorTests
     }
 
     [Fact]
+    public async Task AudioDevices_UpdateAndTestOnlyWithoutActiveCall()
+    {
+        await using CoordinatorFixture fixture = await CoordinatorFixture.CreateAsync();
+
+        await fixture.Coordinator.SetAudioDevicePreferencesAsync(
+            new AudioDevicePreferenceCommand(NewId(), "output-realtek", "input-jabra"),
+            CancellationToken.None);
+        await fixture.Coordinator.TestOutputDeviceAsync(
+            new AudioDeviceTestCommand(NewId(), "output-realtek"),
+            CancellationToken.None);
+        await fixture.Coordinator.TestInputDeviceAsync(
+            new AudioDeviceTestCommand(NewId(), "input-jabra"),
+            CancellationToken.None);
+
+        AgentSnapshotPayload snapshot = await fixture.Coordinator.GetSnapshotAsync(CancellationToken.None);
+        AudioDevicesSnapshot devices = Assert.IsType<AudioDevicesSnapshot>(snapshot.AudioDevices);
+        Assert.Equal("output-realtek", devices.SelectedOutputDeviceId);
+        Assert.Equal("input-jabra", devices.SelectedInputDeviceId);
+        Assert.Equal("output-realtek", fixture.Runtime.LastTestedOutputDeviceId);
+        Assert.Equal("input-jabra", fixture.Runtime.LastTestedInputDeviceId);
+
+        await fixture.RegisterAsync();
+        string callId = NewId();
+        await fixture.Coordinator.StartCallAsync(
+            new CallStartCommand(NewId(), callId, "0812345678", "diagnostic-only"),
+            CancellationToken.None);
+
+        AgentCommandException exception = await Assert.ThrowsAsync<AgentCommandException>(
+            () => fixture.Coordinator.SetAudioDevicePreferencesAsync(
+                new AudioDevicePreferenceCommand(NewId(), "system-default", "system-default"),
+                CancellationToken.None));
+        Assert.Equal("call_in_progress", exception.ErrorCode);
+    }
+
+    [Fact]
     public async Task AudioControls_RejectInvalidStateAndOutOfRangeVolume()
     {
         await using CoordinatorFixture fixture = await CoordinatorFixture.CreateAsync();
@@ -1040,6 +1075,11 @@ public sealed class AgentCoordinatorTests
         public bool IsMicrophoneMuted { get; private set; }
         public int OutputVolume { get; private set; } = 100;
         public int InputVolume { get; private set; } = 100;
+        public AudioDevicesSnapshot AudioDevices { get; private set; } = new(
+            [new AudioDeviceSnapshot("system-default", "System default", true)],
+            [new AudioDeviceSnapshot("system-default", "System default", true)],
+            "system-default",
+            "system-default");
         public char? LastDtmf { get; private set; }
         public int StopRegistrationCount { get; private set; }
         public int RejectUnavailableCount { get; private set; }
@@ -1049,6 +1089,8 @@ public sealed class AgentCoordinatorTests
         public int StartRegistrationCount { get; private set; }
         public int AnswerCount { get; private set; }
         public int RejectCount { get; private set; }
+        public string? LastTestedOutputDeviceId { get; private set; }
+        public string? LastTestedInputDeviceId { get; private set; }
 
         public async Task EmitAsync(SipSignal signal)
         {
@@ -1163,6 +1205,31 @@ public sealed class AgentCoordinatorTests
         {
             InputVolume = volume;
             return Task.CompletedTask;
+        }
+
+        public Task SetAudioDevicePreferencesAsync(
+            string outputDeviceId,
+            string inputDeviceId,
+            CancellationToken cancellationToken)
+        {
+            AudioDevices = AudioDevices with
+            {
+                SelectedOutputDeviceId = outputDeviceId,
+                SelectedInputDeviceId = inputDeviceId
+            };
+            return Task.CompletedTask;
+        }
+
+        public Task TestOutputDeviceAsync(string deviceId, CancellationToken cancellationToken)
+        {
+            LastTestedOutputDeviceId = deviceId;
+            return Task.CompletedTask;
+        }
+
+        public Task<int> TestInputDeviceAsync(string deviceId, CancellationToken cancellationToken)
+        {
+            LastTestedInputDeviceId = deviceId;
+            return Task.FromResult(42);
         }
 
         public ValueTask DisposeAsync()

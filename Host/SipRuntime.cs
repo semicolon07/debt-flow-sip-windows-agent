@@ -1,6 +1,8 @@
 using System.Net;
 using System.Collections.Concurrent;
 using System.Diagnostics;
+using System.Security.Cryptography;
+using System.Text;
 using System.Threading.Channels;
 using Microsoft.Extensions.Logging;
 using NAudio.CoreAudioApi;
@@ -12,6 +14,7 @@ using SIPSorcery.SIP.App;
 using SIPSorceryMedia.Abstractions;
 using SIPSorceryMedia.Windows;
 using DebtFlow.SipAgent.Application;
+using DebtFlow.SipAgent.Protocol;
 
 namespace DebtFlow.SipAgent.Host;
 
@@ -58,6 +61,8 @@ public sealed class SipRuntime : ISipRuntime
     private int _microphoneMuted;
     private int _outputVolume;
     private int _inputVolume;
+    private string _outputDeviceId;
+    private string _inputDeviceId;
     private long _registrationGeneration;
     private long _callGeneration;
     private long _backgroundTaskId;
@@ -75,6 +80,8 @@ public sealed class SipRuntime : ISipRuntime
         AudioPreferences preferences = audioPreferencesStore.Load();
         _outputVolume = preferences.OutputVolume;
         _inputVolume = preferences.InputVolume;
+        _outputDeviceId = preferences.OutputDeviceId;
+        _inputDeviceId = preferences.InputDeviceId;
         _transport = new SIPTransport();
         _transport.AddSIPChannel(new SIPUDPChannel(new IPEndPoint(IPAddress.Any, 0)));
         _transport.AddSIPChannel(new SIPTCPChannel(new IPEndPoint(IPAddress.Any, 0)));
@@ -108,6 +115,7 @@ public sealed class SipRuntime : ISipRuntime
     public bool IsMicrophoneMuted => Volatile.Read(ref _microphoneMuted) != 0;
     public int OutputVolume => Volatile.Read(ref _outputVolume);
     public int InputVolume => Volatile.Read(ref _inputVolume);
+    public AudioDevicesSnapshot AudioDevices => CreateAudioDevicesSnapshot();
 
     public Task ConfigureAsync(SipConfiguration configuration, CancellationToken cancellationToken)
     {
@@ -413,6 +421,89 @@ public sealed class SipRuntime : ISipRuntime
         return Task.CompletedTask;
     }
 
+    public Task SetAudioDevicePreferencesAsync(
+        string outputDeviceId,
+        string inputDeviceId,
+        CancellationToken cancellationToken)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        cancellationToken.ThrowIfCancellationRequested();
+        _ = ResolveOutputDeviceIndex(outputDeviceId, requireAvailable: true);
+        _ = ResolveInputDeviceIndex(inputDeviceId, requireAvailable: true);
+        bool changed = false;
+        lock (_audioNotificationGate)
+        {
+            if (!string.Equals(_outputDeviceId, outputDeviceId, StringComparison.Ordinal))
+            {
+                _outputDeviceId = outputDeviceId;
+                changed = true;
+            }
+            if (!string.Equals(_inputDeviceId, inputDeviceId, StringComparison.Ordinal))
+            {
+                _inputDeviceId = inputDeviceId;
+                changed = true;
+            }
+            _cachedPlaybackDevice = null;
+            _playbackDeviceCacheValid = false;
+            _volumeController.Invalidate();
+        }
+        if (changed) PersistAudioPreferences();
+        return Task.CompletedTask;
+    }
+
+    public async Task TestOutputDeviceAsync(string deviceId, CancellationToken cancellationToken)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        int deviceIndex = ResolveOutputDeviceIndex(deviceId, requireAvailable: true)
+            ?? throw new InvalidOperationException("Audio output device is unavailable.");
+        var format = new WaveFormat(16_000, 16, 1);
+        byte[] samples = CreateTestTone(format, TimeSpan.FromMilliseconds(650));
+        using var stream = new RawSourceWaveStream(new MemoryStream(samples, writable: false), format);
+        using var output = new WaveOut { DeviceNumber = deviceIndex };
+        output.Init(stream);
+        output.Play();
+        await Task.Delay(TimeSpan.FromMilliseconds(700), cancellationToken);
+        output.Stop();
+    }
+
+    public async Task<int> TestInputDeviceAsync(string deviceId, CancellationToken cancellationToken)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        int deviceIndex = ResolveInputDeviceIndex(deviceId, requireAvailable: true)
+            ?? throw new InvalidOperationException("Audio input device is unavailable.");
+        int peak = 0;
+        using var input = new WaveIn
+        {
+            DeviceNumber = deviceIndex,
+            WaveFormat = new WaveFormat(16_000, 16, 1),
+            BufferMilliseconds = 80
+        };
+        input.DataAvailable += (_, eventArgs) =>
+        {
+            for (int offset = 0; offset + 1 < eventArgs.BytesRecorded; offset += 2)
+            {
+                int sample = Math.Abs(BitConverter.ToInt16(eventArgs.Buffer, offset));
+                int observed;
+                do
+                {
+                    observed = Volatile.Read(ref peak);
+                    if (sample <= observed) break;
+                }
+                while (Interlocked.CompareExchange(ref peak, sample, observed) != observed);
+            }
+        };
+        input.StartRecording();
+        try
+        {
+            await Task.Delay(TimeSpan.FromMilliseconds(900), cancellationToken);
+        }
+        finally
+        {
+            input.StopRecording();
+        }
+        return Math.Clamp((int)Math.Round(Volatile.Read(ref peak) / 32767d * 100d), 0, 100);
+    }
+
     public async ValueTask DisposeAsync()
     {
         if (_disposed)
@@ -571,14 +662,15 @@ public sealed class SipRuntime : ISipRuntime
     private VoIPMediaSession CreateMediaSession(SipCallHandle call)
     {
         var encoder = new AudioEncoder();
-        bool hasCapture = WaveIn.DeviceCount > 0;
-        int? playbackDevice = GetWorkingPlaybackDevice();
+        int? captureDevice = ResolveInputDeviceIndex(_inputDeviceId, requireAvailable: false);
+        bool hasCapture = captureDevice.HasValue;
+        int? playbackDevice = ResolveOutputDeviceIndex(_outputDeviceId, requireAvailable: false);
         bool hasPlayback = playbackDevice.HasValue;
 
         _audioEndPoint = new WindowsAudioEndPoint(
             encoder,
             audioOutDeviceIndex: hasPlayback ? playbackDevice!.Value : -1,
-            audioInDeviceIndex: hasCapture ? 0 : -1,
+            audioInDeviceIndex: hasCapture ? captureDevice!.Value : -1,
             disableSource: !hasCapture,
             disableSink: !hasPlayback);
         Volatile.Write(ref _microphoneMuted, 0);
@@ -671,7 +763,15 @@ public sealed class SipRuntime : ISipRuntime
     {
         try
         {
-            _audioPreferencesStore.Save(new AudioPreferences(OutputVolume, InputVolume));
+            string outputDeviceId;
+            string inputDeviceId;
+            lock (_audioNotificationGate)
+            {
+                outputDeviceId = _outputDeviceId;
+                inputDeviceId = _inputDeviceId;
+            }
+            _audioPreferencesStore.Save(
+                new AudioPreferences(OutputVolume, InputVolume, outputDeviceId, inputDeviceId));
         }
         catch (Exception exception) when (
             exception is IOException or UnauthorizedAccessException or InvalidOperationException)
@@ -735,6 +835,129 @@ public sealed class SipRuntime : ISipRuntime
 
         return null;
     }
+
+    private AudioDevicesSnapshot CreateAudioDevicesSnapshot()
+    {
+        IReadOnlyList<WaveDeviceEntry> outputDevices = EnumerateOutputDevices();
+        IReadOnlyList<WaveDeviceEntry> inputDevices = EnumerateInputDevices();
+        string requestedOutput;
+        string requestedInput;
+        lock (_audioNotificationGate)
+        {
+            requestedOutput = _outputDeviceId;
+            requestedInput = _inputDeviceId;
+        }
+        string selectedOutput = outputDevices.Any(device => device.DeviceId == requestedOutput)
+            ? requestedOutput
+            : AudioPreferences.SystemDefaultDeviceId;
+        string selectedInput = inputDevices.Any(device => device.DeviceId == requestedInput)
+            ? requestedInput
+            : AudioPreferences.SystemDefaultDeviceId;
+        return new AudioDevicesSnapshot(
+            outputDevices.Select(ToSnapshot).ToArray(),
+            inputDevices.Select(ToSnapshot).ToArray(),
+            selectedOutput,
+            selectedInput);
+    }
+
+    private int? ResolveOutputDeviceIndex(string deviceId, bool requireAvailable)
+    {
+        if (deviceId == AudioPreferences.SystemDefaultDeviceId)
+        {
+            int? defaultDevice = GetWorkingPlaybackDevice();
+            if (defaultDevice.HasValue || !requireAvailable) return defaultDevice;
+            throw new InvalidOperationException("Audio output device is unavailable.");
+        }
+
+        WaveDeviceEntry? selected = EnumerateOutputDevices()
+            .FirstOrDefault(device => device.DeviceId == deviceId);
+        if (selected is not null) return selected.DeviceIndex;
+        if (!requireAvailable) return GetWorkingPlaybackDevice();
+        throw new InvalidOperationException("Audio output device is unavailable.");
+    }
+
+    private static int? ResolveInputDeviceIndex(string deviceId, bool requireAvailable)
+    {
+        if (deviceId == AudioPreferences.SystemDefaultDeviceId)
+        {
+            if (WaveIn.DeviceCount > 0) return 0;
+            if (!requireAvailable) return null;
+            throw new InvalidOperationException("Audio input device is unavailable.");
+        }
+
+        WaveDeviceEntry? selected = EnumerateInputDevices()
+            .FirstOrDefault(device => device.DeviceId == deviceId);
+        if (selected is not null) return selected.DeviceIndex;
+        if (!requireAvailable) return WaveIn.DeviceCount > 0 ? 0 : null;
+        throw new InvalidOperationException("Audio input device is unavailable.");
+    }
+
+    private static IReadOnlyList<WaveDeviceEntry> EnumerateOutputDevices()
+    {
+        var devices = new List<WaveDeviceEntry>
+        {
+            new(AudioPreferences.SystemDefaultDeviceId, "System default", -1, true)
+        };
+        for (int index = 0; index < WaveOut.DeviceCount; index++)
+        {
+            WaveOutCapabilities capabilities = WaveOut.GetCapabilities(index);
+            devices.Add(new WaveDeviceEntry(
+                CreateDeviceId("output", capabilities.ProductGuid, capabilities.NameGuid, capabilities.ProductName),
+                capabilities.ProductName,
+                index,
+                false));
+        }
+        return devices;
+    }
+
+    private static IReadOnlyList<WaveDeviceEntry> EnumerateInputDevices()
+    {
+        var devices = new List<WaveDeviceEntry>
+        {
+            new(AudioPreferences.SystemDefaultDeviceId, "System default", 0, true)
+        };
+        for (int index = 0; index < WaveIn.DeviceCount; index++)
+        {
+            WaveInCapabilities capabilities = WaveIn.GetCapabilities(index);
+            devices.Add(new WaveDeviceEntry(
+                CreateDeviceId("input", capabilities.ProductGuid, capabilities.NameGuid, capabilities.ProductName),
+                capabilities.ProductName,
+                index,
+                false));
+        }
+        return devices;
+    }
+
+    private static AudioDeviceSnapshot ToSnapshot(WaveDeviceEntry device) =>
+        new(device.DeviceId, device.Label, device.IsSystemDefault);
+
+    private static string CreateDeviceId(string kind, Guid productGuid, Guid nameGuid, string label)
+    {
+        byte[] hash = SHA256.HashData(
+            Encoding.UTF8.GetBytes($"{kind}\n{productGuid:D}\n{nameGuid:D}\n{label}"));
+        return $"{kind}-{Convert.ToHexString(hash.AsSpan(0, 12)).ToLowerInvariant()}";
+    }
+
+    private static byte[] CreateTestTone(WaveFormat format, TimeSpan duration)
+    {
+        int sampleCount = (int)(format.SampleRate * duration.TotalSeconds);
+        var bytes = new byte[sampleCount * 2];
+        const double frequency = 660d;
+        for (int index = 0; index < sampleCount; index++)
+        {
+            double envelope = Math.Min(1d, Math.Min(index / 400d, (sampleCount - index) / 400d));
+            short sample = (short)(Math.Sin(2d * Math.PI * frequency * index / format.SampleRate) *
+                                   short.MaxValue * 0.18d * envelope);
+            BitConverter.TryWriteBytes(bytes.AsSpan(index * 2, 2), sample);
+        }
+        return bytes;
+    }
+
+    private sealed record WaveDeviceEntry(
+        string DeviceId,
+        string Label,
+        int DeviceIndex,
+        bool IsSystemDefault);
 
     private int? GetWorkingPlaybackDevice()
     {

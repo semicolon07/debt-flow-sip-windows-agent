@@ -165,6 +165,9 @@ public sealed class LocalWebSocketServerTests
             Assert.Contains(
                 "audio.volume.preferences",
                 ProtocolCodec.DeserializePayload<WelcomePayload>(welcome.Payload).Capabilities);
+            Assert.Contains(
+                "audio.devices",
+                ProtocolCodec.DeserializePayload<WelcomePayload>(welcome.Payload).Capabilities);
             Assert.Equal("snapshot", snapshot.Kind);
             Assert.Equal("agent.snapshot", snapshot.Type);
 
@@ -272,6 +275,11 @@ public sealed class LocalWebSocketServerTests
         public bool IsMicrophoneMuted => false;
         public int OutputVolume => 100;
         public int InputVolume => 100;
+        public AudioDevicesSnapshot AudioDevices => new(
+            [new AudioDeviceSnapshot("system-default", "System default", true)],
+            [new AudioDeviceSnapshot("system-default", "System default", true)],
+            "system-default",
+            "system-default");
         public Task ConfigureAsync(SipConfiguration configuration, CancellationToken cancellationToken) => Task.CompletedTask;
         public Task StartRegistrationAsync(long generation, CancellationToken cancellationToken) => Task.CompletedTask;
         public Task StopRegistrationAsync(long generation, CancellationToken cancellationToken) => Task.CompletedTask;
@@ -286,6 +294,9 @@ public sealed class LocalWebSocketServerTests
         public Task SetInputVolumeAsync(SipCallHandle call, int volume, CancellationToken cancellationToken) => Task.CompletedTask;
         public Task SetOutputVolumePreferenceAsync(int volume, CancellationToken cancellationToken) => Task.CompletedTask;
         public Task SetInputVolumePreferenceAsync(int volume, CancellationToken cancellationToken) => Task.CompletedTask;
+        public Task SetAudioDevicePreferencesAsync(string outputDeviceId, string inputDeviceId, CancellationToken cancellationToken) => Task.CompletedTask;
+        public Task TestOutputDeviceAsync(string deviceId, CancellationToken cancellationToken) => Task.CompletedTask;
+        public Task<int> TestInputDeviceAsync(string deviceId, CancellationToken cancellationToken) => Task.FromResult(42);
         public ValueTask DisposeAsync()
         {
             _signals.Writer.TryComplete();

@@ -49,6 +49,32 @@ public sealed class V1CommandDispatcherTests
     }
 
     [Fact]
+    public async Task AudioDeviceCommands_DoNotRequireCallId()
+    {
+        await using DispatcherFixture fixture = await DispatcherFixture.CreateAsync();
+
+        byte[] preferenceResponse = await fixture.Dispatcher.DispatchAsync(
+            Envelope(
+                "audio.devices.preference.set",
+                new AudioDevicePreferenceCommand(ProtocolCodec.NewId(), "system-default", "system-default")),
+            CancellationToken.None);
+        byte[] outputTestResponse = await fixture.Dispatcher.DispatchAsync(
+            Envelope(
+                "audio.output.test",
+                new AudioDeviceTestCommand(ProtocolCodec.NewId(), "system-default")),
+            CancellationToken.None);
+        byte[] inputTestResponse = await fixture.Dispatcher.DispatchAsync(
+            Envelope(
+                "audio.input.test",
+                new AudioDeviceTestCommand(ProtocolCodec.NewId(), "system-default")),
+            CancellationToken.None);
+
+        Assert.True(Result(preferenceResponse).Accepted);
+        Assert.True(Result(outputTestResponse).Accepted);
+        Assert.True(Result(inputTestResponse).Accepted);
+    }
+
+    [Fact]
     public async Task UnsupportedCommand_IsRejectedBeforeJournalInsertion()
     {
         await using DispatcherFixture fixture = await DispatcherFixture.CreateAsync();
@@ -149,6 +175,11 @@ public sealed class V1CommandDispatcherTests
         public bool IsMicrophoneMuted => false;
         public int OutputVolume => 100;
         public int InputVolume => 100;
+        public AudioDevicesSnapshot AudioDevices => new(
+            [new AudioDeviceSnapshot("system-default", "System default", true)],
+            [new AudioDeviceSnapshot("system-default", "System default", true)],
+            "system-default",
+            "system-default");
         public Task ConfigureAsync(SipConfiguration configuration, CancellationToken cancellationToken) => Task.CompletedTask;
         public Task StartRegistrationAsync(long generation, CancellationToken cancellationToken) => Task.CompletedTask;
         public Task StopRegistrationAsync(long generation, CancellationToken cancellationToken) => Task.CompletedTask;
@@ -163,6 +194,9 @@ public sealed class V1CommandDispatcherTests
         public Task SetInputVolumeAsync(SipCallHandle call, int volume, CancellationToken cancellationToken) => Task.CompletedTask;
         public Task SetOutputVolumePreferenceAsync(int volume, CancellationToken cancellationToken) => Task.CompletedTask;
         public Task SetInputVolumePreferenceAsync(int volume, CancellationToken cancellationToken) => Task.CompletedTask;
+        public Task SetAudioDevicePreferencesAsync(string outputDeviceId, string inputDeviceId, CancellationToken cancellationToken) => Task.CompletedTask;
+        public Task TestOutputDeviceAsync(string deviceId, CancellationToken cancellationToken) => Task.CompletedTask;
+        public Task<int> TestInputDeviceAsync(string deviceId, CancellationToken cancellationToken) => Task.FromResult(42);
         public ValueTask DisposeAsync()
         {
             _signals.Writer.TryComplete();

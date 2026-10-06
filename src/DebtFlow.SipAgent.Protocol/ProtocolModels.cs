@@ -53,6 +53,13 @@ public sealed record CallVolumeCommand(string CommandId, string CallId, int Volu
 
 public sealed record AudioVolumePreferenceCommand(string CommandId, int Volume);
 
+public sealed record AudioDevicePreferenceCommand(
+    string CommandId,
+    string OutputDeviceId,
+    string InputDeviceId);
+
+public sealed record AudioDeviceTestCommand(string CommandId, string DeviceId);
+
 public sealed record AckPayload(string AgentInstanceId, long AcknowledgedThroughSequence);
 
 public sealed record WelcomePayload(
@@ -79,6 +86,17 @@ public sealed record AudioControlsSnapshot(
     int OutputVolume,
     int InputVolume);
 
+public sealed record AudioDeviceSnapshot(
+    string DeviceId,
+    string Label,
+    bool IsSystemDefault);
+
+public sealed record AudioDevicesSnapshot(
+    IReadOnlyList<AudioDeviceSnapshot> OutputDevices,
+    IReadOnlyList<AudioDeviceSnapshot> InputDevices,
+    string SelectedOutputDeviceId,
+    string SelectedInputDeviceId);
+
 public sealed record AgentSnapshotPayload(
     string AgentState,
     string RegistrationState,
@@ -91,7 +109,8 @@ public sealed record AgentSnapshotPayload(
     string? OutboxCapacityState = null,
     long? OutboxStorageBytes = null,
     long? OldestPendingAgeSeconds = null,
-    AudioControlsSnapshot? AudioControls = null);
+    AudioControlsSnapshot? AudioControls = null,
+    AudioDevicesSnapshot? AudioDevices = null);
 
 public sealed record DurableEventPayload(
     string Delivery,

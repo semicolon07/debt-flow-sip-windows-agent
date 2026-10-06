@@ -209,6 +209,52 @@ public sealed class AgentCoordinator : IAsyncDisposable
             token => _sipRuntime.SetInputVolumePreferenceAsync(command.Volume, token));
     }
 
+    public Task SetAudioDevicePreferencesAsync(
+        AudioDevicePreferenceCommand command,
+        CancellationToken cancellationToken) =>
+        ExecuteIdleAudioDeviceOperationAsync(
+            cancellationToken,
+            token => _sipRuntime.SetAudioDevicePreferencesAsync(
+                command.OutputDeviceId,
+                command.InputDeviceId,
+                token),
+            PublishAudioDevicesChangedAsync);
+
+    public Task TestOutputDeviceAsync(
+        AudioDeviceTestCommand command,
+        CancellationToken cancellationToken) =>
+        ExecuteIdleAudioDeviceOperationAsync(
+            cancellationToken,
+            token => _sipRuntime.TestOutputDeviceAsync(command.DeviceId, token));
+
+    public async Task TestInputDeviceAsync(
+        AudioDeviceTestCommand command,
+        CancellationToken cancellationToken)
+    {
+        await EnsureIdleAudioDeviceOperationAsync(cancellationToken);
+        using var operationTimeout = CancellationTokenSource.CreateLinkedTokenSource(_lifetime.Token);
+        operationTimeout.CancelAfter(TimeSpan.FromSeconds(5));
+        int level;
+        try
+        {
+            level = await _sipRuntime.TestInputDeviceAsync(command.DeviceId, operationTimeout.Token);
+        }
+        catch (OperationCanceledException) when (!_lifetime.IsCancellationRequested)
+        {
+            throw new AgentCommandException("sip_operation_timeout");
+        }
+        catch (Exception exception) when (exception is not AgentCommandException)
+        {
+            throw new AgentCommandException("audio_device_test_failed");
+        }
+        await EnqueueAsync(
+            token => PublishRealtimeAsync(
+                "audio.input.level",
+                new { deviceId = command.DeviceId, level },
+                token),
+            CancellationToken.None);
+    }
+
     public Task<AgentSnapshotPayload> GetSnapshotAsync(CancellationToken cancellationToken) =>
         EnqueueAsync(GetSnapshotCoreAsync, cancellationToken);
 
@@ -576,7 +622,8 @@ public sealed class AgentCoordinator : IAsyncDisposable
             new AudioControlsSnapshot(
                 _sipRuntime.IsMicrophoneMuted,
                 _sipRuntime.OutputVolume,
-                _sipRuntime.InputVolume));
+                _sipRuntime.InputVolume),
+            _sipRuntime.AudioDevices);
     }
 
     private Task PublishAudioControlsChangedAsync(
@@ -590,6 +637,51 @@ public sealed class AgentCoordinator : IAsyncDisposable
                 microphoneMuted = _sipRuntime.IsMicrophoneMuted,
                 outputVolume = _sipRuntime.OutputVolume,
                 inputVolume = _sipRuntime.InputVolume
+            },
+            cancellationToken);
+
+    private Task PublishAudioDevicesChangedAsync(CancellationToken cancellationToken) =>
+        PublishRealtimeAsync(
+            "audio.devices_changed",
+            _sipRuntime.AudioDevices,
+            cancellationToken);
+
+    private async Task ExecuteIdleAudioDeviceOperationAsync(
+        CancellationToken requestCancellationToken,
+        Func<CancellationToken, Task> action,
+        Func<CancellationToken, Task>? publish = null)
+    {
+        await EnsureIdleAudioDeviceOperationAsync(requestCancellationToken);
+        using var operationTimeout = CancellationTokenSource.CreateLinkedTokenSource(_lifetime.Token);
+        operationTimeout.CancelAfter(TimeSpan.FromSeconds(5));
+        try
+        {
+            await action(operationTimeout.Token);
+        }
+        catch (OperationCanceledException) when (!_lifetime.IsCancellationRequested)
+        {
+            throw new AgentCommandException("sip_operation_timeout");
+        }
+        catch (Exception exception) when (exception is not AgentCommandException)
+        {
+            throw new AgentCommandException("audio_device_control_failed");
+        }
+        if (publish is not null)
+        {
+            await EnqueueAsync(publish, CancellationToken.None);
+        }
+    }
+
+    private Task EnsureIdleAudioDeviceOperationAsync(CancellationToken cancellationToken) =>
+        EnqueueAsync(
+            token =>
+            {
+                token.ThrowIfCancellationRequested();
+                if (_call is { State: not CallState.Ended })
+                {
+                    throw new AgentCommandException("call_in_progress");
+                }
+                return Task.CompletedTask;
             },
             cancellationToken);
 
@@ -963,6 +1055,7 @@ public sealed class AgentCoordinator : IAsyncDisposable
                     "audio.state_changed",
                     new { state = _sipRuntime.AudioState, code = signal.SafeCode ?? "audio_devices_changed" },
                     cancellationToken);
+                await PublishAudioDevicesChangedAsync(cancellationToken);
                 break;
             case SipSignalType.DtmfReceived:
                 await EmitForCurrentCallCoreAsync("call.dtmf_received", new { received = true }, cancellationToken);

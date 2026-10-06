@@ -283,6 +283,21 @@ public sealed class V1CommandDispatcher(
                     ProtocolCodec.DeserializePayload<AudioVolumePreferenceCommand>(envelope.Payload),
                     cancellationToken);
                 break;
+            case "audio.devices.preference.set":
+                await coordinator.SetAudioDevicePreferencesAsync(
+                    ProtocolCodec.DeserializePayload<AudioDevicePreferenceCommand>(envelope.Payload),
+                    cancellationToken);
+                break;
+            case "audio.output.test":
+                await coordinator.TestOutputDeviceAsync(
+                    ProtocolCodec.DeserializePayload<AudioDeviceTestCommand>(envelope.Payload),
+                    cancellationToken);
+                break;
+            case "audio.input.test":
+                await coordinator.TestInputDeviceAsync(
+                    ProtocolCodec.DeserializePayload<AudioDeviceTestCommand>(envelope.Payload),
+                    cancellationToken);
+                break;
             case "state.get":
                 _ = ProtocolCodec.DeserializePayload<CommandHeader>(envelope.Payload);
                 break;
@@ -342,6 +357,10 @@ public sealed class V1CommandDispatcher(
             "audio.output.volume.preference.set" or "audio.input.volume.preference.set" =>
                 CanonicalizeVolumePreference(
                     ProtocolCodec.DeserializePayload<AudioVolumePreferenceCommand>(envelope.Payload)),
+            "audio.devices.preference.set" => CanonicalizeAudioDevicePreference(
+                ProtocolCodec.DeserializePayload<AudioDevicePreferenceCommand>(envelope.Payload)),
+            "audio.output.test" or "audio.input.test" => CanonicalizeAudioDeviceTest(
+                ProtocolCodec.DeserializePayload<AudioDeviceTestCommand>(envelope.Payload)),
             _ => throw new ProtocolException("invalid_message", "Command type is unsupported.")
         };
 
@@ -434,6 +453,30 @@ public sealed class V1CommandDispatcher(
         }
 
         return command;
+    }
+
+    private static AudioDevicePreferenceCommand CanonicalizeAudioDevicePreference(
+        AudioDevicePreferenceCommand command)
+    {
+        ValidateDeviceId(command.OutputDeviceId);
+        ValidateDeviceId(command.InputDeviceId);
+        return command;
+    }
+
+    private static AudioDeviceTestCommand CanonicalizeAudioDeviceTest(AudioDeviceTestCommand command)
+    {
+        ValidateDeviceId(command.DeviceId);
+        return command;
+    }
+
+    private static void ValidateDeviceId(string deviceId)
+    {
+        if (string.IsNullOrWhiteSpace(deviceId) ||
+            deviceId.Length > 128 ||
+            deviceId.Any(character => !char.IsAsciiLetterOrDigit(character) && character is not '-' and not '_'))
+        {
+            throw new ProtocolException("invalid_message", "Audio device id is invalid.");
+        }
     }
 
     private async Task MaybePruneCommandsAsync()

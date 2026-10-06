@@ -6,7 +6,7 @@ namespace DebtFlow.SipAgent.Persistence;
 
 public sealed class FileAudioPreferencesStore(string path) : IAudioPreferencesStore
 {
-    private const int SchemaVersion = 1;
+    private const int SchemaVersion = 2;
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web)
     {
         PropertyNameCaseInsensitive = false,
@@ -29,14 +29,21 @@ public sealed class FileAudioPreferencesStore(string path) : IAudioPreferencesSt
                 AudioPreferencesDocument? document = JsonSerializer.Deserialize<AudioPreferencesDocument>(
                     File.ReadAllBytes(path),
                     JsonOptions);
-                return document is
+                if (document is not
+                    {
+                        SchemaVersion: 1 or SchemaVersion,
+                        OutputVolume: >= 0 and <= 100,
+                        InputVolume: >= 0 and <= 100
+                    })
                 {
-                    SchemaVersion: SchemaVersion,
-                    OutputVolume: >= 0 and <= 100,
-                    InputVolume: >= 0 and <= 100
+                    return AudioPreferences.Default;
                 }
-                    ? new AudioPreferences(document.OutputVolume, document.InputVolume)
-                    : AudioPreferences.Default;
+
+                return new AudioPreferences(
+                    document.OutputVolume,
+                    document.InputVolume,
+                    NormalizeDeviceId(document.OutputDeviceId),
+                    NormalizeDeviceId(document.InputDeviceId));
             }
             catch (Exception exception) when (
                 exception is IOException or UnauthorizedAccessException or JsonException)
@@ -64,7 +71,9 @@ public sealed class FileAudioPreferencesStore(string path) : IAudioPreferencesSt
                 var document = new AudioPreferencesDocument(
                     SchemaVersion,
                     preferences.OutputVolume,
-                    preferences.InputVolume);
+                    preferences.InputVolume,
+                    preferences.OutputDeviceId,
+                    preferences.InputDeviceId);
                 File.WriteAllBytes(
                     temporaryPath,
                     JsonSerializer.SerializeToUtf8Bytes(document, JsonOptions));
@@ -83,7 +92,11 @@ public sealed class FileAudioPreferencesStore(string path) : IAudioPreferencesSt
     private static void Validate(AudioPreferences preferences)
     {
         if (preferences.OutputVolume is < 0 or > 100 ||
-            preferences.InputVolume is < 0 or > 100)
+            preferences.InputVolume is < 0 or > 100 ||
+            string.IsNullOrWhiteSpace(preferences.OutputDeviceId) ||
+            string.IsNullOrWhiteSpace(preferences.InputDeviceId) ||
+            preferences.OutputDeviceId.Length > 128 ||
+            preferences.InputDeviceId.Length > 128)
         {
             throw new ArgumentOutOfRangeException(nameof(preferences));
         }
@@ -92,5 +105,12 @@ public sealed class FileAudioPreferencesStore(string path) : IAudioPreferencesSt
     private sealed record AudioPreferencesDocument(
         int SchemaVersion,
         int OutputVolume,
-        int InputVolume);
+        int InputVolume,
+        string? OutputDeviceId = null,
+        string? InputDeviceId = null);
+
+    private static string NormalizeDeviceId(string? value) =>
+        string.IsNullOrWhiteSpace(value) || value.Length > 128
+            ? AudioPreferences.SystemDefaultDeviceId
+            : value;
 }

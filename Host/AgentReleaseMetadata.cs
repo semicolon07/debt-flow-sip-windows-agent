@@ -26,6 +26,9 @@ public sealed record AgentReleaseMetadata(
         "audio.output.volume",
         "audio.input.volume",
         "audio.volume.preferences",
+        "audio.devices",
+        "audio.output.test",
+        "audio.input.test",
         "event.durable",
         "event.collection_binding.v1"
     ];

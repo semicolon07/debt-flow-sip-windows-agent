@@ -151,6 +151,7 @@ public interface ISipRuntime : IAsyncDisposable
     bool IsMicrophoneMuted { get; }
     int OutputVolume { get; }
     int InputVolume { get; }
+    AudioDevicesSnapshot AudioDevices { get; }
     Task ConfigureAsync(SipConfiguration configuration, CancellationToken cancellationToken);
     Task StartRegistrationAsync(long generation, CancellationToken cancellationToken);
     Task StopRegistrationAsync(long generation, CancellationToken cancellationToken);
@@ -165,11 +166,23 @@ public interface ISipRuntime : IAsyncDisposable
     Task SetInputVolumeAsync(SipCallHandle call, int volume, CancellationToken cancellationToken);
     Task SetOutputVolumePreferenceAsync(int volume, CancellationToken cancellationToken);
     Task SetInputVolumePreferenceAsync(int volume, CancellationToken cancellationToken);
+    Task SetAudioDevicePreferencesAsync(
+        string outputDeviceId,
+        string inputDeviceId,
+        CancellationToken cancellationToken);
+    Task TestOutputDeviceAsync(string deviceId, CancellationToken cancellationToken);
+    Task<int> TestInputDeviceAsync(string deviceId, CancellationToken cancellationToken);
 }
 
-public sealed record AudioPreferences(int OutputVolume, int InputVolume)
+public sealed record AudioPreferences(
+    int OutputVolume,
+    int InputVolume,
+    string OutputDeviceId,
+    string InputDeviceId)
 {
-    public static AudioPreferences Default { get; } = new(100, 100);
+    public const string SystemDefaultDeviceId = "system-default";
+    public static AudioPreferences Default { get; } =
+        new(100, 100, SystemDefaultDeviceId, SystemDefaultDeviceId);
 }
 
 public interface IAudioPreferencesStore

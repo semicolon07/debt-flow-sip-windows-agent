@@ -30,11 +30,32 @@ public sealed class FileAudioPreferencesStoreTests
             string path = Path.Combine(directory, "audio-preferences.json");
             var store = new FileAudioPreferencesStore(path);
 
-            store.Save(new AudioPreferences(65, 40));
-            store.Save(new AudioPreferences(75, 55));
+            store.Save(new AudioPreferences(65, 40, "output-a", "input-a"));
+            store.Save(new AudioPreferences(75, 55, "output-b", "input-b"));
 
-            Assert.Equal(new AudioPreferences(75, 55), new FileAudioPreferencesStore(path).Load());
+            Assert.Equal(
+                new AudioPreferences(75, 55, "output-b", "input-b"),
+                new FileAudioPreferencesStore(path).Load());
             Assert.Empty(Directory.GetFiles(directory, "*.tmp"));
+        }
+        finally
+        {
+            Directory.Delete(directory, recursive: true);
+        }
+    }
+
+    [Fact]
+    public void SchemaVersionOne_MigratesVolumesAndUsesSystemDefaultDevices()
+    {
+        string directory = CreateDirectory();
+        try
+        {
+            string path = Path.Combine(directory, "audio-preferences.json");
+            File.WriteAllText(path, "{\"schemaVersion\":1,\"outputVolume\":65,\"inputVolume\":40}");
+
+            Assert.Equal(
+                new AudioPreferences(65, 40, "system-default", "system-default"),
+                new FileAudioPreferencesStore(path).Load());
         }
         finally
         {
@@ -44,7 +65,7 @@ public sealed class FileAudioPreferencesStoreTests
 
     [Theory]
     [InlineData("not-json")]
-    [InlineData("{\"schemaVersion\":2,\"outputVolume\":65,\"inputVolume\":40}")]
+    [InlineData("{\"schemaVersion\":3,\"outputVolume\":65,\"inputVolume\":40}")]
     [InlineData("{\"schemaVersion\":1,\"outputVolume\":101,\"inputVolume\":40}")]
     [InlineData("{\"schemaVersion\":1,\"outputVolume\":65,\"inputVolume\":40,\"unknown\":true}")]
     public void InvalidFile_ReturnsSafeDefaults(string content)
@@ -72,7 +93,7 @@ public sealed class FileAudioPreferencesStoreTests
             var store = new FileAudioPreferencesStore(Path.Combine(directory, "audio-preferences.json"));
 
             Assert.Throws<ArgumentOutOfRangeException>(() =>
-                store.Save(new AudioPreferences(-1, 100)));
+                store.Save(new AudioPreferences(-1, 100, "system-default", "system-default")));
         }
         finally
         {
