@@ -145,6 +145,9 @@ public interface ISipRuntime : IAsyncDisposable
 {
     event Func<SipSignal, Task>? Signal;
     string AudioState { get; }
+    bool IsMicrophoneMuted { get; }
+    int OutputVolume { get; }
+    int InputVolume { get; }
     Task ConfigureAsync(SipConfiguration configuration, CancellationToken cancellationToken);
     Task StartRegistrationAsync(CancellationToken cancellationToken);
     Task StopRegistrationAsync(CancellationToken cancellationToken);
@@ -154,6 +157,20 @@ public interface ISipRuntime : IAsyncDisposable
     Task RejectUnavailableAsync(CancellationToken cancellationToken);
     Task HangupAsync(CancellationToken cancellationToken);
     Task SendDtmfAsync(char digit, CancellationToken cancellationToken);
+    Task SetMicrophoneMutedAsync(bool muted, CancellationToken cancellationToken);
+    Task SetOutputVolumeAsync(int volume, CancellationToken cancellationToken);
+    Task SetInputVolumeAsync(int volume, CancellationToken cancellationToken);
+}
+
+public sealed record AudioPreferences(int OutputVolume, int InputVolume)
+{
+    public static AudioPreferences Default { get; } = new(100, 100);
+}
+
+public interface IAudioPreferencesStore
+{
+    AudioPreferences Load();
+    void Save(AudioPreferences preferences);
 }
 
 public interface IRegistrationRetryPolicy

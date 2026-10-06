@@ -10,7 +10,16 @@ public sealed class V1CommandDispatcher(
     IAgentClock clock)
 {
     private static readonly HashSet<string> CallScopedCommandTypes =
-        ["call.start", "call.answer", "call.reject", "call.hangup", "call.dtmf"];
+        [
+            "call.start",
+            "call.answer",
+            "call.reject",
+            "call.hangup",
+            "call.dtmf",
+            "call.mute.set",
+            "audio.output.volume.set",
+            "audio.input.volume.set"
+        ];
 
     public async Task<byte[]> DispatchAsync(ProtocolEnvelope envelope, CancellationToken cancellationToken)
     {
@@ -209,6 +218,21 @@ public sealed class V1CommandDispatcher(
             case "call.dtmf":
                 await coordinator.SendDtmfAsync(
                     ProtocolCodec.DeserializePayload<DtmfCommand>(envelope.Payload),
+                    cancellationToken);
+                break;
+            case "call.mute.set":
+                await coordinator.SetMicrophoneMutedAsync(
+                    ProtocolCodec.DeserializePayload<CallMuteCommand>(envelope.Payload),
+                    cancellationToken);
+                break;
+            case "audio.output.volume.set":
+                await coordinator.SetOutputVolumeAsync(
+                    ProtocolCodec.DeserializePayload<CallVolumeCommand>(envelope.Payload),
+                    cancellationToken);
+                break;
+            case "audio.input.volume.set":
+                await coordinator.SetInputVolumeAsync(
+                    ProtocolCodec.DeserializePayload<CallVolumeCommand>(envelope.Payload),
                     cancellationToken);
                 break;
             case "state.get":

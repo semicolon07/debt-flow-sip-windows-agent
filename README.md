@@ -10,6 +10,7 @@ Per-user SIP/audio tray agent สำหรับ Debt Flow Portal บน Windows
 - Kestrel loopback secure WebSocket V1: `wss://localhost:8443/agent/v1` (ไม่มี plaintext listener/fallback)
 - SIPSorcery 10.0.16: UDP first และ automatic TCP fallback เมื่อเกิด transport-level temporary failure
 - SQLite schema v4 outbox/call journal: `%LOCALAPPDATA%\DebtFlow\SipAgent\agent-v1.db`
+- Audio volume preferences: `%LOCALAPPDATA%\DebtFlow\SipAgent\audio-preferences.json`
 - JSONL logs: `%LOCALAPPDATA%\DebtFlow\SipAgent\Logs`, 10 MB ต่อไฟล์/7 rolling files
 - หนึ่ง Agent ต่อ Windows user, หนึ่ง Portal controller และหนึ่ง active call
 

@@ -242,6 +242,60 @@ public sealed class AgentCoordinatorTests
     }
 
     [Fact]
+    public async Task AudioControls_UpdateRuntimeAndSnapshotWithoutDurableEvents()
+    {
+        await using CoordinatorFixture fixture = await CoordinatorFixture.CreateAsync();
+        await fixture.RegisterAsync();
+        string callId = NewId();
+        await fixture.Coordinator.StartCallAsync(
+            new CallStartCommand(NewId(), callId, "0812345678", "diagnostic-only"),
+            CancellationToken.None);
+        await fixture.Runtime.EmitAsync(new SipSignal(SipSignalType.CallConnected, 200));
+        long eventsBeforeControls = await fixture.Store.CountPendingAsync(CancellationToken.None);
+
+        await fixture.Coordinator.SetMicrophoneMutedAsync(
+            new CallMuteCommand(NewId(), callId, true),
+            CancellationToken.None);
+        await fixture.Coordinator.SetOutputVolumeAsync(
+            new CallVolumeCommand(NewId(), callId, 65),
+            CancellationToken.None);
+        await fixture.Coordinator.SetInputVolumeAsync(
+            new CallVolumeCommand(NewId(), callId, 40),
+            CancellationToken.None);
+
+        AgentSnapshotPayload snapshot = await fixture.Coordinator.GetSnapshotAsync(CancellationToken.None);
+        AudioControlsSnapshot controls = Assert.IsType<AudioControlsSnapshot>(snapshot.AudioControls);
+        Assert.True(controls.MicrophoneMuted);
+        Assert.Equal(65, controls.OutputVolume);
+        Assert.Equal(40, controls.InputVolume);
+        Assert.Equal(eventsBeforeControls, await fixture.Store.CountPendingAsync(CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task AudioControls_RejectInvalidStateAndOutOfRangeVolume()
+    {
+        await using CoordinatorFixture fixture = await CoordinatorFixture.CreateAsync();
+        await fixture.RegisterAsync();
+        string callId = NewId();
+        await fixture.Coordinator.StartCallAsync(
+            new CallStartCommand(NewId(), callId, "0812345678", "diagnostic-only"),
+            CancellationToken.None);
+
+        AgentCommandException invalidState = await Assert.ThrowsAsync<AgentCommandException>(
+            () => fixture.Coordinator.SetMicrophoneMutedAsync(
+                new CallMuteCommand(NewId(), callId, true),
+                CancellationToken.None));
+        Assert.Equal("call_invalid_state", invalidState.ErrorCode);
+
+        await fixture.Runtime.EmitAsync(new SipSignal(SipSignalType.CallConnected, 200));
+        AgentCommandException invalidVolume = await Assert.ThrowsAsync<AgentCommandException>(
+            () => fixture.Coordinator.SetOutputVolumeAsync(
+                new CallVolumeCommand(NewId(), callId, 101),
+                CancellationToken.None));
+        Assert.Equal("invalid_message", invalidVolume.ErrorCode);
+    }
+
+    [Fact]
     public async Task ConcurrentTerminalSignals_AreSerializedToOneCallEndedEvent()
     {
         await using CoordinatorFixture fixture = await CoordinatorFixture.CreateAsync();
@@ -912,6 +966,9 @@ public sealed class AgentCoordinatorTests
     {
         public event Func<SipSignal, Task>? Signal;
         public string AudioState => "ready";
+        public bool IsMicrophoneMuted { get; private set; }
+        public int OutputVolume { get; private set; } = 100;
+        public int InputVolume { get; private set; } = 100;
         public char? LastDtmf { get; private set; }
         public int StopRegistrationCount { get; private set; }
         public int RejectUnavailableCount { get; private set; }
@@ -968,6 +1025,24 @@ public sealed class AgentCoordinatorTests
         public Task SendDtmfAsync(char digit, CancellationToken cancellationToken)
         {
             LastDtmf = digit;
+            return Task.CompletedTask;
+        }
+
+        public Task SetMicrophoneMutedAsync(bool muted, CancellationToken cancellationToken)
+        {
+            IsMicrophoneMuted = muted;
+            return Task.CompletedTask;
+        }
+
+        public Task SetOutputVolumeAsync(int volume, CancellationToken cancellationToken)
+        {
+            OutputVolume = volume;
+            return Task.CompletedTask;
+        }
+
+        public Task SetInputVolumeAsync(int volume, CancellationToken cancellationToken)
+        {
+            InputVolume = volume;
             return Task.CompletedTask;
         }
 

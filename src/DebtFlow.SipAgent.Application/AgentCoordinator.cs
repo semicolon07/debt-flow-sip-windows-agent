@@ -106,6 +106,15 @@ public sealed class AgentCoordinator : IAsyncDisposable
     public Task SendDtmfAsync(DtmfCommand command, CancellationToken cancellationToken) =>
         EnqueueAsync(token => SendDtmfCoreAsync(command, token), cancellationToken);
 
+    public Task SetMicrophoneMutedAsync(CallMuteCommand command, CancellationToken cancellationToken) =>
+        EnqueueAsync(token => SetMicrophoneMutedCoreAsync(command, token), cancellationToken);
+
+    public Task SetOutputVolumeAsync(CallVolumeCommand command, CancellationToken cancellationToken) =>
+        EnqueueAsync(token => SetOutputVolumeCoreAsync(command, token), cancellationToken);
+
+    public Task SetInputVolumeAsync(CallVolumeCommand command, CancellationToken cancellationToken) =>
+        EnqueueAsync(token => SetInputVolumeCoreAsync(command, token), cancellationToken);
+
     public Task<AgentSnapshotPayload> GetSnapshotAsync(CancellationToken cancellationToken) =>
         EnqueueAsync(GetSnapshotCoreAsync, cancellationToken);
 
@@ -415,6 +424,35 @@ public sealed class AgentCoordinator : IAsyncDisposable
         await EmitCallEventAsync("call.dtmf_sent", call, new { success = true }, cancellationToken);
     }
 
+    private async Task SetMicrophoneMutedCoreAsync(
+        CallMuteCommand command,
+        CancellationToken cancellationToken)
+    {
+        CallSessionState call = EnsureConnectedCall(command.CallId);
+        await _sipRuntime.SetMicrophoneMutedAsync(command.Muted, cancellationToken);
+        await PublishAudioControlsChangedAsync(call, cancellationToken);
+    }
+
+    private async Task SetOutputVolumeCoreAsync(
+        CallVolumeCommand command,
+        CancellationToken cancellationToken)
+    {
+        CallSessionState call = EnsureConnectedCall(command.CallId);
+        ValidateVolume(command.Volume);
+        await _sipRuntime.SetOutputVolumeAsync(command.Volume, cancellationToken);
+        await PublishAudioControlsChangedAsync(call, cancellationToken);
+    }
+
+    private async Task SetInputVolumeCoreAsync(
+        CallVolumeCommand command,
+        CancellationToken cancellationToken)
+    {
+        CallSessionState call = EnsureConnectedCall(command.CallId);
+        ValidateVolume(command.Volume);
+        await _sipRuntime.SetInputVolumeAsync(command.Volume, cancellationToken);
+        await PublishAudioControlsChangedAsync(call, cancellationToken);
+    }
+
     private async Task<AgentSnapshotPayload> GetSnapshotCoreAsync(CancellationToken cancellationToken)
     {
         IReadOnlyList<ActiveCallSnapshot> calls = _call is { State: not CallState.Ended } call
@@ -446,8 +484,26 @@ public sealed class AgentCoordinator : IAsyncDisposable
             _eventStore.LastAcknowledgedSequence,
             health.CapacityState.ToString().ToLowerInvariant(),
             health.StorageBytes,
-            oldestPendingAgeSeconds);
+            oldestPendingAgeSeconds,
+            new AudioControlsSnapshot(
+                _sipRuntime.IsMicrophoneMuted,
+                _sipRuntime.OutputVolume,
+                _sipRuntime.InputVolume));
     }
+
+    private Task PublishAudioControlsChangedAsync(
+        CallSessionState call,
+        CancellationToken cancellationToken) =>
+        PublishRealtimeAsync(
+            "audio.controls_changed",
+            new
+            {
+                callId = call.CallId,
+                microphoneMuted = _sipRuntime.IsMicrophoneMuted,
+                outputVolume = _sipRuntime.OutputVolume,
+                inputVolume = _sipRuntime.InputVolume
+            },
+            cancellationToken);
 
     private Task PortalConnectedCoreAsync(CancellationToken cancellationToken)
     {
@@ -1053,6 +1109,25 @@ public sealed class AgentCoordinator : IAsyncDisposable
         }
 
         return call;
+    }
+
+    private CallSessionState EnsureConnectedCall(string callId)
+    {
+        CallSessionState call = EnsureCurrentCall(callId);
+        if (call.State != CallState.Connected)
+        {
+            throw new AgentCommandException("call_invalid_state");
+        }
+
+        return call;
+    }
+
+    private static void ValidateVolume(int volume)
+    {
+        if (volume is < 0 or > 100)
+        {
+            throw new AgentCommandException("invalid_message");
+        }
     }
 
     private static SipConfiguration ValidateConfigure(ConfigureCommand command)

@@ -148,6 +148,15 @@ public sealed class LocalWebSocketServerTests
             Assert.Contains(
                 "event.collection_binding.v1",
                 ProtocolCodec.DeserializePayload<WelcomePayload>(welcome.Payload).Capabilities);
+            Assert.Contains(
+                "call.mute",
+                ProtocolCodec.DeserializePayload<WelcomePayload>(welcome.Payload).Capabilities);
+            Assert.Contains(
+                "audio.output.volume",
+                ProtocolCodec.DeserializePayload<WelcomePayload>(welcome.Payload).Capabilities);
+            Assert.Contains(
+                "audio.input.volume",
+                ProtocolCodec.DeserializePayload<WelcomePayload>(welcome.Payload).Capabilities);
             Assert.Equal("snapshot", snapshot.Kind);
             Assert.Equal("agent.snapshot", snapshot.Type);
 
@@ -255,6 +264,9 @@ public sealed class LocalWebSocketServerTests
             remove { }
         }
         public string AudioState => "ready";
+        public bool IsMicrophoneMuted => false;
+        public int OutputVolume => 100;
+        public int InputVolume => 100;
         public Task ConfigureAsync(SipConfiguration configuration, CancellationToken cancellationToken) => Task.CompletedTask;
         public Task StartRegistrationAsync(CancellationToken cancellationToken) => Task.CompletedTask;
         public Task StopRegistrationAsync(CancellationToken cancellationToken) => Task.CompletedTask;
@@ -264,6 +276,9 @@ public sealed class LocalWebSocketServerTests
         public Task RejectUnavailableAsync(CancellationToken cancellationToken) => Task.CompletedTask;
         public Task HangupAsync(CancellationToken cancellationToken) => Task.CompletedTask;
         public Task SendDtmfAsync(char digit, CancellationToken cancellationToken) => Task.CompletedTask;
+        public Task SetMicrophoneMutedAsync(bool muted, CancellationToken cancellationToken) => Task.CompletedTask;
+        public Task SetOutputVolumeAsync(int volume, CancellationToken cancellationToken) => Task.CompletedTask;
+        public Task SetInputVolumeAsync(int volume, CancellationToken cancellationToken) => Task.CompletedTask;
         public ValueTask DisposeAsync() => ValueTask.CompletedTask;
     }
 }

@@ -17,10 +17,12 @@ public sealed class SipRuntime : ISipRuntime
     private static readonly TimeSpan OutboundCallTimeout = TimeSpan.FromSeconds(60);
     private static readonly TimeSpan AnswerTimeout = TimeSpan.FromSeconds(30);
     private readonly ILogger<SipRuntime> _logger;
+    private readonly IAudioPreferencesStore _audioPreferencesStore;
     private readonly SIPTransport _transport;
     private readonly SIPUserAgent _userAgent;
     private readonly SemaphoreSlim _mediaGate = new(1, 1);
     private readonly object _audioNotificationGate = new();
+    private readonly AudioSessionVolumeController _volumeController = new();
     private readonly MMDeviceEnumerator? _audioDeviceEnumerator;
     private readonly MMDeviceNotificationClient? _audioNotificationClient;
     private SIPRegistrationUserAgent? _registrationAgent;
@@ -31,12 +33,19 @@ public sealed class SipRuntime : ISipRuntime
     private SipConfiguration? _configuration;
     private CancellationTokenSource? _audioNotificationDebounce;
     private bool _useTcp;
+    private int _microphoneMuted;
+    private int _outputVolume;
+    private int _inputVolume;
     private int _registrationGeneration;
     private bool _disposed;
 
-    public SipRuntime(ILogger<SipRuntime> logger)
+    public SipRuntime(ILogger<SipRuntime> logger, IAudioPreferencesStore audioPreferencesStore)
     {
         _logger = logger;
+        _audioPreferencesStore = audioPreferencesStore;
+        AudioPreferences preferences = audioPreferencesStore.Load();
+        _outputVolume = preferences.OutputVolume;
+        _inputVolume = preferences.InputVolume;
         _transport = new SIPTransport();
         _transport.AddSIPChannel(new SIPUDPChannel(new IPEndPoint(IPAddress.Any, 0)));
         _transport.AddSIPChannel(new SIPTCPChannel(new IPEndPoint(IPAddress.Any, 0)));
@@ -67,6 +76,9 @@ public sealed class SipRuntime : ISipRuntime
     public event Func<SipSignal, Task>? Signal;
 
     public string AudioState { get; private set; }
+    public bool IsMicrophoneMuted => Volatile.Read(ref _microphoneMuted) != 0;
+    public int OutputVolume => Volatile.Read(ref _outputVolume);
+    public int InputVolume => Volatile.Read(ref _inputVolume);
 
     public Task ConfigureAsync(SipConfiguration configuration, CancellationToken cancellationToken)
     {
@@ -263,6 +275,47 @@ public sealed class SipRuntime : ISipRuntime
         return _userAgent.SendDtmf(tone);
     }
 
+    public async Task SetMicrophoneMutedAsync(bool muted, CancellationToken cancellationToken)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        await _mediaGate.WaitAsync(cancellationToken);
+        try
+        {
+            WindowsAudioEndPoint endpoint = _audioEndPoint
+                ?? throw new InvalidOperationException("Audio capture session is unavailable.");
+            if (muted)
+            {
+                await endpoint.PauseAudio();
+            }
+            else
+            {
+                await endpoint.ResumeAudio();
+            }
+
+            Volatile.Write(ref _microphoneMuted, muted ? 1 : 0);
+        }
+        finally
+        {
+            _mediaGate.Release();
+        }
+    }
+
+    public async Task SetOutputVolumeAsync(int volume, CancellationToken cancellationToken)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        await SetSessionVolumeAsync(DataFlow.Render, volume, cancellationToken);
+        Volatile.Write(ref _outputVolume, volume);
+        PersistAudioPreferences();
+    }
+
+    public async Task SetInputVolumeAsync(int volume, CancellationToken cancellationToken)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        await SetSessionVolumeAsync(DataFlow.Capture, volume, cancellationToken);
+        Volatile.Write(ref _inputVolume, volume);
+        PersistAudioPreferences();
+    }
+
     public async ValueTask DisposeAsync()
     {
         if (_disposed)
@@ -350,6 +403,7 @@ public sealed class SipRuntime : ISipRuntime
             audioInDeviceIndex: hasCapture ? 0 : -1,
             disableSource: !hasCapture,
             disableSink: !hasPlayback);
+        Volatile.Write(ref _microphoneMuted, 0);
 
         _audioEndPoint.OnAudioSourceError += error =>
             _ = EmitAsync(new SipSignal(SipSignalType.MediaDegraded, SafeCode: "audio_source_error"));
@@ -389,9 +443,65 @@ public sealed class SipRuntime : ISipRuntime
         _mediaSession.OnAudioFormatsNegotiated += formats =>
         {
             string codec = string.Join(",", formats.Select(format => $"{format.Codec}/{format.ClockRate}"));
+            _ = ApplyRememberedVolumesAsync();
             _ = EmitAsync(new SipSignal(SipSignalType.MediaReady, Codec: codec));
         };
         return _mediaSession;
+    }
+
+    private async Task SetSessionVolumeAsync(
+        DataFlow dataFlow,
+        int volume,
+        CancellationToken cancellationToken)
+    {
+        if (volume is < 0 or > 100)
+        {
+            throw new ArgumentOutOfRangeException(nameof(volume));
+        }
+
+        for (int attempt = 0; attempt < 5; attempt++)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (_volumeController.TrySetProcessVolume(dataFlow, volume))
+            {
+                return;
+            }
+
+            await Task.Delay(TimeSpan.FromMilliseconds(100), cancellationToken);
+        }
+
+        throw new InvalidOperationException("Audio session is unavailable.");
+    }
+
+    private async Task ApplyRememberedVolumesAsync()
+    {
+        try
+        {
+            using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(2));
+            await SetSessionVolumeAsync(DataFlow.Render, OutputVolume, timeout.Token);
+            await SetSessionVolumeAsync(DataFlow.Capture, InputVolume, timeout.Token);
+        }
+        catch (Exception exception) when (exception is not OperationCanceledException)
+        {
+            _logger.LogWarning(
+                "Remembered audio volume could not be applied because of {ErrorType}",
+                exception.GetType().Name);
+        }
+    }
+
+    private void PersistAudioPreferences()
+    {
+        try
+        {
+            _audioPreferencesStore.Save(new AudioPreferences(OutputVolume, InputVolume));
+        }
+        catch (Exception exception) when (
+            exception is IOException or UnauthorizedAccessException or InvalidOperationException)
+        {
+            _logger.LogWarning(
+                "Audio preferences could not be saved because of {ErrorType}",
+                exception.GetType().Name);
+        }
     }
 
     private int? FindWorkingPlaybackDevice()
@@ -429,6 +539,7 @@ public sealed class SipRuntime : ISipRuntime
         _mediaSession = null;
         _fallbackAudioSource = null;
         _audioEndPoint = null;
+        Volatile.Write(ref _microphoneMuted, 0);
         try
         {
             mediaSession?.Close("call ended");

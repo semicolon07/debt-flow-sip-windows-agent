@@ -7,6 +7,7 @@ using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using SIPSorcery;
 using DebtFlow.SipAgent.Application;
+using DebtFlow.SipAgent.Persistence;
 
 namespace DebtFlow.SipAgent.Host;
 
@@ -261,6 +262,8 @@ public static class Program
         builder.Services.AddSingleton<IAgentClock, SystemAgentClock>();
         builder.Services.AddSingleton<IAgentIdGenerator, GuidAgentIdGenerator>();
         builder.Services.AddSingleton<IAgentDelay, SystemAgentDelay>();
+        builder.Services.AddSingleton<IAudioPreferencesStore>(
+            new FileAudioPreferencesStore(AgentStoragePaths.AudioPreferencesPath));
         builder.Services.AddSingleton<SipRuntime>();
         builder.Services.AddSingleton<ISipRuntime>(provider => provider.GetRequiredService<SipRuntime>());
         builder.Services.AddSingleton(provider => new AgentCoordinator(

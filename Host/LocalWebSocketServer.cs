@@ -197,7 +197,17 @@ public sealed class LocalWebSocketServer(
                 GetAgentVersion(),
                 eventStore.AgentInstanceId,
                 coordinator.AgentSessionId,
-                ["sip.register", "call.outbound", "call.inbound", "call.dtmf", "event.durable", "event.collection_binding.v1"],
+                [
+                    "sip.register",
+                    "call.outbound",
+                    "call.inbound",
+                    "call.dtmf",
+                    "call.mute",
+                    "audio.output.volume",
+                    "audio.input.volume",
+                    "event.durable",
+                    "event.collection_binding.v1"
+                ],
                 eventStore.LastSequence,
                 eventStore.LastAcknowledgedSequence),
             cancellationToken);

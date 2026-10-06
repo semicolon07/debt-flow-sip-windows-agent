@@ -47,6 +47,10 @@ public sealed record CallCommand(string CommandId, string CallId);
 
 public sealed record DtmfCommand(string CommandId, string CallId, string Digit);
 
+public sealed record CallMuteCommand(string CommandId, string CallId, bool Muted);
+
+public sealed record CallVolumeCommand(string CommandId, string CallId, int Volume);
+
 public sealed record AckPayload(string AgentInstanceId, long AcknowledgedThroughSequence);
 
 public sealed record WelcomePayload(
@@ -68,6 +72,11 @@ public sealed record ActiveCallSnapshot(
     DateTimeOffset StartedAtUtc,
     DateTimeOffset? AnsweredAtUtc);
 
+public sealed record AudioControlsSnapshot(
+    bool MicrophoneMuted,
+    int OutputVolume,
+    int InputVolume);
+
 public sealed record AgentSnapshotPayload(
     string AgentState,
     string RegistrationState,
@@ -79,7 +88,8 @@ public sealed record AgentSnapshotPayload(
     long? LastAcknowledgedSequence = null,
     string? OutboxCapacityState = null,
     long? OutboxStorageBytes = null,
-    long? OldestPendingAgeSeconds = null);
+    long? OldestPendingAgeSeconds = null,
+    AudioControlsSnapshot? AudioControls = null);
 
 public sealed record DurableEventPayload(
     string Delivery,
