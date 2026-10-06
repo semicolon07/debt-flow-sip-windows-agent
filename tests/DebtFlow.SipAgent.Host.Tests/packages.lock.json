@@ -278,8 +278,7 @@
           "DebtFlow.SipAgent.Protocol": "[1.0.0, )",
           "NAudio": "[3.1.0, )",
           "SIPSorcery": "[10.0.16, )",
-          "SIPSorceryMedia.Windows": "[10.0.16, )",
-          "System.Security.Cryptography.ProtectedData": "[10.0.3, )"
+          "SIPSorceryMedia.Windows": "[10.0.16, )"
         }
       },
       "debtflow.sipagent.persistence": {
@@ -359,12 +358,6 @@
         "requested": "[2.1.13, )",
         "resolved": "2.1.13",
         "contentHash": "D2UAuiGxFYBqeRXjjjGgvJ5UQifzn6wefmSqeKU7XcNGKLbJRP6X7kcPZ6opOBJGdCIlgbSxTvDpBbLvsN594A=="
-      },
-      "System.Security.Cryptography.ProtectedData": {
-        "type": "CentralTransitive",
-        "requested": "[10.0.3, )",
-        "resolved": "10.0.3",
-        "contentHash": "JCKbH/CN5l0CSoJBILEvJmNQVp5vV+FY3q2ue4K9p4eDT4mFEv0bjTQCV+MD6Qk1b/qk9fWmZZKhG1TklbXw1Q=="
       }
     },
     "net10.0-windows10.0.17763/win-x64": {

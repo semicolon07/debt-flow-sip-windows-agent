@@ -42,12 +42,6 @@
           "SIPSorceryMedia.Abstractions": "10.0.16"
         }
       },
-      "System.Security.Cryptography.ProtectedData": {
-        "type": "Direct",
-        "requested": "[10.0.3, )",
-        "resolved": "10.0.3",
-        "contentHash": "JCKbH/CN5l0CSoJBILEvJmNQVp5vV+FY3q2ue4K9p4eDT4mFEv0bjTQCV+MD6Qk1b/qk9fWmZZKhG1TklbXw1Q=="
-      },
       "BouncyCastle.Cryptography": {
         "type": "Transitive",
         "resolved": "2.7.0",
