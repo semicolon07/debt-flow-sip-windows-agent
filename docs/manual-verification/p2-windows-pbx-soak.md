@@ -13,7 +13,7 @@ source inspection หรือผล P1 เดิมแทนการทดส�
 ./scripts/verify-p2-windows.ps1
 ```
 
-ต้องได้ Release build 0 warning/error, core + Windows host testsอย่างน้อย 109 casesผ่านทั้งหมด,
+ต้องได้ Release build 0 warning/error, core testsอย่างน้อย 92 casesและ Windows host testsทั้งหมดผ่าน,
 vulnerability count 0, self-contained multi-file ZIP, SHA-256 และ `p2-windows-evidence.json`.
 
 ## PBX and failure matrix
@@ -40,6 +40,13 @@ vulnerability count 0, self-contained multi-file ZIP, SHA-256 และ `p2-wind
 | P2-RTP-02 | NAT/symmetric RTP matrix | ระบุนโยบายขั้นต่ำที่ providerต้องใช้และ threat residual | pending |
 | P2-DIAG-01 | Export safe diagnostics | ZIP ไม่มี password/user/raw number/Origin/SIP header/SDP/DTMF/DB | pending |
 | P2-SHUT-01 | exit/restart ระหว่าง retry/call/device callback | shutdown ≤10s, ไม่มี crash/double terminal | pending |
+| NEXT-SIG-01 | inject append failureใน signalหนึ่งครั้งแล้วส่ง terminal callback | pumpยัง running, สาย cleanup, สายใหม่ถูก block/reject | pending |
+| NEXT-WS-01 | socketปิดก่อน/กลาง/final replay page | sessionจบ, Agent/storeไม่ degraded, reconnect replayครบ | pending |
+| NEXT-WS-02 | realtime burstระหว่าง replay 10,000 events | controlตอบได้, durable ordered, realtime drop observable, memory bounded | pending |
+| NEXT-DB-01 | fail eventตัวที่สองของ start/terminal batch | transaction rollbackทั้ง eventsและ active-call journal | pending |
+| NEXT-CAN-01 | shutdownชน answer/hangup/audio operation | cancellationไม่กลายเป็น business error, ไม่มี double terminal | pending |
+| NEXT-LOG-01 | log directory denied/fullแล้ว recover | call controlไม่สะดุด, metricเพิ่ม, writer recover, shutdown bounded | pending |
+| NEXT-DIAG-01 | export diagnosticsระหว่าง queue/task fault | health fieldsครบ, ไม่มี identifier/PII/raw exception | pending |
 
 ## Soak gate
 

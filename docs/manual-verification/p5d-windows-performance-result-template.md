@@ -41,6 +41,11 @@ audio probes, replay duration and logging failures can be compared without addin
 | Replay duration and event throughput | | | |
 | Process disk read and write rate | | | |
 | Logger dropped records and writer failures | | | |
+| SIP signal processing failures | | | |
+| Background task faults by bounded operation | | | |
+| WebSocket queue high-water by lane | | | |
+| WebSocket queue aborts and realtime drops | | | |
+| Command prune failures | | | |
 
 ## Control latency
 
@@ -63,6 +68,10 @@ Use one Windows machine, PBX account, network path and audio devices for both ru
 
 Confirm that live events generated during replay appear after the replay boundary and that reconnect does not
 duplicate an acknowledged durable sequence.
+
+แนบ diagnostic `summary.json` ก่อน/หลัง workloadและตรวจ `coordinatorProcessorState`, `sipSignalPumpState`,
+background task count, WebSocket session generation, lane depth/high-water, dropped realtime, queue abortและ
+writer fault count. ทุก fieldต้องไม่มี call ID, command ID, destination, Originหรือ credential.
 
 ## Audio device cache
 

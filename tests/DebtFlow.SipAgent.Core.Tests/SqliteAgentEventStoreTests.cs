@@ -416,6 +416,59 @@ public sealed class SqliteAgentEventStoreTests
     }
 
     [Fact]
+    public async Task CallTransition_WhenSecondInsertFails_RollsBackEventsAndJournal()
+    {
+        string directory = CreateTemporaryDirectory();
+        try
+        {
+            await using var store = new SqliteAgentEventStore(Path.Combine(directory, "agent.db"));
+            await store.InitializeAsync(CancellationToken.None);
+            string callId = Guid.NewGuid().ToString("D");
+            string duplicateEventId = Guid.NewGuid().ToString("D");
+            var active = new CallSessionState(
+                callId,
+                Guid.NewGuid().ToString("D"),
+                CallDirection.Outbound,
+                CallState.Dialing,
+                DateTimeOffset.UtcNow,
+                null,
+                null,
+                null,
+                null,
+                "0812345678");
+            DurableEventDraft first = CreateDraft(callId) with
+            {
+                EventId = duplicateEventId,
+                EventType = "call.created",
+                State = "created"
+            };
+            DurableEventDraft second = CreateDraft(callId) with
+            {
+                EventId = duplicateEventId,
+                EventType = "call.state_changed",
+                State = "dialing"
+            };
+
+            await Assert.ThrowsAnyAsync<Exception>(
+                () => store.AppendCallTransitionAsync(
+                    [first, second],
+                    active,
+                    terminal: false,
+                    CancellationToken.None));
+
+            Assert.Equal(0, await store.CountPendingAsync(CancellationToken.None));
+            Assert.Null(await store.LoadActiveCallAsync(CancellationToken.None));
+            Assert.Equal(0, store.LastSequence);
+            StoredDurableEvent next = await store.AppendAsync(CreateDraft(), CancellationToken.None);
+            Assert.Equal(1, next.Sequence);
+        }
+        finally
+        {
+            Directory.Delete(directory, true);
+        }
+    }
+
+    [Fact]
     public async Task Capacity_ReservesFinalTenPercentForExistingCallEvents()
     {
         string directory = CreateTemporaryDirectory();

@@ -28,6 +28,13 @@ public sealed class UnavailableAgentEventStore : IAgentEventStore
         CancellationToken cancellationToken) =>
         Task.FromException<StoredDurableEvent>(new AgentStoreException(_failureCode));
 
+    public Task<IReadOnlyList<StoredDurableEvent>> AppendCallTransitionAsync(
+        IReadOnlyList<DurableEventDraft> drafts,
+        CallSessionState callState,
+        bool terminal,
+        CancellationToken cancellationToken) =>
+        Task.FromException<IReadOnlyList<StoredDurableEvent>>(new AgentStoreException(_failureCode));
+
     public Task<IReadOnlyList<StoredDurableEvent>> LoadPendingAsync(
         long afterSequence,
         int maximumCount,

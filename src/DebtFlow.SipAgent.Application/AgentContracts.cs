@@ -104,6 +104,18 @@ public sealed record EventStoreHealth(
     EventStoreCapacityState CapacityState,
     DateTimeOffset? OldestPendingAtUtc = null);
 
+public sealed record AgentOperationalHealth(
+    string CoordinatorProcessorState,
+    string SipSignalPumpState,
+    int CoordinatorQueueDepth,
+    int CoordinatorQueueHighWater,
+    int ActiveBackgroundTasks,
+    long BackgroundTaskFaultCount,
+    string? LastBackgroundFaultOperation,
+    long SipSignalFailureCount,
+    string? LastSipSignalFailureCode,
+    bool LifetimeCancellationRequested);
+
 public sealed class AgentStoreException(string errorCode, Exception? innerException = null)
     : Exception(errorCode, innerException)
 {
@@ -119,6 +131,11 @@ public interface IAgentEventStore : IAsyncDisposable
     Task<StoredDurableEvent> AppendAsync(DurableEventDraft draft, CancellationToken cancellationToken);
     Task<StoredDurableEvent> AppendCallEventAsync(
         DurableEventDraft draft,
+        CallSessionState callState,
+        bool terminal,
+        CancellationToken cancellationToken);
+    Task<IReadOnlyList<StoredDurableEvent>> AppendCallTransitionAsync(
+        IReadOnlyList<DurableEventDraft> drafts,
         CallSessionState callState,
         bool terminal,
         CancellationToken cancellationToken);

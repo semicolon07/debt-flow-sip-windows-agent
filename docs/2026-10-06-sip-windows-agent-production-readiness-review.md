@@ -2,7 +2,7 @@
 
 วันที่ตรวจ: 06/10/2026  
 Baseline commit: `012e15e42cc4302972375100af19cec3e3849432`  
-สถานะ: **Implementation complete — release gated with approved exceptions**
+สถานะ: **Mandatory source hardening implemented 09/10/2026 — full DoD and external release gates pending**
 
 ## ข้อสรุปสำหรับการตัดสินใจ
 
@@ -38,7 +38,8 @@ Owner risk acceptance เดิมเรื่อง allow-all Origin, unsigned 
 | รายการ | ผล |
 | --- | --- |
 | Release build | PASS, 0 warnings, 0 errors |
-| Core tests ณ implementation ล่าสุด | PASS, 86/86 |
+| Locked restore | PASS; ไม่มี `NU1510` |
+| Core tests ณ implementation ล่าสุด | PASS, 92/92 |
 | Inbound answer regression | PASS: connected callback ก่อน `AnswerAsync` return ไม่ deadlock |
 | Locked restore พร้อม `NuGetAuditMode=all` | PASS โดยไม่มี vulnerability advisory warning |
 | Windows host tests | COMPILE PASS; NOT RUN บน macOS เนื่องจากไม่มี Windows Desktop runtime |
@@ -65,6 +66,35 @@ Owner risk acceptance เดิมเรื่อง allow-all Origin, unsigned 
 
 ข้อยกเว้นที่ยืนยันและยังคงอยู่: unauthenticated allow-all WSS, unsigned ZIP, full-target rollout ไม่มี canary
 และ plaintext SQLite/WAL. สถานะสุดท้ายจึงใช้คำว่า `released with approved exceptions` เท่านั้น.
+
+## Comprehensive re-audit update — 09/10/2026
+
+การตรวจ baseline `150241ee0f85` หลัง meticulous follow-up พบ source gaps ที่ต้องปิดก่อน production เพิ่มเติม:
+
+- SIP signal pump หยุดอ่าน callback ทั้งหมดเมื่อ signal handling หนึ่งรายการโยน exception แต่ processยังรันต่อ
+- WebSocket disconnect ระหว่าง replay บาง path ถูกจำแนกเป็น `outbox_unavailable` และ Agentไม่ recoverเอง
+- multi-event call transition commitแยก transaction ทำให้ lifecycle half-commitได้
+- background operations, cancellation taxonomy, WebSocket QoS และ operational healthยังต้องทำให้มี owner/policyครบ
+
+confirmed scope, target architecture, implementation sequence, tests, performance budgets, migration/rollback
+และ definition of done อยู่ที่
+[`2026-10-09-sip-windows-agent-comprehensive-improvement-plan.md`](2026-10-09-sip-windows-agent-comprehensive-improvement-plan.md).
+ข้อความ `Implementation complete` ใน historical phase resultหมายถึง scopeของ phaseนั้นเท่านั้น และไม่แทน
+production-ready decision หลัง re-audit นี้.
+
+### Implementation result — 09/10/2026
+
+P0/P1 source blockersถูกแก้แล้วโดยเพิ่ม per-signal supervision, atomic multi-event call transition,
+store/transport replay isolation, supervised background lifecycle และ WebSocket QoS lanes. Architecture hardening
+เพิ่ม pure call lifecycle planner, prepared command definition, async command maintenance และ local operational-health
+snapshotสำหรับ diagnostics. Logger/tray caller pathถูก isolateและ diagnosticsไม่ enumerate WinMMบน UI threadแล้ว.
+
+ผลบน macOS cross-target environment: locked restore PASS, Release build 0 warnings/errors, core tests 92/92,
+Host/Host.Tests compile PASS และ formatting/whitespace PASS. Windows Host execution, vulnerability scanner,
+PBX/device/fault/performance/soak/privacy/release rehearsalยัง pending จึงยังไม่ production ready.
+
+รายละเอียด authoritative อยู่ที่
+[`2026-10-09-sip-agent-comprehensive-improvement-result.md`](plan-results/2026-10-09-sip-agent-comprehensive-improvement-result.md).
 
 ## Meticulous follow-up — 07/10/2026
 
@@ -109,6 +139,21 @@ Owner risk acceptance เดิมเรื่อง allow-all Origin, unsigned 
 | SIP-PRR-009 | P1 | Real SIP runtime ไม่มี automated lifecycle coverage เพียงพอ | Open external release gate |
 | SIP-PRR-010 | P2 | Release manifest, versioning และ artifact trust เริ่ม drift จาก runtime | Drift remediated; unsigned artifact approved exception |
 | SIP-PRR-011 | P2 | Control-plane ทำ SQLite scan, audio probe และ replay wait ถี่เกินจำเป็น | Remediated in source; Windows benchmark pending |
+
+| Follow-up ID | ระดับ | สถานะหลัง implementation 09/10/2026 |
+| --- | --- | --- |
+| SIP-NEXT-001 | P0 | Remediated; signal continuation regression PASS |
+| SIP-NEXT-002 | P0 | Remediated in source; live replay disconnect matrix pending |
+| SIP-NEXT-003 | P1 | Remediated; atomic rollback regression PASS |
+| SIP-NEXT-004 | P1 | Remediated with shared task supervisor; Windows shutdown/runtime fault matrix pending |
+| SIP-NEXT-005 | P1 | Remediated in runtime/audio wrappers; shutdown-race matrix pending |
+| SIP-NEXT-006 | P1 | Remediated with QoS lanes; saturation test compile PASS, Windows execution pending |
+| SIP-NEXT-007 | P2 | Prepared command definition consolidated; Host architecture/idempotency execution pending on Windows |
+| SIP-NEXT-008 | P2 | Prune removed from request path; retry/metric implemented |
+| SIP-NEXT-009 | P2 | Logger/tray isolation implemented; Windows disk/UI fault evidence pending |
+| SIP-NEXT-010 | P2 | Partially remediated: lifecycle planner/task supervisor extracted; large runtime/store split deferred behind characterization |
+| SIP-NEXT-011 | P2 | Coordinator/WebSocket health snapshot and bounded metrics implemented; operational evidence pending |
+| SIP-NEXT-012 | P2 | Mandatory batching/prune/UI optimization implemented; Windows profiling/query-plan evidence pending |
 
 รายละเอียด “ผลกระทบ/การแก้ไขที่ต้องการ” ด้านล่างบันทึก finding ณ baseline commit; ตารางสถานะและ
 Implementation update ด้านบนเป็น authority ของผลหลังแก้ไข.

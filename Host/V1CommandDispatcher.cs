@@ -5,25 +5,31 @@ using DebtFlow.SipAgent.Protocol;
 
 namespace DebtFlow.SipAgent.Host;
 
+public sealed record CommandMaintenancePolicy(
+    TimeSpan Retention,
+    int MaximumRetained,
+    TimeSpan Interval,
+    TimeSpan FailureRetry)
+{
+    public static CommandMaintenancePolicy Default { get; } = new(
+        TimeSpan.FromDays(30),
+        45_000,
+        TimeSpan.FromMinutes(15),
+        TimeSpan.FromMinutes(1));
+}
+
 public sealed class V1CommandDispatcher(
     AgentCoordinator coordinator,
     IAgentEventStore eventStore,
     IAgentClock clock,
-    ICommandFingerprintService fingerprintService)
+    ICommandFingerprintService fingerprintService,
+    CommandMaintenancePolicy? maintenancePolicy = null)
 {
     private long _nextPruneUtcTicks;
     private int _fingerprintKeyState;
-    private static readonly HashSet<string> CallScopedCommandTypes =
-        [
-            "call.start",
-            "call.answer",
-            "call.reject",
-            "call.hangup",
-            "call.dtmf",
-            "call.mute.set",
-            "audio.output.volume.set",
-            "audio.input.volume.set"
-        ];
+    private readonly BackgroundTaskSupervisor _maintenanceTasks = new();
+    private readonly CommandMaintenancePolicy _maintenancePolicy = ValidateMaintenancePolicy(
+        maintenancePolicy ?? CommandMaintenancePolicy.Default);
 
     public async Task<byte[]> DispatchAsync(ProtocolEnvelope envelope, CancellationToken cancellationToken)
     {
@@ -68,15 +74,10 @@ public sealed class V1CommandDispatcher(
             return Error(envelope.MessageId, "invalid_message", false);
         }
 
-        string commandId;
-        string? callId;
-        byte[] canonicalPayload;
+        PreparedCommand command;
         try
         {
-            commandId = GetCommandId(envelope);
-            ProtocolCodec.ValidateUuid(commandId, "commandId");
-            callId = GetCallIdForFingerprint(envelope);
-            canonicalPayload = CanonicalizeCommand(envelope);
+            command = PrepareCommand(envelope);
         }
         catch (ProtocolException exception)
         {
@@ -86,7 +87,7 @@ public sealed class V1CommandDispatcher(
         string requestHash;
         try
         {
-            CommandFingerprint fingerprint = fingerprintService.Compute(canonicalPayload);
+            CommandFingerprint fingerprint = fingerprintService.Compute(command.CanonicalPayload);
             if (fingerprint.KeyWasCreated)
             {
                 Volatile.Write(ref _fingerprintKeyState, 2);
@@ -94,59 +95,58 @@ public sealed class V1CommandDispatcher(
                 Volatile.Write(ref _fingerprintKeyState, existingV2Commands ? 2 : 1);
             }
             if (Volatile.Read(ref _fingerprintKeyState) == 2)
-                return Result(commandId, envelope.Type, false, "command_key_unavailable");
+                return Result(command.CommandId, envelope.Type, false, "command_key_unavailable");
 
             requestHash = fingerprint.Value;
         }
         catch (AgentConfigurationException exception)
         {
-            return Result(commandId, envelope.Type, false, exception.Code);
+            return Result(command.CommandId, envelope.Type, false, exception.Code);
         }
         catch (AgentStoreException exception)
         {
             await coordinator.MarkDegradedAsync(exception.ErrorCode, CancellationToken.None);
-            return Result(commandId, envelope.Type, false, exception.ErrorCode);
+            return Result(command.CommandId, envelope.Type, false, exception.ErrorCode);
         }
         catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
         {
-            return Result(commandId, envelope.Type, false, "command_key_unavailable");
+            return Result(command.CommandId, envelope.Type, false, "command_key_unavailable");
         }
         ProcessedCommand? existing;
         try
         {
-            existing = await eventStore.FindCommandAsync(commandId, cancellationToken);
+            existing = await eventStore.FindCommandAsync(command.CommandId, cancellationToken);
         }
         catch (AgentStoreException exception)
         {
             await coordinator.MarkDegradedAsync(exception.ErrorCode, CancellationToken.None);
-            return Result(commandId, envelope.Type, false, exception.ErrorCode);
+            return Result(command.CommandId, envelope.Type, false, exception.ErrorCode);
         }
         catch (Exception exception) when (exception is not OperationCanceledException)
         {
             await coordinator.MarkDegradedAsync("outbox_unavailable", CancellationToken.None);
-            return Result(commandId, envelope.Type, false, "outbox_unavailable");
+            return Result(command.CommandId, envelope.Type, false, "outbox_unavailable");
         }
         if (existing != null)
         {
             string expectedHash = existing.RequestHash.StartsWith("v2:", StringComparison.Ordinal)
                 ? requestHash
-                : ProtocolCodec.ComputeCommandIdentityHash(envelope.Type, commandId, callId);
+                : ProtocolCodec.ComputeCommandIdentityHash(envelope.Type, command.CommandId, command.CallId);
             if (!string.Equals(existing.CommandType, envelope.Type, StringComparison.Ordinal) ||
                 !string.Equals(existing.RequestHash, expectedHash, StringComparison.Ordinal))
             {
-                return Result(commandId, envelope.Type, false, "command_duplicate_conflict");
+                return Result(command.CommandId, envelope.Type, false, "command_duplicate_conflict");
             }
 
             return System.Text.Encoding.UTF8.GetBytes(existing.ResultJson);
         }
 
-        await MaybePruneCommandsAsync();
-        byte[] provisional = Result(commandId, envelope.Type, false, "command_outcome_unknown");
+        byte[] provisional = Result(command.CommandId, envelope.Type, false, "command_outcome_unknown");
         try
         {
             await eventStore.SaveCommandAsync(
                 new ProcessedCommand(
-                    commandId,
+                    command.CommandId,
                     envelope.Type,
                     requestHash,
                     System.Text.Encoding.UTF8.GetString(provisional),
@@ -157,35 +157,35 @@ public sealed class V1CommandDispatcher(
         catch (AgentStoreException exception)
         {
             await coordinator.MarkDegradedAsync(exception.ErrorCode, CancellationToken.None);
-            return Result(commandId, envelope.Type, false, exception.ErrorCode);
+            return Result(command.CommandId, envelope.Type, false, exception.ErrorCode);
         }
         catch (Exception exception) when (exception is not OperationCanceledException)
         {
             await coordinator.MarkDegradedAsync("outbox_unavailable", CancellationToken.None);
-            return Result(commandId, envelope.Type, false, "outbox_unavailable");
+            return Result(command.CommandId, envelope.Type, false, "outbox_unavailable");
         }
 
         byte[] result;
         string executionState;
         try
         {
-            await ExecuteAsync(envelope, cancellationToken);
-            result = Result(commandId, envelope.Type, true, null);
+            await command.Execute(cancellationToken);
+            result = Result(command.CommandId, envelope.Type, true, null);
             executionState = "completed";
         }
         catch (AgentCommandException exception)
         {
-            result = Result(commandId, envelope.Type, false, exception.ErrorCode);
+            result = Result(command.CommandId, envelope.Type, false, exception.ErrorCode);
             executionState = "failed";
         }
         catch (ProtocolException exception)
         {
-            result = Result(commandId, envelope.Type, false, exception.Code);
+            result = Result(command.CommandId, envelope.Type, false, exception.Code);
             executionState = "failed";
         }
         catch
         {
-            result = Result(commandId, envelope.Type, false, "internal_error");
+            result = Result(command.CommandId, envelope.Type, false, "internal_error");
             executionState = "failed";
         }
 
@@ -193,7 +193,7 @@ public sealed class V1CommandDispatcher(
         {
             await eventStore.SaveCommandAsync(
                 new ProcessedCommand(
-                    commandId,
+                    command.CommandId,
                     envelope.Type,
                     requestHash,
                     System.Text.Encoding.UTF8.GetString(result),
@@ -204,168 +204,177 @@ public sealed class V1CommandDispatcher(
         catch (AgentStoreException exception)
         {
             await coordinator.MarkDegradedAsync(exception.ErrorCode, CancellationToken.None);
-            return Result(commandId, envelope.Type, false, "command_outcome_unknown");
+            return Result(command.CommandId, envelope.Type, false, "command_outcome_unknown");
         }
         catch (Exception exception) when (exception is not OperationCanceledException)
         {
             await coordinator.MarkDegradedAsync("outbox_unavailable", CancellationToken.None);
-            return Result(commandId, envelope.Type, false, "command_outcome_unknown");
+            return Result(command.CommandId, envelope.Type, false, "command_outcome_unknown");
         }
 
-        await MaybePruneCommandsAsync();
+        ScheduleCommandPruneIfDue();
         return result;
     }
 
-    private async Task ExecuteAsync(ProtocolEnvelope envelope, CancellationToken cancellationToken)
+    private PreparedCommand PrepareCommand(ProtocolEnvelope envelope)
     {
-        switch (envelope.Type)
+        PreparedCommand prepared = envelope.Type switch
         {
-            case "session.configure":
-                await coordinator.ConfigureAsync(
-                    ProtocolCodec.DeserializePayload<ConfigureCommand>(envelope.Payload),
-                    cancellationToken);
-                break;
-            case "registration.start":
-                _ = ProtocolCodec.DeserializePayload<CommandHeader>(envelope.Payload);
-                await coordinator.StartRegistrationAsync(cancellationToken);
-                break;
-            case "registration.stop":
-                _ = ProtocolCodec.DeserializePayload<CommandHeader>(envelope.Payload);
-                await coordinator.StopRegistrationAsync(cancellationToken);
-                break;
-            case "call.start":
-                await coordinator.StartCallAsync(
-                    ProtocolCodec.DeserializePayload<CallStartCommand>(envelope.Payload),
-                    cancellationToken);
-                break;
-            case "call.answer":
-                await coordinator.AnswerAsync(
-                    ProtocolCodec.DeserializePayload<CallCommand>(envelope.Payload),
-                    cancellationToken);
-                break;
-            case "call.reject":
-                await coordinator.RejectAsync(
-                    ProtocolCodec.DeserializePayload<CallCommand>(envelope.Payload),
-                    cancellationToken);
-                break;
-            case "call.hangup":
-                await coordinator.HangupAsync(
-                    ProtocolCodec.DeserializePayload<CallCommand>(envelope.Payload),
-                    cancellationToken);
-                break;
-            case "call.dtmf":
-                await coordinator.SendDtmfAsync(
-                    ProtocolCodec.DeserializePayload<DtmfCommand>(envelope.Payload),
-                    cancellationToken);
-                break;
-            case "call.mute.set":
-                await coordinator.SetMicrophoneMutedAsync(
-                    ProtocolCodec.DeserializePayload<CallMuteCommand>(envelope.Payload),
-                    cancellationToken);
-                break;
-            case "audio.output.volume.set":
-                await coordinator.SetOutputVolumeAsync(
-                    ProtocolCodec.DeserializePayload<CallVolumeCommand>(envelope.Payload),
-                    cancellationToken);
-                break;
-            case "audio.input.volume.set":
-                await coordinator.SetInputVolumeAsync(
-                    ProtocolCodec.DeserializePayload<CallVolumeCommand>(envelope.Payload),
-                    cancellationToken);
-                break;
-            case "audio.output.volume.preference.set":
-                await coordinator.SetOutputVolumePreferenceAsync(
-                    ProtocolCodec.DeserializePayload<AudioVolumePreferenceCommand>(envelope.Payload),
-                    cancellationToken);
-                break;
-            case "audio.input.volume.preference.set":
-                await coordinator.SetInputVolumePreferenceAsync(
-                    ProtocolCodec.DeserializePayload<AudioVolumePreferenceCommand>(envelope.Payload),
-                    cancellationToken);
-                break;
-            case "audio.devices.preference.set":
-                await coordinator.SetAudioDevicePreferencesAsync(
-                    ProtocolCodec.DeserializePayload<AudioDevicePreferenceCommand>(envelope.Payload),
-                    cancellationToken);
-                break;
-            case "audio.output.test":
-                await coordinator.TestOutputDeviceAsync(
-                    ProtocolCodec.DeserializePayload<AudioDeviceTestCommand>(envelope.Payload),
-                    cancellationToken);
-                break;
-            case "audio.input.test":
-                await coordinator.TestInputDeviceAsync(
-                    ProtocolCodec.DeserializePayload<AudioDeviceTestCommand>(envelope.Payload),
-                    cancellationToken);
-                break;
-            case "state.get":
-                _ = ProtocolCodec.DeserializePayload<CommandHeader>(envelope.Payload);
-                break;
-            default:
-                throw new AgentCommandException("invalid_message");
-        }
-    }
-
-    private static string GetCommandId(ProtocolEnvelope envelope)
-    {
-        if (!envelope.Payload.TryGetProperty("commandId", out JsonElement property) ||
-            property.ValueKind != JsonValueKind.String ||
-            string.IsNullOrWhiteSpace(property.GetString()))
-        {
-            throw new ProtocolException("invalid_message", "commandId is required.");
-        }
-
-        return property.GetString()!;
-    }
-
-    private static string? GetCallIdForFingerprint(ProtocolEnvelope envelope)
-    {
-        if (!CallScopedCommandTypes.Contains(envelope.Type))
-        {
-            return null;
-        }
-
-        if (!envelope.Payload.TryGetProperty("callId", out JsonElement property) ||
-            property.ValueKind != JsonValueKind.String ||
-            string.IsNullOrWhiteSpace(property.GetString()))
-        {
-            throw new ProtocolException("invalid_message", "callId is required.");
-        }
-
-        string callId = property.GetString()!;
-        ProtocolCodec.ValidateUuid(callId, "callId");
-        return callId;
-    }
-
-    private static byte[] CanonicalizeCommand(ProtocolEnvelope envelope)
-    {
-        object canonical = envelope.Type switch
-        {
-            "session.configure" => CanonicalizeConfigure(
-                ProtocolCodec.DeserializePayload<ConfigureCommand>(envelope.Payload)),
-            "registration.start" or "registration.stop" or "state.get" =>
-                ProtocolCodec.DeserializePayload<CommandHeader>(envelope.Payload),
-            "call.start" => CanonicalizeCallStart(
-                ProtocolCodec.DeserializePayload<CallStartCommand>(envelope.Payload)),
-            "call.answer" or "call.reject" or "call.hangup" =>
-                ProtocolCodec.DeserializePayload<CallCommand>(envelope.Payload),
-            "call.dtmf" => CanonicalizeDtmf(
-                ProtocolCodec.DeserializePayload<DtmfCommand>(envelope.Payload)),
-            "call.mute.set" => ProtocolCodec.DeserializePayload<CallMuteCommand>(envelope.Payload),
-            "audio.output.volume.set" or "audio.input.volume.set" => CanonicalizeVolume(
-                ProtocolCodec.DeserializePayload<CallVolumeCommand>(envelope.Payload)),
-            "audio.output.volume.preference.set" or "audio.input.volume.preference.set" =>
-                CanonicalizeVolumePreference(
-                    ProtocolCodec.DeserializePayload<AudioVolumePreferenceCommand>(envelope.Payload)),
-            "audio.devices.preference.set" => CanonicalizeAudioDevicePreference(
-                ProtocolCodec.DeserializePayload<AudioDevicePreferenceCommand>(envelope.Payload)),
-            "audio.output.test" or "audio.input.test" => CanonicalizeAudioDeviceTest(
-                ProtocolCodec.DeserializePayload<AudioDeviceTestCommand>(envelope.Payload)),
+            "session.configure" => PrepareConfigure(envelope),
+            "registration.start" => PrepareHeader(
+                envelope,
+                coordinator.StartRegistrationAsync),
+            "registration.stop" => PrepareHeader(
+                envelope,
+                coordinator.StopRegistrationAsync),
+            "call.start" => PrepareCallStart(envelope),
+            "call.answer" => PrepareCall(
+                envelope,
+                coordinator.AnswerAsync),
+            "call.reject" => PrepareCall(
+                envelope,
+                coordinator.RejectAsync),
+            "call.hangup" => PrepareCall(
+                envelope,
+                coordinator.HangupAsync),
+            "call.dtmf" => PrepareDtmf(envelope),
+            "call.mute.set" => PrepareCallMute(envelope),
+            "audio.output.volume.set" => PrepareCallVolume(
+                envelope,
+                coordinator.SetOutputVolumeAsync),
+            "audio.input.volume.set" => PrepareCallVolume(
+                envelope,
+                coordinator.SetInputVolumeAsync),
+            "audio.output.volume.preference.set" => PrepareVolumePreference(
+                envelope,
+                coordinator.SetOutputVolumePreferenceAsync),
+            "audio.input.volume.preference.set" => PrepareVolumePreference(
+                envelope,
+                coordinator.SetInputVolumePreferenceAsync),
+            "audio.devices.preference.set" => PrepareAudioDevicePreference(envelope),
+            "audio.output.test" => PrepareAudioDeviceTest(
+                envelope,
+                coordinator.TestOutputDeviceAsync),
+            "audio.input.test" => PrepareAudioDeviceTest(
+                envelope,
+                coordinator.TestInputDeviceAsync),
+            "state.get" => PrepareHeader(envelope, static _ => Task.CompletedTask),
             _ => throw new ProtocolException("invalid_message", "Command type is unsupported.")
         };
 
-        return JsonSerializer.SerializeToUtf8Bytes(canonical, canonical.GetType(), ProtocolJson.Options);
+        ProtocolCodec.ValidateUuid(prepared.CommandId, "commandId");
+        if (prepared.CallId != null)
+        {
+            ProtocolCodec.ValidateUuid(prepared.CallId, "callId");
+        }
+
+        return prepared;
     }
+
+    private PreparedCommand PrepareConfigure(ProtocolEnvelope envelope)
+    {
+        ConfigureCommand command = ProtocolCodec.DeserializePayload<ConfigureCommand>(envelope.Payload);
+        object canonical = CanonicalizeConfigure(command);
+        return CreatePrepared(command.CommandId, null, canonical, token => coordinator.ConfigureAsync(command, token));
+    }
+
+    private PreparedCommand PrepareHeader(
+        ProtocolEnvelope envelope,
+        Func<CancellationToken, Task> execute)
+    {
+        CommandHeader command = ProtocolCodec.DeserializePayload<CommandHeader>(envelope.Payload);
+        return CreatePrepared(command.CommandId, null, command, execute);
+    }
+
+    private PreparedCommand PrepareCallStart(ProtocolEnvelope envelope)
+    {
+        CallStartCommand command = ProtocolCodec.DeserializePayload<CallStartCommand>(envelope.Payload);
+        object canonical = CanonicalizeCallStart(command);
+        return CreatePrepared(
+            command.CommandId,
+            command.CallId,
+            canonical,
+            token => coordinator.StartCallAsync(command, token));
+    }
+
+    private PreparedCommand PrepareCall(
+        ProtocolEnvelope envelope,
+        Func<CallCommand, CancellationToken, Task> execute)
+    {
+        CallCommand command = ProtocolCodec.DeserializePayload<CallCommand>(envelope.Payload);
+        return CreatePrepared(command.CommandId, command.CallId, command, token => execute(command, token));
+    }
+
+    private PreparedCommand PrepareDtmf(ProtocolEnvelope envelope)
+    {
+        DtmfCommand command = ProtocolCodec.DeserializePayload<DtmfCommand>(envelope.Payload);
+        object canonical = CanonicalizeDtmf(command);
+        return CreatePrepared(
+            command.CommandId,
+            command.CallId,
+            canonical,
+            token => coordinator.SendDtmfAsync(command, token));
+    }
+
+    private PreparedCommand PrepareCallMute(ProtocolEnvelope envelope)
+    {
+        CallMuteCommand command = ProtocolCodec.DeserializePayload<CallMuteCommand>(envelope.Payload);
+        return CreatePrepared(
+            command.CommandId,
+            command.CallId,
+            command,
+            token => coordinator.SetMicrophoneMutedAsync(command, token));
+    }
+
+    private PreparedCommand PrepareCallVolume(
+        ProtocolEnvelope envelope,
+        Func<CallVolumeCommand, CancellationToken, Task> execute)
+    {
+        CallVolumeCommand command = ProtocolCodec.DeserializePayload<CallVolumeCommand>(envelope.Payload);
+        CallVolumeCommand canonical = CanonicalizeVolume(command);
+        return CreatePrepared(command.CommandId, command.CallId, canonical, token => execute(command, token));
+    }
+
+    private PreparedCommand PrepareVolumePreference(
+        ProtocolEnvelope envelope,
+        Func<AudioVolumePreferenceCommand, CancellationToken, Task> execute)
+    {
+        AudioVolumePreferenceCommand command =
+            ProtocolCodec.DeserializePayload<AudioVolumePreferenceCommand>(envelope.Payload);
+        AudioVolumePreferenceCommand canonical = CanonicalizeVolumePreference(command);
+        return CreatePrepared(command.CommandId, null, canonical, token => execute(command, token));
+    }
+
+    private PreparedCommand PrepareAudioDevicePreference(ProtocolEnvelope envelope)
+    {
+        AudioDevicePreferenceCommand command =
+            ProtocolCodec.DeserializePayload<AudioDevicePreferenceCommand>(envelope.Payload);
+        AudioDevicePreferenceCommand canonical = CanonicalizeAudioDevicePreference(command);
+        return CreatePrepared(
+            command.CommandId,
+            null,
+            canonical,
+            token => coordinator.SetAudioDevicePreferencesAsync(command, token));
+    }
+
+    private PreparedCommand PrepareAudioDeviceTest(
+        ProtocolEnvelope envelope,
+        Func<AudioDeviceTestCommand, CancellationToken, Task> execute)
+    {
+        AudioDeviceTestCommand command = ProtocolCodec.DeserializePayload<AudioDeviceTestCommand>(envelope.Payload);
+        AudioDeviceTestCommand canonical = CanonicalizeAudioDeviceTest(command);
+        return CreatePrepared(command.CommandId, null, canonical, token => execute(command, token));
+    }
+
+    private static PreparedCommand CreatePrepared(
+        string commandId,
+        string? callId,
+        object canonical,
+        Func<CancellationToken, Task> execute) => new(
+        commandId,
+        callId,
+        JsonSerializer.SerializeToUtf8Bytes(canonical, canonical.GetType(), ProtocolJson.Options),
+        execute);
 
     private static object CanonicalizeConfigure(ConfigureCommand command)
     {
@@ -479,29 +488,55 @@ public sealed class V1CommandDispatcher(
         }
     }
 
-    private async Task MaybePruneCommandsAsync()
+    private void ScheduleCommandPruneIfDue()
     {
         long nowTicks = clock.UtcNow.UtcTicks;
         long nextTicks = Volatile.Read(ref _nextPruneUtcTicks);
         if (nowTicks < nextTicks ||
             Interlocked.CompareExchange(
                 ref _nextPruneUtcTicks,
-                clock.UtcNow.AddMinutes(15).UtcTicks,
+                clock.UtcNow.Add(_maintenancePolicy.Interval).UtcTicks,
                 nextTicks) != nextTicks)
         {
             return;
         }
 
+        _maintenanceTasks.Track("command_prune", PruneCommandsAsync());
+    }
+
+    private async Task PruneCommandsAsync()
+    {
         try
         {
             await eventStore.PruneCommandsAsync(
-                clock.UtcNow.AddDays(-30),
-                45_000,
+                clock.UtcNow.Subtract(_maintenancePolicy.Retention),
+                _maintenancePolicy.MaximumRetained,
                 CancellationToken.None);
         }
         catch (Exception exception) when (exception is not OperationCanceledException)
         {
+            AgentPerformanceTelemetry.RecordCommandPruneFailure();
+            Volatile.Write(ref _nextPruneUtcTicks, clock.UtcNow.Add(_maintenancePolicy.FailureRetry).UtcTicks);
         }
+    }
+
+    private sealed record PreparedCommand(
+        string CommandId,
+        string? CallId,
+        byte[] CanonicalPayload,
+        Func<CancellationToken, Task> Execute);
+
+    private static CommandMaintenancePolicy ValidateMaintenancePolicy(CommandMaintenancePolicy policy)
+    {
+        if (policy.Retention <= TimeSpan.Zero ||
+            policy.MaximumRetained < 1 ||
+            policy.Interval <= TimeSpan.Zero ||
+            policy.FailureRetry <= TimeSpan.Zero)
+        {
+            throw new ArgumentOutOfRangeException(nameof(policy));
+        }
+
+        return policy;
     }
 
     private static byte[] Result(string commandId, string commandType, bool accepted, string? errorCode) =>

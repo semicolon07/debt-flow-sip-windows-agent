@@ -88,6 +88,45 @@ public sealed class WebSocketEventPublisherTests
         Assert.Equal([1, 2], durableSequences);
     }
 
+    [Fact]
+    public async Task RealtimeOverflow_DropsRealtimeWithoutAbortingControlLane()
+    {
+        await using var publisher = new WebSocketEventPublisher();
+        var sendRelease = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        using var socket = new RecordingWebSocket(sendRelease.Task);
+        Assert.True(publisher.TryAttach(socket, CancellationToken.None));
+        publisher.Activate(socket, replayedThroughSequence: 0);
+
+        for (int index = 0; index < 160; index++)
+        {
+            await publisher.PublishRealtimeAsync(
+                "audio.input.level",
+                new RealtimeEventPayload(
+                    "realtime",
+                    NewId(),
+                    NewId(),
+                    NewId(),
+                    DateTimeOffset.UtcNow,
+                    JsonSerializer.SerializeToElement(new { level = index })),
+                CancellationToken.None);
+        }
+
+        Task control = publisher.SendControlAndWaitAsync(
+            "pong",
+            "session.pong",
+            new { correlationMessageId = NewId() },
+            CancellationToken.None);
+        Assert.True(publisher.IsConnected);
+        sendRelease.TrySetResult();
+        await control.WaitAsync(TimeSpan.FromSeconds(2));
+
+        Assert.True(publisher.IsConnected);
+        Assert.Equal(WebSocketState.Open, socket.State);
+        Assert.Contains(
+            socket.Messages.Select(message => ProtocolCodec.Deserialize(message)),
+            message => message.Type == "session.pong");
+    }
+
     private static StoredDurableEvent StoredEvent(long sequence) => new(
         sequence,
         NewId(),

@@ -9,6 +9,12 @@ using DebtFlow.SipAgent.Application;
 
 namespace DebtFlow.SipAgent.Host;
 
+public sealed record LoggerOperationalHealth(
+    int QueueDepth,
+    int QueueHighWater,
+    long DroppedRecords,
+    long WriterFailures);
+
 public sealed class SafeJsonLoggerProvider : ILoggerProvider
 {
     private const long MaximumFileBytes = 10 * 1024 * 1024;
@@ -25,12 +31,23 @@ public sealed class SafeJsonLoggerProvider : ILoggerProvider
     private FileStream? _writer;
     private int _disposed;
     private long _droppedLines;
+    private long _totalDroppedLines;
+    private long _writerFailures;
+    private int _queueHighWater;
 
     public SafeJsonLoggerProvider(string directory, bool writeConsole)
     {
         _directory = directory;
         _writeConsole = writeConsole;
-        Directory.CreateDirectory(directory);
+        try
+        {
+            Directory.CreateDirectory(directory);
+        }
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
+        {
+            AgentPerformanceTelemetry.RecordLogWriterFailure(exception.GetType().Name);
+            Interlocked.Increment(ref _writerFailures);
+        }
         _queue = Channel.CreateBounded<byte[]>(new BoundedChannelOptions(2048)
         {
             SingleReader = true,
@@ -42,6 +59,12 @@ public sealed class SafeJsonLoggerProvider : ILoggerProvider
     }
 
     public ILogger CreateLogger(string categoryName) => new SafeJsonLogger(this, categoryName);
+
+    public LoggerOperationalHealth GetOperationalHealth() => new(
+        _queue.Reader.Count,
+        Volatile.Read(ref _queueHighWater),
+        Volatile.Read(ref _totalDroppedLines),
+        Volatile.Read(ref _writerFailures));
 
     public void Dispose()
     {
@@ -65,6 +88,27 @@ public sealed class SafeJsonLoggerProvider : ILoggerProvider
     }
 
     private void Write<TState>(
+        string category,
+        LogLevel level,
+        EventId eventId,
+        TState state,
+        Exception? exception)
+    {
+        try
+        {
+            WriteCore(category, level, eventId, state, exception);
+        }
+        catch (Exception writeException) when (
+            writeException is not OutOfMemoryException and not AccessViolationException)
+        {
+            AgentPerformanceTelemetry.RecordLogWriterFailure(writeException.GetType().Name);
+            AgentPerformanceTelemetry.RecordDroppedLogs(1);
+            Interlocked.Increment(ref _writerFailures);
+            Interlocked.Increment(ref _totalDroppedLines);
+        }
+    }
+
+    private void WriteCore<TState>(
         string category,
         LogLevel level,
         EventId eventId,
@@ -112,6 +156,11 @@ public sealed class SafeJsonLoggerProvider : ILoggerProvider
         if (!_queue.Writer.TryWrite(line))
         {
             Interlocked.Increment(ref _droppedLines);
+            Interlocked.Increment(ref _totalDroppedLines);
+        }
+        else
+        {
+            RecordQueueDepth();
         }
     }
 
@@ -205,6 +254,7 @@ public sealed class SafeJsonLoggerProvider : ILoggerProvider
                 catch (Exception exception) when (exception is not OperationCanceledException)
                 {
                     AgentPerformanceTelemetry.RecordLogWriterFailure(exception.GetType().Name);
+                    Interlocked.Increment(ref _writerFailures);
                     ResetWriterAfterFailure();
                     dirty = false;
                     pendingRead = null;
@@ -237,6 +287,23 @@ public sealed class SafeJsonLoggerProvider : ILoggerProvider
             }
 
             _writer = null;
+        }
+    }
+
+    private void RecordQueueDepth()
+    {
+        int depth = _queue.Reader.Count;
+        int observed = Volatile.Read(ref _queueHighWater);
+        while (depth > observed)
+        {
+            int previous = Interlocked.CompareExchange(ref _queueHighWater, depth, observed);
+            if (previous == observed)
+            {
+                AgentPerformanceTelemetry.RecordQueueHighWater("logger", depth);
+                break;
+            }
+
+            observed = previous;
         }
     }
 
@@ -401,8 +468,15 @@ public static class SafeLogSanitizer
     public static string Sanitize(string value)
     {
         string bounded = value.Length <= 4096 ? value : value[..4096];
-        string assignmentsRemoved = SensitiveAssignment.Replace(bounded, "$1=[REDACTED]");
-        string originsRemoved = WebOrigin.Replace(assignmentsRemoved, "[ORIGIN_REDACTED]");
-        return LongNumber.Replace(originsRemoved, "[REDACTED]");
+        try
+        {
+            string assignmentsRemoved = SensitiveAssignment.Replace(bounded, "$1=[REDACTED]");
+            string originsRemoved = WebOrigin.Replace(assignmentsRemoved, "[ORIGIN_REDACTED]");
+            return LongNumber.Replace(originsRemoved, "[REDACTED]");
+        }
+        catch (RegexMatchTimeoutException)
+        {
+            return "[REDACTED:SANITIZER_TIMEOUT]";
+        }
     }
 }

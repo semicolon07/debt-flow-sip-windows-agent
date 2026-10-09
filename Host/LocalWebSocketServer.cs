@@ -20,6 +20,7 @@ public sealed class LocalWebSocketServer(
     private int _clientConnected;
 
     public bool IsClientConnected => Volatile.Read(ref _clientConnected) != 0;
+    public WebSocketOperationalHealth GetOperationalHealth() => publisher.GetOperationalHealth();
 
     public async Task HandleAsync(HttpContext context)
     {
@@ -58,7 +59,7 @@ public sealed class LocalWebSocketServer(
                     "protocol.error",
                     new ErrorPayload(null, "client_already_connected", false)),
                 context.RequestAborted);
-            await rejected.CloseAsync(WebSocketCloseStatus.PolicyViolation, "client_already_connected", context.RequestAborted);
+            await TryCloseAsync(rejected, WebSocketCloseStatus.PolicyViolation, "client_already_connected");
             return;
         }
 
@@ -84,13 +85,13 @@ public sealed class LocalWebSocketServer(
                         "protocol.error",
                         new ErrorPayload(hello.MessageId, "protocol_version_unsupported", false)),
                     context.RequestAborted);
-                await socket.CloseAsync(WebSocketCloseStatus.PolicyViolation, "protocol_version_unsupported", context.RequestAborted);
+                await TryCloseAsync(socket, WebSocketCloseStatus.PolicyViolation, "protocol_version_unsupported");
                 return;
             }
 
             if (!publisher.TryAttach(socket, context.RequestAborted))
             {
-                await socket.CloseAsync(WebSocketCloseStatus.PolicyViolation, "client_already_connected", context.RequestAborted);
+                await TryCloseAsync(socket, WebSocketCloseStatus.PolicyViolation, "client_already_connected");
                 return;
             }
 
@@ -148,15 +149,17 @@ public sealed class LocalWebSocketServer(
                         CancellationToken.None);
                 }
 
-                await socket.CloseAsync(WebSocketCloseStatus.InvalidPayloadData, exception.Code, CancellationToken.None);
+                await TryCloseAsync(socket, WebSocketCloseStatus.InvalidPayloadData, exception.Code);
             }
+        }
+        catch (ClientClosedException)
+        {
+            logger.LogInformation("WebSocket client closed the session");
+            await TryCloseAsync(socket, WebSocketCloseStatus.NormalClosure, "client_closed");
         }
         catch (OperationCanceledException)
         {
-            if (socket is { State: WebSocketState.Open })
-            {
-                await socket.CloseAsync(WebSocketCloseStatus.EndpointUnavailable, "timeout", CancellationToken.None);
-            }
+            await TryCloseAsync(socket, WebSocketCloseStatus.EndpointUnavailable, "timeout");
         }
         catch (WebSocketException exception)
         {
@@ -221,14 +224,43 @@ public sealed class LocalWebSocketServer(
     {
         long started = Stopwatch.GetTimestamp();
         long replayedEventCount = 0;
+        long afterSequence = eventStore.LastAcknowledgedSequence;
         try
         {
-            long afterSequence = eventStore.LastAcknowledgedSequence;
             while (true)
             {
-                IReadOnlyList<StoredDurableEvent> page = await eventStore.LoadPendingAsync(afterSequence, 250, cancellationToken);
+                IReadOnlyList<StoredDurableEvent> page;
+                try
+                {
+                    page = await eventStore.LoadPendingAsync(afterSequence, 250, cancellationToken);
+                }
+                catch (AgentStoreException exception)
+                {
+                    await coordinator.MarkDegradedAsync(exception.ErrorCode, CancellationToken.None);
+                    throw;
+                }
+                catch (Exception exception) when (exception is not OperationCanceledException)
+                {
+                    await coordinator.MarkDegradedAsync("outbox_unavailable", CancellationToken.None);
+                    throw;
+                }
+
                 if (page.Count == 0)
                 {
+                    try
+                    {
+                        await coordinator.RefreshStorageHealthAsync(cancellationToken);
+                    }
+                    catch (AgentStoreException exception)
+                    {
+                        await coordinator.MarkDegradedAsync(exception.ErrorCode, CancellationToken.None);
+                        throw;
+                    }
+                    catch (Exception exception) when (exception is not OperationCanceledException)
+                    {
+                        await coordinator.MarkDegradedAsync("outbox_unavailable", CancellationToken.None);
+                        throw;
+                    }
                     return afterSequence;
                 }
 
@@ -236,11 +268,6 @@ public sealed class LocalWebSocketServer(
                 replayedEventCount += page.Count;
                 afterSequence = page[^1].Sequence;
             }
-        }
-        catch (Exception exception) when (exception is not OperationCanceledException)
-        {
-            await coordinator.MarkDegradedAsync("outbox_unavailable", CancellationToken.None);
-            throw;
         }
         finally
         {
@@ -265,7 +292,7 @@ public sealed class LocalWebSocketServer(
             result = await socket.ReceiveAsync(chunk, timeout.Token);
             if (result.MessageType == WebSocketMessageType.Close)
             {
-                throw new OperationCanceledException("Client closed the WebSocket.");
+                throw new ClientClosedException();
             }
 
             if (result.MessageType != WebSocketMessageType.Text)
@@ -300,6 +327,28 @@ public sealed class LocalWebSocketServer(
     private static Task SendDirectAsync(WebSocket socket, byte[] message, CancellationToken cancellationToken) =>
         socket.SendAsync(message, WebSocketMessageType.Text, true, cancellationToken);
 
+    private static async Task TryCloseAsync(
+        WebSocket? socket,
+        WebSocketCloseStatus status,
+        string description)
+    {
+        if (socket is not { State: WebSocketState.Open or WebSocketState.CloseReceived })
+        {
+            return;
+        }
+
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(2));
+        try
+        {
+            await socket.CloseAsync(status, description, timeout.Token);
+        }
+        catch (Exception exception) when (
+            exception is OperationCanceledException or WebSocketException or ObjectDisposedException)
+        {
+            socket.Abort();
+        }
+    }
+
     private static void ValidateHello(ProtocolEnvelope hello)
     {
         if (hello.Kind != "hello" || hello.Type != "session.hello")
@@ -320,4 +369,6 @@ public sealed class LocalWebSocketServer(
             throw new ProtocolException("invalid_message", "session.hello payload is invalid.");
         }
     }
+
+    private sealed class ClientClosedException : Exception;
 }

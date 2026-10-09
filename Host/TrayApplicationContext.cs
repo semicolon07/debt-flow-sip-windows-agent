@@ -2,7 +2,6 @@ using System.Diagnostics;
 using System.Drawing;
 using Microsoft.Extensions.Logging;
 using Microsoft.Win32;
-using NAudio.Wave;
 using DebtFlow.SipAgent.Application;
 using DebtFlow.SipAgent.Protocol;
 
@@ -19,6 +18,7 @@ public sealed class TrayApplicationContext : ApplicationContext
     private readonly ILogger<TrayApplicationContext> _logger;
     private readonly IAgentEventStore _eventStore;
     private readonly DiagnosticBundleExporter _diagnosticExporter;
+    private readonly SafeJsonLoggerProvider _logProvider;
     private readonly string _logDirectory;
     private readonly int? _tlsDaysRemaining;
     private readonly string? _tlsWarningCode;
@@ -46,6 +46,7 @@ public sealed class TrayApplicationContext : ApplicationContext
         ILogger<TrayApplicationContext> logger,
         IAgentEventStore eventStore,
         DiagnosticBundleExporter diagnosticExporter,
+        SafeJsonLoggerProvider logProvider,
         string logDirectory,
         bool startupRegistrationFailed,
         int? tlsDaysRemaining = null,
@@ -59,6 +60,7 @@ public sealed class TrayApplicationContext : ApplicationContext
         _logger = logger;
         _eventStore = eventStore;
         _diagnosticExporter = diagnosticExporter;
+        _logProvider = logProvider;
         _logDirectory = logDirectory;
         _tlsDaysRemaining = tlsDaysRemaining;
         _tlsWarningCode = tlsWarningCode;
@@ -79,13 +81,17 @@ public sealed class TrayApplicationContext : ApplicationContext
         var openLogs = new ToolStripMenuItem(TrayText.Get("OpenLogs"));
         openLogs.Click += (_, _) => OpenLogDirectory();
         var exportDiagnostics = new ToolStripMenuItem(TrayText.Get("ExportDiagnostics"));
-        exportDiagnostics.Click += async (_, _) => await ExportDiagnosticsAsync();
+        exportDiagnostics.Click += (_, _) => RunUiTask(ExportDiagnosticsAsync, "export_diagnostics");
         var repairCertificate = new ToolStripMenuItem(TrayText.Get("RepairCertificate"));
-        repairCertificate.Click += async (_, _) => await RequestCertificateMaintenanceAsync(AgentMaintenanceRequest.RepairCertificate);
+        repairCertificate.Click += (_, _) => RunUiTask(
+            () => RequestCertificateMaintenanceAsync(AgentMaintenanceRequest.RepairCertificate),
+            "repair_certificate");
         var removeCertificate = new ToolStripMenuItem(TrayText.Get("RemoveCertificate"));
-        removeCertificate.Click += async (_, _) => await RequestCertificateMaintenanceAsync(AgentMaintenanceRequest.RemoveCertificate);
+        removeCertificate.Click += (_, _) => RunUiTask(
+            () => RequestCertificateMaintenanceAsync(AgentMaintenanceRequest.RemoveCertificate),
+            "remove_certificate");
         var exit = new ToolStripMenuItem(TrayText.Get("Exit"));
-        exit.Click += async (_, _) => await ExitAsync(confirmActiveCall: true);
+        exit.Click += (_, _) => RunUiTask(() => ExitAsync(confirmActiveCall: true), "exit");
 
         var menu = new ContextMenuStrip();
         menu.Items.AddRange([
@@ -111,14 +117,14 @@ public sealed class TrayApplicationContext : ApplicationContext
             ContextMenuStrip = menu,
             Visible = true
         };
-        _notifyIcon.DoubleClick += async (_, _) => await RefreshStatusAsync();
+        _notifyIcon.DoubleClick += (_, _) => RunUiTask(RefreshStatusAsync, "status_refresh");
 
         _timer = new System.Windows.Forms.Timer
         {
             Interval = StatusRefreshIntervalMilliseconds,
             Enabled = true
         };
-        _timer.Tick += async (_, _) => await RefreshStatusAsync();
+        _timer.Tick += (_, _) => RunUiTask(RefreshStatusAsync, "status_refresh");
         _singleInstance.ActivationRequested += OnActivationRequested;
         SystemEvents.SessionEnding += OnSessionEnding;
 
@@ -137,7 +143,7 @@ public sealed class TrayApplicationContext : ApplicationContext
             Notify(tlsWarningCode, TrayText.Format("TlsWarning", tlsWarningCode));
         }
 
-        _ = RefreshStatusAsync();
+        RunUiTask(RefreshStatusAsync, "initial_status_refresh");
     }
 
     protected override void Dispose(bool disposing)
@@ -239,8 +245,14 @@ public sealed class TrayApplicationContext : ApplicationContext
         {
             _logger.LogWarning("Graceful shutdown exceeded its time limit");
         }
-
-        ExitThread();
+        catch (Exception exception)
+        {
+            _logger.LogWarning("Graceful shutdown failed with {ErrorType}", exception.GetType().Name);
+        }
+        finally
+        {
+            ExitThread();
+        }
     }
 
     private async Task RequestCertificateMaintenanceAsync(AgentMaintenanceRequest request)
@@ -282,7 +294,7 @@ public sealed class TrayApplicationContext : ApplicationContext
     }
 
     private void OnSessionEnding(object sender, SessionEndingEventArgs eventArgs) =>
-        _uiContext.Post(async _ => await ExitAsync(confirmActiveCall: false), null);
+        _uiContext.Post(_ => RunUiTask(() => ExitAsync(confirmActiveCall: false), "session_ending"), null);
 
     private void OnActivationRequested() => _uiContext.Post(
         _ => Notify("second_instance", TrayText.Get("SecondInstance")),
@@ -318,8 +330,16 @@ public sealed class TrayApplicationContext : ApplicationContext
 
     private void OpenLogDirectory()
     {
-        Directory.CreateDirectory(_logDirectory);
-        Process.Start(new ProcessStartInfo(_logDirectory) { UseShellExecute = true });
+        try
+        {
+            Directory.CreateDirectory(_logDirectory);
+            Process.Start(new ProcessStartInfo(_logDirectory) { UseShellExecute = true });
+        }
+        catch (Exception exception) when (
+            exception is IOException or UnauthorizedAccessException or InvalidOperationException)
+        {
+            _logger.LogWarning("Opening the log directory failed with {ErrorType}", exception.GetType().Name);
+        }
     }
 
     private async Task ExportDiagnosticsAsync()
@@ -329,6 +349,7 @@ public sealed class TrayApplicationContext : ApplicationContext
             using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(5));
             AgentSnapshotPayload snapshot = await _coordinator.GetSnapshotAsync(timeout.Token);
             EventStoreHealth health = await _eventStore.GetHealthAsync(timeout.Token);
+            AudioDevicesSnapshot? audioDevices = snapshot.AudioDevices;
             string outputPath = Path.Combine(
                 AgentStoragePaths.DiagnosticDirectory,
                 $"debt-flow-sip-agent-diagnostics-{DateTime.UtcNow:yyyyMMdd-HHmmss}.zip");
@@ -336,13 +357,16 @@ public sealed class TrayApplicationContext : ApplicationContext
                 outputPath,
                 snapshot,
                 health,
-                WaveIn.DeviceCount,
-                WaveOut.DeviceCount,
+                Math.Max(0, (audioDevices?.InputDevices.Count ?? 1) - 1),
+                Math.Max(0, (audioDevices?.OutputDevices.Count ?? 1) - 1),
                 _options.IsOperational,
                 timeout.Token,
                 LocalTlsCertificateProfile.Version,
                 _tlsDaysRemaining,
-                _tlsWarningCode);
+                _tlsWarningCode,
+                _coordinator.GetOperationalHealth(),
+                _webSocketServer.GetOperationalHealth(),
+                _logProvider.GetOperationalHealth());
             MessageBox.Show(
                 TrayText.Format("DiagnosticExported", exported),
                 TrayText.Get("AppName"),
@@ -375,6 +399,21 @@ public sealed class TrayApplicationContext : ApplicationContext
     {
         using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(2));
         return await _coordinator.GetSnapshotAsync(timeout.Token);
+    }
+
+    private async void RunUiTask(Func<Task> action, string operation)
+    {
+        try
+        {
+            await action();
+        }
+        catch (Exception exception)
+        {
+            _logger.LogWarning(
+                "Tray operation {Operation} failed with {ErrorType}",
+                operation,
+                exception.GetType().Name);
+        }
     }
 
     private static string TruncateTooltip(string value) => value.Length <= 63 ? value : value[..63];

@@ -5,16 +5,37 @@ using DebtFlow.SipAgent.Protocol;
 
 namespace DebtFlow.SipAgent.Host;
 
+public sealed record WebSocketOperationalHealth(
+    long SessionGeneration,
+    bool Connected,
+    int ControlQueueDepth,
+    int DurableQueueDepth,
+    int RealtimeQueueDepth,
+    int ControlQueueHighWater,
+    int DurableQueueHighWater,
+    int RealtimeQueueHighWater,
+    long DroppedRealtimeEvents,
+    long QueueAbortCount,
+    long WriterFaultCount);
+
 public sealed class WebSocketEventPublisher : IAgentEventPublisher, IAsyncDisposable
 {
-    private const int OutboundCapacity = 256;
     private Session? _session;
+    private long _sessionGeneration;
+    private long _droppedRealtimeEvents;
+    private long _queueAbortCount;
+    private long _writerFaultCount;
+    private SessionQueueHealth _lastQueueHealth = SessionQueueHealth.Empty;
 
-    public bool IsConnected => Volatile.Read(ref _session) != null;
+    public bool IsConnected => Volatile.Read(ref _session) is { IsHealthy: true };
 
     public bool TryAttach(WebSocket socket, CancellationToken applicationToken)
     {
-        var session = new Session(socket, applicationToken);
+        var session = new Session(
+            Interlocked.Increment(ref _sessionGeneration),
+            socket,
+            applicationToken,
+            () => Interlocked.Increment(ref _writerFaultCount));
         if (Interlocked.CompareExchange(ref _session, session, null) == null)
         {
             session.Start();
@@ -36,6 +57,7 @@ public sealed class WebSocketEventPublisher : IAgentEventPublisher, IAsyncDispos
         if (Interlocked.CompareExchange(ref _session, null, current) == current)
         {
             await current.DisposeAsync();
+            Volatile.Write(ref _lastQueueHealth, current.GetQueueHealth());
         }
     }
 
@@ -44,7 +66,8 @@ public sealed class WebSocketEventPublisher : IAgentEventPublisher, IAsyncDispos
             ProtocolCodec.Serialize("event", storedEvent.EventType, storedEvent.ToPayload()),
             cancellationToken,
             deferUntilActive: true,
-            durableSequence: storedEvent.Sequence);
+            durableSequence: storedEvent.Sequence,
+            lane: OutboundLane.Durable);
 
     public Task PublishRealtimeAsync(
         string eventType,
@@ -53,13 +76,15 @@ public sealed class WebSocketEventPublisher : IAgentEventPublisher, IAsyncDispos
         SendAsync(
             ProtocolCodec.Serialize("event", eventType, payload),
             cancellationToken,
-            deferUntilActive: true);
+            deferUntilActive: true,
+            lane: OutboundLane.Realtime);
 
     public Task SendReplayAsync(StoredDurableEvent storedEvent, CancellationToken cancellationToken) =>
         SendAsync(
             ProtocolCodec.Serialize("event", storedEvent.EventType, storedEvent.ToPayload()),
             cancellationToken,
-            waitForDelivery: true);
+            waitForDelivery: true,
+            lane: OutboundLane.Durable);
 
     public async Task SendReplayPageAsync(
         IReadOnlyList<StoredDurableEvent> storedEvents,
@@ -84,11 +109,16 @@ public sealed class WebSocketEventPublisher : IAgentEventPublisher, IAsyncDispos
             var message = new OutboundMessage(
                 ProtocolCodec.Serialize("event", storedEvent.EventType, storedEvent.ToPayload()),
                 index == storedEvents.Count - 1 ? deliveryBarrier : null,
-                null);
+                null,
+                OutboundLane.Durable);
             await session.EnqueueReplayAsync(message, cancellationToken);
         }
 
         await deliveryBarrier.Task.WaitAsync(cancellationToken);
+        if (!ReferenceEquals(session, Volatile.Read(ref _session)) || !session.IsHealthy)
+        {
+            throw new WebSocketException("socket_not_open");
+        }
     }
 
     public Task SendControlAsync<T>(string kind, string type, T payload, CancellationToken cancellationToken) =>
@@ -114,7 +144,32 @@ public sealed class WebSocketEventPublisher : IAgentEventPublisher, IAsyncDispos
         if (current != null)
         {
             await current.DisposeAsync();
+            Volatile.Write(ref _lastQueueHealth, current.GetQueueHealth());
         }
+    }
+
+    public WebSocketOperationalHealth GetOperationalHealth()
+    {
+        Session? session = Volatile.Read(ref _session);
+        SessionQueueHealth queue = session?.GetQueueHealth() ??
+            Volatile.Read(ref _lastQueueHealth) with
+            {
+                ControlDepth = 0,
+                DurableDepth = 0,
+                RealtimeDepth = 0
+            };
+        return new WebSocketOperationalHealth(
+            session?.Generation ?? Volatile.Read(ref _sessionGeneration),
+            session is { IsHealthy: true },
+            queue.ControlDepth,
+            queue.DurableDepth,
+            queue.RealtimeDepth,
+            queue.ControlHighWater,
+            queue.DurableHighWater,
+            queue.RealtimeHighWater,
+            Volatile.Read(ref _droppedRealtimeEvents),
+            Volatile.Read(ref _queueAbortCount),
+            Volatile.Read(ref _writerFaultCount));
     }
 
     private Task SendAsync(
@@ -122,7 +177,8 @@ public sealed class WebSocketEventPublisher : IAgentEventPublisher, IAsyncDispos
         CancellationToken cancellationToken,
         bool waitForDelivery = false,
         bool deferUntilActive = false,
-        long? durableSequence = null)
+        long? durableSequence = null,
+        OutboundLane lane = OutboundLane.Control)
     {
         cancellationToken.ThrowIfCancellationRequested();
         Session? session = Volatile.Read(ref _session);
@@ -134,43 +190,112 @@ public sealed class WebSocketEventPublisher : IAgentEventPublisher, IAsyncDispos
         var outbound = new OutboundMessage(
             message,
             waitForDelivery ? new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously) : null,
-            durableSequence);
+            durableSequence,
+            lane);
         if (!session.TryEnqueue(outbound, deferUntilActive))
         {
+            if (!session.IsHealthy)
+            {
+                return lane == OutboundLane.Realtime
+                    ? Task.CompletedTask
+                    : Task.FromException(new WebSocketException("socket_not_open"));
+            }
+
+            AgentPerformanceTelemetry.RecordWebSocketQueueOverflow(lane.ToString().ToLowerInvariant());
+            if (lane == OutboundLane.Realtime)
+            {
+                AgentPerformanceTelemetry.RecordDroppedRealtimeEvent();
+                Interlocked.Increment(ref _droppedRealtimeEvents);
+                outbound.Completion?.TrySetResult();
+                return Task.CompletedTask;
+            }
+
+            Interlocked.Increment(ref _queueAbortCount);
             session.Abort();
-            return waitForDelivery
-                ? Task.FromException(new WebSocketException("outbound_queue_full"))
-                : Task.CompletedTask;
+            return Task.FromException(new WebSocketException("outbound_queue_full"));
         }
 
         return outbound.Completion?.Task.WaitAsync(cancellationToken) ?? Task.CompletedTask;
     }
 
-    private sealed record OutboundMessage(byte[] Payload, TaskCompletionSource? Completion, long? DurableSequence);
+    private enum OutboundLane
+    {
+        Control,
+        Durable,
+        Realtime
+    }
+
+    private sealed record OutboundMessage(
+        byte[] Payload,
+        TaskCompletionSource? Completion,
+        long? DurableSequence,
+        OutboundLane Lane);
+
+    private sealed record SessionQueueHealth(
+        int ControlDepth,
+        int DurableDepth,
+        int RealtimeDepth,
+        int ControlHighWater,
+        int DurableHighWater,
+        int RealtimeHighWater)
+    {
+        public static SessionQueueHealth Empty { get; } = new(0, 0, 0, 0, 0, 0);
+    }
 
     private sealed class Session : IAsyncDisposable
     {
         private readonly CancellationTokenSource _shutdown;
         private readonly object _stateGate = new();
         private readonly Queue<OutboundMessage> _deferred = new();
+        private readonly SemaphoreSlim _available = new(0);
+        private readonly Channel<OutboundMessage> _control;
+        private readonly Channel<OutboundMessage> _activation;
+        private readonly Channel<OutboundMessage> _durable;
+        private readonly Channel<OutboundMessage> _realtime;
+        private readonly Action _onWriterFault;
         private bool _active;
         private Task? _writerTask;
+        private int _healthy = 1;
+        private int _controlHighWater;
+        private int _durableHighWater;
+        private int _realtimeHighWater;
 
-        public Session(WebSocket socket, CancellationToken applicationToken)
+        public Session(
+            long generation,
+            WebSocket socket,
+            CancellationToken applicationToken,
+            Action onWriterFault)
         {
+            Generation = generation;
             Socket = socket;
+            _onWriterFault = onWriterFault;
             _shutdown = CancellationTokenSource.CreateLinkedTokenSource(applicationToken);
-            Outbound = Channel.CreateBounded<OutboundMessage>(new BoundedChannelOptions(OutboundCapacity)
+            _control = CreateLane(64);
+            _activation = CreateLane(512);
+            _durable = CreateLane(256);
+            _realtime = CreateLane(128);
+        }
+
+        private static Channel<OutboundMessage> CreateLane(int capacity) =>
+            Channel.CreateBounded<OutboundMessage>(new BoundedChannelOptions(capacity)
             {
                 SingleReader = true,
                 SingleWriter = false,
                 FullMode = BoundedChannelFullMode.Wait,
                 AllowSynchronousContinuations = false
             });
-        }
 
         public WebSocket Socket { get; }
-        public Channel<OutboundMessage> Outbound { get; }
+        public long Generation { get; }
+        public bool IsHealthy => Volatile.Read(ref _healthy) != 0;
+
+        public SessionQueueHealth GetQueueHealth() => new(
+            _control.Reader.Count,
+            _durable.Reader.Count,
+            _realtime.Reader.Count,
+            Volatile.Read(ref _controlHighWater),
+            Volatile.Read(ref _durableHighWater),
+            Volatile.Read(ref _realtimeHighWater));
 
         public void Start() => _writerTask = WriteLoopAsync();
 
@@ -178,9 +303,14 @@ public sealed class WebSocketEventPublisher : IAgentEventPublisher, IAsyncDispos
         {
             lock (_stateGate)
             {
+                if (!IsHealthy)
+                {
+                    return false;
+                }
+
                 if (deferUntilActive && !_active)
                 {
-                    if (_deferred.Count >= OutboundCapacity)
+                    if (_deferred.Count >= 512)
                     {
                         return false;
                     }
@@ -189,12 +319,21 @@ public sealed class WebSocketEventPublisher : IAgentEventPublisher, IAsyncDispos
                     return true;
                 }
 
-                return Outbound.Writer.TryWrite(message);
+                return TryWrite(message);
             }
         }
 
-        public ValueTask EnqueueReplayAsync(OutboundMessage message, CancellationToken cancellationToken) =>
-            Outbound.Writer.WriteAsync(message, cancellationToken);
+        public async ValueTask EnqueueReplayAsync(OutboundMessage message, CancellationToken cancellationToken)
+        {
+            if (!IsHealthy)
+            {
+                throw new WebSocketException("socket_not_open");
+            }
+
+            await _durable.Writer.WriteAsync(message, cancellationToken);
+            _available.Release();
+            RecordQueueDepth(OutboundLane.Durable);
+        }
 
         public void Activate(long replayedThroughSequence)
         {
@@ -215,11 +354,23 @@ public sealed class WebSocketEventPublisher : IAgentEventPublisher, IAsyncDispos
                         continue;
                     }
 
-                    if (!Outbound.Writer.TryWrite(message))
+                    if (!_activation.Writer.TryWrite(message))
                     {
-                        message.Completion?.TrySetException(new WebSocketException("outbound_queue_full"));
-                        overflow = true;
-                        break;
+                        if (message.Lane == OutboundLane.Realtime)
+                        {
+                            AgentPerformanceTelemetry.RecordDroppedRealtimeEvent();
+                            message.Completion?.TrySetResult();
+                        }
+                        else
+                        {
+                            message.Completion?.TrySetException(new WebSocketException("outbound_queue_full"));
+                            overflow = true;
+                            break;
+                        }
+                    }
+                    else
+                    {
+                        _available.Release();
                     }
                 }
 
@@ -237,6 +388,7 @@ public sealed class WebSocketEventPublisher : IAgentEventPublisher, IAsyncDispos
 
         public void Abort()
         {
+            Interlocked.Exchange(ref _healthy, 0);
             _shutdown.Cancel();
             Socket.Abort();
         }
@@ -251,7 +403,7 @@ public sealed class WebSocketEventPublisher : IAgentEventPublisher, IAsyncDispos
                 }
             }
 
-            Outbound.Writer.TryComplete();
+            CompleteLanes();
             _shutdown.Cancel();
             if (_writerTask != null)
             {
@@ -270,6 +422,7 @@ public sealed class WebSocketEventPublisher : IAgentEventPublisher, IAsyncDispos
                 }
             }
 
+            _available.Dispose();
             _shutdown.Dispose();
         }
 
@@ -277,38 +430,162 @@ public sealed class WebSocketEventPublisher : IAgentEventPublisher, IAsyncDispos
         {
             try
             {
-                await foreach (OutboundMessage message in Outbound.Reader.ReadAllAsync(_shutdown.Token))
+                int durableBurst = 0;
+                while (!_shutdown.IsCancellationRequested)
                 {
+                    await _available.WaitAsync(_shutdown.Token);
+                    if (!TryReadNext(ref durableBurst, out OutboundMessage? message))
+                    {
+                        continue;
+                    }
+                    OutboundMessage next = message!;
+
                     if (Socket.State != WebSocketState.Open)
                     {
-                        message.Completion?.TrySetException(new WebSocketException("socket_not_open"));
+                        next.Completion?.TrySetException(new WebSocketException("socket_not_open"));
+                        AgentPerformanceTelemetry.RecordPublisherFailure("writer");
+                        _onWriterFault();
                         return;
                     }
 
                     try
                     {
-                        await Socket.SendAsync(message.Payload, WebSocketMessageType.Text, true, _shutdown.Token);
-                        message.Completion?.TrySetResult();
+                        await Socket.SendAsync(next.Payload, WebSocketMessageType.Text, true, _shutdown.Token);
+                        next.Completion?.TrySetResult();
                     }
                     catch (OperationCanceledException exception)
                     {
-                        message.Completion?.TrySetCanceled(exception.CancellationToken);
+                        next.Completion?.TrySetCanceled(exception.CancellationToken);
                         throw;
                     }
                     catch (Exception exception) when (exception is WebSocketException or ObjectDisposedException)
                     {
-                        message.Completion?.TrySetException(exception);
+                        next.Completion?.TrySetException(exception);
+                        AgentPerformanceTelemetry.RecordPublisherFailure("writer");
+                        _onWriterFault();
                         throw;
                     }
                 }
             }
             finally
             {
-                while (Outbound.Reader.TryRead(out OutboundMessage? pending))
+                Interlocked.Exchange(ref _healthy, 0);
+                CompleteLanes();
+                if (Socket.State is WebSocketState.Open or WebSocketState.CloseReceived)
                 {
-                    pending.Completion?.TrySetCanceled();
+                    Socket.Abort();
+                }
+                while (TryReadAny(out OutboundMessage? pending))
+                {
+                    pending!.Completion?.TrySetCanceled();
                 }
             }
         }
+
+        private bool TryWrite(OutboundMessage message)
+        {
+            bool written = WriterFor(message.Lane).TryWrite(message);
+            if (written)
+            {
+                _available.Release();
+                RecordQueueDepth(message.Lane);
+            }
+
+            return written;
+        }
+
+        private void RecordQueueDepth(OutboundLane lane)
+        {
+            int depth = lane switch
+            {
+                OutboundLane.Control => _control.Reader.Count,
+                OutboundLane.Durable => _durable.Reader.Count,
+                _ => _realtime.Reader.Count
+            };
+            switch (lane)
+            {
+                case OutboundLane.Control:
+                    UpdateHighWater(ref _controlHighWater, lane, depth);
+                    break;
+                case OutboundLane.Durable:
+                    UpdateHighWater(ref _durableHighWater, lane, depth);
+                    break;
+                default:
+                    UpdateHighWater(ref _realtimeHighWater, lane, depth);
+                    break;
+            }
+        }
+
+        private static void UpdateHighWater(ref int highWater, OutboundLane lane, int depth)
+        {
+            int observed = Volatile.Read(ref highWater);
+            while (depth > observed)
+            {
+                int previous = Interlocked.CompareExchange(ref highWater, depth, observed);
+                if (previous == observed)
+                {
+                    AgentPerformanceTelemetry.RecordQueueHighWater(
+                        $"websocket_{lane.ToString().ToLowerInvariant()}",
+                        depth);
+                    break;
+                }
+
+                observed = previous;
+            }
+        }
+
+        private void CompleteLanes()
+        {
+            _control.Writer.TryComplete();
+            _activation.Writer.TryComplete();
+            _durable.Writer.TryComplete();
+            _realtime.Writer.TryComplete();
+        }
+
+        private ChannelWriter<OutboundMessage> WriterFor(OutboundLane lane) => lane switch
+        {
+            OutboundLane.Control => _control.Writer,
+            OutboundLane.Durable => _durable.Writer,
+            _ => _realtime.Writer
+        };
+
+        private bool TryReadNext(ref int durableBurst, out OutboundMessage? message)
+        {
+            if (_control.Reader.TryRead(out message))
+            {
+                return true;
+            }
+
+            if (_activation.Reader.TryRead(out message))
+            {
+                return true;
+            }
+
+            if (durableBurst >= 8 && _realtime.Reader.TryRead(out message))
+            {
+                durableBurst = 0;
+                return true;
+            }
+
+            if (_durable.Reader.TryRead(out message))
+            {
+                durableBurst++;
+                return true;
+            }
+
+            if (_realtime.Reader.TryRead(out message))
+            {
+                durableBurst = 0;
+                return true;
+            }
+
+            return false;
+        }
+
+        private bool TryReadAny(out OutboundMessage? message) =>
+            _control.Reader.TryRead(out message) ||
+            _activation.Reader.TryRead(out message) ||
+            _durable.Reader.TryRead(out message) ||
+            _realtime.Reader.TryRead(out message);
     }
 }

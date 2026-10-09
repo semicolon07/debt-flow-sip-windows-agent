@@ -23,6 +23,7 @@ public sealed class AgentCoordinator : IAsyncDisposable
     private readonly CancellationTokenSource _lifetime = new();
     private readonly Task _processor;
     private readonly Task _signalPump;
+    private readonly BackgroundTaskSupervisor _backgroundTasks = new();
     private readonly string _agentSessionId;
     private Task _ownerLeaseExpiration = Task.CompletedTask;
     private Task _registrationRetry = Task.CompletedTask;
@@ -43,6 +44,9 @@ public sealed class AgentCoordinator : IAsyncDisposable
     private bool _registrationRequested;
     private bool _audioDeviceOperationReserved;
     private int _disposeStarted;
+    private int _queueHighWaterMark;
+    private long _sipSignalFailureCount;
+    private string? _lastSipSignalFailureCode;
 
     public AgentCoordinator(
         ISipRuntime sipRuntime,
@@ -84,6 +88,18 @@ public sealed class AgentCoordinator : IAsyncDisposable
 
     public string AgentSessionId => _agentSessionId;
     public string AgentInstanceId => _eventStore.AgentInstanceId;
+
+    public AgentOperationalHealth GetOperationalHealth() => new(
+        ToTaskState(_processor),
+        ToTaskState(_signalPump),
+        _work.Reader.CanCount ? _work.Reader.Count : -1,
+        Volatile.Read(ref _queueHighWaterMark),
+        _backgroundTasks.ActiveCount,
+        _backgroundTasks.FaultCount,
+        _backgroundTasks.LastFaultOperation,
+        Volatile.Read(ref _sipSignalFailureCount),
+        Volatile.Read(ref _lastSipSignalFailureCode),
+        _lifetime.IsCancellationRequested);
 
     public Task InitializeAsync(CancellationToken cancellationToken) =>
         EnqueueAsync(InitializeCoreAsync, cancellationToken);
@@ -254,7 +270,9 @@ public sealed class AgentCoordinator : IAsyncDisposable
     public async Task PortalDisconnectedAsync(CancellationToken cancellationToken)
     {
         long generation = await EnqueueAsync(PortalDisconnectedCoreAsync, cancellationToken);
-        Volatile.Write(ref _ownerLeaseExpiration, ExpireOwnerLeaseAsync(generation));
+        Task expiration = ExpireOwnerLeaseAsync(generation);
+        Volatile.Write(ref _ownerLeaseExpiration, expiration);
+        _backgroundTasks.Track("owner_lease", expiration);
     }
 
     internal Task WaitForCurrentOwnerLeaseExpirationAsync() =>
@@ -281,8 +299,10 @@ public sealed class AgentCoordinator : IAsyncDisposable
             using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(10));
             await ShutdownAsync(timeout.Token);
         }
-        catch (Exception exception) when (exception is OperationCanceledException or ChannelClosedException)
+        catch (Exception exception) when (
+            exception is not OutOfMemoryException and not AccessViolationException)
         {
+            AgentPerformanceTelemetry.RecordBackgroundTaskFault("coordinator_shutdown");
         }
 
         _work.Writer.TryComplete();
@@ -291,18 +311,34 @@ public sealed class AgentCoordinator : IAsyncDisposable
         {
             await _processor.WaitAsync(TimeSpan.FromSeconds(5));
         }
-        catch (TimeoutException)
+        catch (Exception exception) when (
+            exception is TimeoutException or OperationCanceledException || _processor.IsFaulted)
         {
+            _ = _processor.Exception;
         }
         try
         {
             await _signalPump.WaitAsync(TimeSpan.FromSeconds(2));
         }
-        catch (Exception exception) when (exception is TimeoutException or OperationCanceledException)
+        catch (Exception exception) when (
+            exception is TimeoutException or OperationCanceledException || _signalPump.IsFaulted)
         {
+            _ = _signalPump.Exception;
         }
-        await _sipRuntime.DisposeAsync();
-        _lifetime.Dispose();
+        await _backgroundTasks.DrainAsync(TimeSpan.FromSeconds(2));
+        try
+        {
+            await _sipRuntime.DisposeAsync();
+        }
+        catch (Exception exception) when (
+            exception is not OutOfMemoryException and not AccessViolationException)
+        {
+            AgentPerformanceTelemetry.RecordBackgroundTaskFault("sip_runtime_dispose");
+        }
+        finally
+        {
+            _lifetime.Dispose();
+        }
     }
 
     private async Task InitializeCoreAsync(CancellationToken cancellationToken)
@@ -367,7 +403,9 @@ public sealed class AgentCoordinator : IAsyncDisposable
             return;
         }
 
-        if (_agentState == "degraded" && IsCapacityCode(_agentStateCode))
+        if (_agentState == "degraded" &&
+            (IsCapacityCode(_agentStateCode) ||
+             string.Equals(_agentStateCode, "outbox_unavailable", StringComparison.Ordinal)))
         {
             _agentState = "ready";
             _agentStateCode = null;
@@ -489,7 +527,7 @@ public sealed class AgentCoordinator : IAsyncDisposable
             throw new AgentCommandException("invalid_message");
         }
 
-        _call = CallReducer.CreateOutbound(
+        CallSessionState created = CallReducer.CreateOutbound(
             command.CallId,
             command.CommandId,
             _clock.UtcNow,
@@ -497,26 +535,24 @@ public sealed class AgentCoordinator : IAsyncDisposable
             _collectionId,
             _collectionBindingId,
             command.CallContextId);
+        CallLifecyclePlan plan;
         try
         {
-            await EmitCallEventAsync(
-                "call.created",
-                _call,
-                new { direction = "outbound", remoteParty = _call.RemoteParty },
-                cancellationToken);
-            await ApplyCallSignalCoreAsync(
-                new CallSignal(CallSignalType.Dial, _clock.UtcNow),
-                new { direction = "outbound" },
-                cancellationToken);
+            plan = CallLifecyclePlanner.Start(
+                created,
+                new CallSignal(CallSignalType.Dial, _clock.UtcNow));
         }
-        catch (AgentCommandException)
+        catch (InvalidOperationException)
         {
-            _call = null;
-            throw;
+            throw new AgentCommandException("call_invalid_state");
         }
+
+        IReadOnlyList<StoredDurableEvent> started = await PersistCallPlanAsync(plan, cancellationToken);
+        _call = plan.State;
+        await PublishDurableBatchAsync(started, cancellationToken);
         SipCallHandle callHandle = NewCallHandle(command.CallId);
         _activeSipCall = callHandle;
-        _ = RunOutboundCallAsync(callHandle, destination);
+        _backgroundTasks.Track("outbound_call", RunOutboundCallAsync(callHandle, destination));
     }
 
     private async Task<CallRuntimeOperation> PrepareAnswerCoreAsync(
@@ -738,6 +774,10 @@ public sealed class AgentCoordinator : IAsyncDisposable
         {
             await action(operationTimeout.Token);
         }
+        catch (OperationCanceledException) when (_lifetime.IsCancellationRequested)
+        {
+            throw;
+        }
         catch (OperationCanceledException) when (!_lifetime.IsCancellationRequested)
         {
             await TryEndFailedOperationAsync(operation.Handle, "sip_operation_timeout");
@@ -763,6 +803,10 @@ public sealed class AgentCoordinator : IAsyncDisposable
         try
         {
             await action(operation.Handle, operationTimeout.Token);
+        }
+        catch (OperationCanceledException) when (_lifetime.IsCancellationRequested)
+        {
+            throw;
         }
         catch (OperationCanceledException) when (!_lifetime.IsCancellationRequested)
         {
@@ -798,6 +842,10 @@ public sealed class AgentCoordinator : IAsyncDisposable
             {
                 await activeCallAction(operation.Handle, operationTimeout.Token);
             }
+        }
+        catch (OperationCanceledException) when (_lifetime.IsCancellationRequested)
+        {
+            throw;
         }
         catch (OperationCanceledException) when (!_lifetime.IsCancellationRequested)
         {
@@ -929,7 +977,7 @@ public sealed class AgentCoordinator : IAsyncDisposable
                     "agent_shutdown",
                     cancellationToken);
             }
-            catch (AgentCommandException exception) when (exception.ErrorCode == "outbox_unavailable")
+            catch (AgentCommandException)
             {
             }
         }
@@ -1011,7 +1059,20 @@ public sealed class AgentCoordinator : IAsyncDisposable
                 catch (Exception exception)
                 {
                     signal.ProcessingCompletion?.TrySetException(exception);
-                    throw;
+                    Interlocked.Increment(ref _sipSignalFailureCount);
+                    Volatile.Write(ref _lastSipSignalFailureCode, "sip_signal_processing_failed");
+                    AgentPerformanceTelemetry.RecordSipSignalFailure(signal.Type.ToString());
+                    try
+                    {
+                        await EnqueueAsync(
+                            token => HandleSignalProcessingFailureCoreAsync(token),
+                            _lifetime.Token);
+                    }
+                    catch (Exception degradedException) when (
+                        degradedException is not OutOfMemoryException and not AccessViolationException)
+                    {
+                        AgentPerformanceTelemetry.RecordBackgroundTaskFault("signal_failure_policy");
+                    }
                 }
             }
         }
@@ -1049,9 +1110,9 @@ public sealed class AgentCoordinator : IAsyncDisposable
                 if (signal.Type == SipSignalType.RegistrationRegistered)
                 {
                     long generation = ++_registrationGeneration;
-                    Volatile.Write(
-                        ref _registrationRetry,
-                        ResetRegistrationRetryAfterStablePeriodAsync(generation));
+                    Task reset = ResetRegistrationRetryAfterStablePeriodAsync(generation);
+                    Volatile.Write(ref _registrationRetry, reset);
+                    _backgroundTasks.Track("registration_stable_reset", reset);
                 }
                 else if (signal.Type == SipSignalType.RegistrationFailed &&
                          signal.Retryable &&
@@ -1123,6 +1184,12 @@ public sealed class AgentCoordinator : IAsyncDisposable
     {
         SipCallHandle incomingHandle = signal.Call
             ?? throw new AgentCommandException("sip_runtime_error");
+        if (_agentState != "ready")
+        {
+            await _sipRuntime.RejectUnavailableAsync(incomingHandle, cancellationToken);
+            return;
+        }
+
         if (_call is { State: not CallState.Ended })
         {
             await _sipRuntime.RejectAsync(incomingHandle, cancellationToken);
@@ -1155,26 +1222,23 @@ public sealed class AgentCoordinator : IAsyncDisposable
             return;
         }
 
-        _call = CallReducer.CreateInbound(
+        CallSessionState created = CallReducer.CreateInbound(
             _ids.NewId(),
             _clock.UtcNow,
             RemotePartyNormalizer.Normalize(signal.Caller),
             _collectionId,
             _collectionBindingId);
-        _activeSipCall = incomingHandle with { PublicCallId = _call.CallId };
         try
         {
-            await EmitCallEventAsync(
-                "call.created",
-                _call,
-                new { direction = "inbound", remoteParty = _call.RemoteParty },
-                cancellationToken);
-            await ApplyCallSignalCoreAsync(
-                new CallSignal(CallSignalType.Incoming, _clock.UtcNow),
-                new { direction = "inbound" },
-                cancellationToken);
+            CallLifecyclePlan plan = CallLifecyclePlanner.Start(
+                created,
+                new CallSignal(CallSignalType.Incoming, _clock.UtcNow));
+            IReadOnlyList<StoredDurableEvent> started = await PersistCallPlanAsync(plan, cancellationToken);
+            _call = plan.State;
+            _activeSipCall = incomingHandle with { PublicCallId = plan.State.CallId };
+            await PublishDurableBatchAsync(started, cancellationToken);
         }
-        catch (AgentCommandException)
+        catch (Exception exception) when (exception is AgentCommandException or InvalidOperationException)
         {
             await _sipRuntime.RejectUnavailableAsync(incomingHandle, cancellationToken);
             _call = null;
@@ -1200,14 +1264,15 @@ public sealed class AgentCoordinator : IAsyncDisposable
             return;
         }
 
-        CallTransition transition = CallReducer.Apply(_call, signal);
-        if (!transition.Accepted || !transition.StateChanged)
+        CallLifecyclePlan? plan = CallLifecyclePlanner.Transition(_call, signal, data);
+        if (plan == null)
         {
             return;
         }
 
-        _call = transition.State;
-        await EmitCallEventAsync("call.state_changed", _call, data, cancellationToken);
+        IReadOnlyList<StoredDurableEvent> stored = await PersistCallPlanAsync(plan, cancellationToken);
+        _call = plan.State;
+        await PublishDurableBatchAsync(stored, cancellationToken);
     }
 
     private async Task EndCallCoreAsync(CallOutcome outcome, string reason, CancellationToken cancellationToken)
@@ -1217,23 +1282,17 @@ public sealed class AgentCoordinator : IAsyncDisposable
             return;
         }
 
-        CallTransition transition = CallReducer.Apply(
-            _call,
-            new CallSignal(CallSignalType.End, _clock.UtcNow, outcome, reason));
-        if (!transition.Accepted || !transition.StateChanged)
+        CallLifecyclePlan? plan = CallLifecyclePlanner.End(_call, _clock.UtcNow, outcome, reason);
+        if (plan == null)
         {
             return;
         }
 
-        _call = transition.State;
-        CallSessionState ended = _call;
-        await EmitCallEventAsync(
-            "call.state_changed",
-            ended,
-            new { outcome = ToWire(outcome), endReason = reason },
-            cancellationToken);
-        await EmitEndedEventAsync(ended, outcome, reason, cancellationToken);
+        IReadOnlyList<StoredDurableEvent> stored = await PersistCallPlanAsync(plan, cancellationToken);
+        CallSessionState ended = plan.State;
+        _call = plan.State;
         _activeSipCall = null;
+        await PublishDurableBatchAsync(stored, cancellationToken);
         await RefreshStorageHealthCoreAsync(cancellationToken);
 
         if (_clearCredentialsAfterCall && !_portalConnected)
@@ -1243,6 +1302,21 @@ public sealed class AgentCoordinator : IAsyncDisposable
             {
                 await StopRegistrationCoreAsync(cancellationToken);
             }
+        }
+        else if (_agentState == "degraded" && _registrationState != RegistrationState.Unconfigured)
+        {
+            await StopRegistrationCoreAsync(cancellationToken);
+        }
+    }
+
+    private async Task HandleSignalProcessingFailureCoreAsync(CancellationToken cancellationToken)
+    {
+        _registrationRequested = false;
+        await MarkDegradedCoreAsync("sip_signal_processing_failed", cancellationToken);
+        if ((_call is null or { State: CallState.Ended }) &&
+            _registrationState != RegistrationState.Unconfigured)
+        {
+            await StopRegistrationCoreAsync(cancellationToken);
         }
     }
 
@@ -1295,22 +1369,11 @@ public sealed class AgentCoordinator : IAsyncDisposable
         try
         {
             StoredDurableEvent stored = await _eventStore.AppendCallEventAsync(
-                new DurableEventDraft(
-                    _ids.NewId(),
-                    _agentSessionId,
-                    call.CallId,
-                    call.CommandId,
-                    eventType,
-                    _clock.UtcNow,
-                    ToWire(call.State),
-                    JsonSerializer.Serialize(data, ProtocolJson.Options),
-                    call.CollectionId,
-                    call.CollectionBindingId,
-                    call.CallContextId),
+                CreateCallEventDraft(eventType, call, data),
                 call,
                 string.Equals(eventType, "call.ended", StringComparison.Ordinal),
                 cancellationToken);
-            await _publisher.PublishDurableAsync(stored, cancellationToken);
+            await PublishDurableSafeAsync(stored, cancellationToken);
         }
         catch (AgentStoreException exception)
         {
@@ -1324,19 +1387,104 @@ public sealed class AgentCoordinator : IAsyncDisposable
         }
     }
 
+    private DurableEventDraft CreateCallEventDraft(
+        string eventType,
+        CallSessionState call,
+        object data) => new(
+        _ids.NewId(),
+        _agentSessionId,
+        call.CallId,
+        call.CommandId,
+        eventType,
+        _clock.UtcNow,
+        ToWire(call.State),
+        JsonSerializer.Serialize(data, ProtocolJson.Options),
+        call.CollectionId,
+        call.CollectionBindingId,
+        call.CallContextId);
+
+    private async Task<IReadOnlyList<StoredDurableEvent>> PersistCallTransitionAsync(
+        IReadOnlyList<DurableEventDraft> drafts,
+        CallSessionState state,
+        bool terminal,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            return await _eventStore.AppendCallTransitionAsync(
+                drafts,
+                state,
+                terminal,
+                cancellationToken);
+        }
+        catch (AgentStoreException exception)
+        {
+            await MarkDegradedCoreAsync(exception.ErrorCode, CancellationToken.None);
+            throw new AgentCommandException(exception.ErrorCode);
+        }
+        catch (Exception exception) when (exception is not OperationCanceledException and not AgentCommandException)
+        {
+            await MarkDegradedCoreAsync("outbox_unavailable", CancellationToken.None);
+            throw new AgentCommandException("outbox_unavailable");
+        }
+    }
+
+    private Task<IReadOnlyList<StoredDurableEvent>> PersistCallPlanAsync(
+        CallLifecyclePlan plan,
+        CancellationToken cancellationToken) =>
+        PersistCallTransitionAsync(
+            plan.Events
+                .Select(item => CreateCallEventDraft(item.EventType, item.State, item.Data))
+                .ToArray(),
+            plan.State,
+            plan.Terminal,
+            cancellationToken);
+
+    private async Task PublishDurableBatchAsync(
+        IReadOnlyList<StoredDurableEvent> storedEvents,
+        CancellationToken cancellationToken)
+    {
+        foreach (StoredDurableEvent storedEvent in storedEvents)
+        {
+            await PublishDurableSafeAsync(storedEvent, cancellationToken);
+        }
+    }
+
+    private async Task PublishDurableSafeAsync(
+        StoredDurableEvent storedEvent,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            await _publisher.PublishDurableAsync(storedEvent, cancellationToken);
+        }
+        catch
+        {
+            // The durable event is already committed. Replay is responsible for delivery.
+            AgentPerformanceTelemetry.RecordPublisherFailure("durable");
+        }
+    }
+
     private async Task PublishRealtimeAsync(string type, object data, CancellationToken cancellationToken)
     {
         JsonElement element = JsonSerializer.SerializeToElement(data, ProtocolJson.Options);
-        await _publisher.PublishRealtimeAsync(
-            type,
-            new RealtimeEventPayload(
-                "realtime",
-                _ids.NewId(),
-                AgentInstanceId,
-                AgentSessionId,
-                _clock.UtcNow,
-                element),
-            cancellationToken);
+        try
+        {
+            await _publisher.PublishRealtimeAsync(
+                type,
+                new RealtimeEventPayload(
+                    "realtime",
+                    _ids.NewId(),
+                    AgentInstanceId,
+                    AgentSessionId,
+                    _clock.UtcNow,
+                    element),
+                cancellationToken);
+        }
+        catch
+        {
+            AgentPerformanceTelemetry.RecordPublisherFailure("realtime");
+        }
     }
 
     private async Task EnsureCapacityForNewCallAsync(CancellationToken cancellationToken)
@@ -1426,7 +1574,9 @@ public sealed class AgentCoordinator : IAsyncDisposable
                 retryAfterMs = (long)retryAfter.TotalMilliseconds
             },
             cancellationToken);
-        Volatile.Write(ref _registrationRetry, RetryRegistrationAfterDelayAsync(generation, retryAfter));
+        Task retry = RetryRegistrationAfterDelayAsync(generation, retryAfter);
+        Volatile.Write(ref _registrationRetry, retry);
+        _backgroundTasks.Track("registration_retry", retry);
     }
 
     private async Task RetryRegistrationAfterDelayAsync(long generation, TimeSpan delay)
@@ -1521,7 +1671,30 @@ public sealed class AgentCoordinator : IAsyncDisposable
                 cancelExecution,
                 Stopwatch.GetTimestamp()),
             cancellationToken);
+        RecordCoordinatorQueueDepth();
         return await completion.Task.WaitAsync(cancellationToken);
+    }
+
+    private void RecordCoordinatorQueueDepth()
+    {
+        if (!_work.Reader.CanCount)
+        {
+            return;
+        }
+
+        int depth = _work.Reader.Count;
+        int observed = Volatile.Read(ref _queueHighWaterMark);
+        while (depth > observed)
+        {
+            int previous = Interlocked.CompareExchange(ref _queueHighWaterMark, depth, observed);
+            if (previous == observed)
+            {
+                AgentPerformanceTelemetry.RecordQueueHighWater("coordinator", depth);
+                break;
+            }
+
+            observed = previous;
+        }
     }
 
     private void EnsureOperational()
@@ -1534,6 +1707,16 @@ public sealed class AgentCoordinator : IAsyncDisposable
 
     private static bool IsCapacityCode(string? code) =>
         code is "outbox_capacity_critical" or "outbox_capacity_exceeded";
+
+    private static string ToTaskState(Task task) => task.Status switch
+    {
+        TaskStatus.Running or TaskStatus.WaitingForActivation or TaskStatus.WaitingToRun or
+            TaskStatus.WaitingForChildrenToComplete => "running",
+        TaskStatus.RanToCompletion => "completed",
+        TaskStatus.Canceled => "canceled",
+        TaskStatus.Faulted => "faulted",
+        _ => "created"
+    };
 
     private CallSessionState EnsureCurrentCall(string callId, CallDirection? direction = null)
     {

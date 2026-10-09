@@ -1,5 +1,4 @@
 using System.Net;
-using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Security.Cryptography;
 using System.Text;
@@ -41,7 +40,7 @@ public sealed class SipRuntime : ISipRuntime
             FullMode = BoundedChannelFullMode.Wait,
             AllowSynchronousContinuations = false
         });
-    private readonly ConcurrentDictionary<long, Task> _backgroundTasks = new();
+    private readonly BackgroundTaskSupervisor _backgroundTasks = new();
     private readonly Dictionary<string, SipCallHandle> _callHandlesBySipCallId = new(StringComparer.Ordinal);
     private readonly Dictionary<ISIPServerUserAgent, SipCallHandle> _incomingHandles = new();
     private readonly AudioSessionVolumeController _volumeController = new();
@@ -72,9 +71,9 @@ public sealed class SipRuntime : ISipRuntime
     private string _inputDeviceId;
     private long _registrationGeneration;
     private long _callGeneration;
-    private long _backgroundTaskId;
     private int _signalOverflow;
-    private bool _disposed;
+    private volatile bool _disposed;
+    private string _audioState = "degraded";
 
     public SipRuntime(
         ILogger<SipRuntime> logger,
@@ -120,7 +119,11 @@ public sealed class SipRuntime : ISipRuntime
 
     public ChannelReader<SipSignal> Signals => _signals.Reader;
 
-    public string AudioState { get; private set; }
+    public string AudioState
+    {
+        get => Volatile.Read(ref _audioState);
+        private set => Volatile.Write(ref _audioState, value);
+    }
     public bool IsMicrophoneMuted => Volatile.Read(ref _microphoneMuted) != 0;
     public int OutputVolume => Volatile.Read(ref _outputVolume);
     public int InputVolume => Volatile.Read(ref _inputVolume);
@@ -554,17 +557,7 @@ public sealed class SipRuntime : ISipRuntime
         _audioDeviceEnumerator?.Dispose();
         _transport.Shutdown();
         _configuration = null;
-        Task[] background = _backgroundTasks.Values.ToArray();
-        if (background.Length > 0)
-        {
-            try
-            {
-                await Task.WhenAll(background).WaitAsync(TimeSpan.FromSeconds(2));
-            }
-            catch (Exception exception) when (exception is TimeoutException or OperationCanceledException)
-            {
-            }
-        }
+        await _backgroundTasks.DrainAsync(TimeSpan.FromSeconds(2));
         _signals.Writer.TryComplete();
         _mediaGate.Dispose();
     }
@@ -1618,15 +1611,11 @@ public sealed class SipRuntime : ISipRuntime
         }
     }
 
-    private void TrackBackground(Task task)
+    private void TrackBackground(
+        Task task,
+        [System.Runtime.CompilerServices.CallerMemberName] string operation = "unknown")
     {
-        long id = Interlocked.Increment(ref _backgroundTaskId);
-        _backgroundTasks[id] = task;
-        _ = task.ContinueWith(
-            completed => _backgroundTasks.TryRemove(id, out _),
-            CancellationToken.None,
-            TaskContinuationOptions.ExecuteSynchronously,
-            TaskScheduler.Default);
+        _backgroundTasks.Track(operation, task);
     }
 
     private static bool SameCall(SipCallHandle? left, SipCallHandle? right) =>

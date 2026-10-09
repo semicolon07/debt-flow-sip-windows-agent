@@ -403,6 +403,7 @@ public static class Program
                 app.Services.GetRequiredService<ILogger<TrayApplicationContext>>(),
                 eventStore,
                 app.Services.GetRequiredService<DiagnosticBundleExporter>(),
+                logProvider,
                 logDirectory,
                 startupRegistrationFailed,
                 tlsDaysRemaining,

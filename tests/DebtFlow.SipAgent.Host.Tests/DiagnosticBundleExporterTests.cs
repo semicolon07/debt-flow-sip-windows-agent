@@ -31,7 +31,31 @@ public sealed class DiagnosticBundleExporterTests
                 CancellationToken.None,
                 tlsCertificateProfileVersion: 1,
                 tlsCertificateDaysRemaining: 24,
-                tlsCertificateErrorCode: "tls_certificate_rotation_failed");
+                tlsCertificateErrorCode: "tls_certificate_rotation_failed",
+                operationalHealth: new AgentOperationalHealth(
+                    "running",
+                    "running",
+                    2,
+                    8,
+                    1,
+                    0,
+                    null,
+                    0,
+                    null,
+                    false),
+                webSocketHealth: new WebSocketOperationalHealth(
+                    3,
+                    true,
+                    1,
+                    2,
+                    3,
+                    4,
+                    5,
+                    6,
+                    7,
+                    0,
+                    0),
+                loggerHealth: new LoggerOperationalHealth(1, 9, 0, 0));
 
             using ZipArchive archive = ZipFile.OpenRead(output);
             Assert.NotNull(archive.GetEntry("summary.json"));
@@ -51,6 +75,9 @@ public sealed class DiagnosticBundleExporterTests
             Assert.Contains("registration_failed", combined, StringComparison.Ordinal);
             Assert.Contains("tls_certificate_rotation_failed", combined, StringComparison.Ordinal);
             Assert.Contains("\"tlsCertificateDaysRemaining\":24", combined, StringComparison.Ordinal);
+            Assert.Contains("\"sipSignalPumpState\":\"running\"", combined, StringComparison.Ordinal);
+            Assert.Contains("\"webSocketRealtimeQueueHighWater\":6", combined, StringComparison.Ordinal);
+            Assert.Contains("\"loggerQueueHighWater\":9", combined, StringComparison.Ordinal);
             Assert.Contains("[REDACTED]", combined, StringComparison.Ordinal);
         }
         finally

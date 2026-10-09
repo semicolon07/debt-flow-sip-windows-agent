@@ -128,8 +128,18 @@ public sealed class SqliteAgentEventStore : IAgentEventStore
         DurableEventDraft draft,
         CallSessionState callState,
         bool terminal,
+        CancellationToken cancellationToken) => AppendSingleCallEventAsync(
+            draft,
+            callState,
+            terminal,
+            cancellationToken);
+
+    public Task<IReadOnlyList<StoredDurableEvent>> AppendCallTransitionAsync(
+        IReadOnlyList<DurableEventDraft> drafts,
+        CallSessionState callState,
+        bool terminal,
         CancellationToken cancellationToken) =>
-        AppendInternalAsync(draft, callState, terminal, useReservedCapacity: true, cancellationToken);
+        AppendCallTransitionInternalAsync(drafts, callState, terminal, cancellationToken);
 
     public async Task<IReadOnlyList<StoredDurableEvent>> LoadPendingAsync(
         long afterSequence,
@@ -641,6 +651,104 @@ public sealed class SqliteAgentEventStore : IAgentEventStore
                 Stopwatch.GetElapsedTime(started));
         }
     }
+
+    private async Task<StoredDurableEvent> AppendSingleCallEventAsync(
+        DurableEventDraft draft,
+        CallSessionState callState,
+        bool terminal,
+        CancellationToken cancellationToken)
+    {
+        IReadOnlyList<StoredDurableEvent> stored = await AppendCallTransitionInternalAsync(
+            [draft],
+            callState,
+            terminal,
+            cancellationToken);
+        return stored[0];
+    }
+
+    private async Task<IReadOnlyList<StoredDurableEvent>> AppendCallTransitionInternalAsync(
+        IReadOnlyList<DurableEventDraft> drafts,
+        CallSessionState callState,
+        bool terminal,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(drafts);
+        ArgumentNullException.ThrowIfNull(callState);
+        if (drafts.Count == 0)
+        {
+            throw new ArgumentException("At least one durable event is required.", nameof(drafts));
+        }
+
+        long started = Stopwatch.GetTimestamp();
+        await _gate.WaitAsync(cancellationToken);
+        try
+        {
+            RefreshStorageBytesCore();
+            EventStoreHealth health = await GetHealthCoreAsync(cancellationToken);
+            if (health.CapacityState == EventStoreCapacityState.Full)
+            {
+                throw new AgentStoreException("outbox_capacity_exceeded");
+            }
+
+            SqliteConnection connection = RequireConnection();
+            await using SqliteTransaction transaction =
+                (SqliteTransaction)await connection.BeginTransactionAsync(cancellationToken);
+            var storedEvents = new List<StoredDurableEvent>(drafts.Count);
+            foreach (DurableEventDraft draft in drafts)
+            {
+                if (!string.Equals(draft.CallId, callState.CallId, StringComparison.Ordinal))
+                {
+                    throw new ArgumentException("All transition events must belong to the journaled call.", nameof(drafts));
+                }
+
+                long sequence = await InsertEventAsync(connection, transaction, draft, cancellationToken);
+                storedEvents.Add(ToStoredEvent(sequence, draft));
+            }
+
+            if (terminal)
+            {
+                await DeleteActiveCallAsync(connection, transaction, callState.CallId, cancellationToken);
+            }
+            else
+            {
+                await UpsertActiveCallAsync(connection, transaction, callState, cancellationToken);
+            }
+
+            await transaction.CommitAsync(cancellationToken);
+            LastSequence = Math.Max(LastSequence, storedEvents[^1].Sequence);
+            _pendingEventCount = LastSequence - LastAcknowledgedSequence;
+            DateTimeOffset oldestDraft = drafts.Min(static draft => draft.OccurredAtUtc);
+            if (_oldestPendingAtUtc == null || oldestDraft < _oldestPendingAtUtc.Value)
+            {
+                _oldestPendingAtUtc = oldestDraft;
+            }
+
+            RefreshStorageBytesCore();
+            return storedEvents;
+        }
+        finally
+        {
+            _gate.Release();
+            AgentPerformanceTelemetry.RecordStorageOperation(
+                "append_call_transition",
+                Stopwatch.GetElapsedTime(started));
+        }
+    }
+
+    private StoredDurableEvent ToStoredEvent(long sequence, DurableEventDraft draft) => new(
+        sequence,
+        draft.EventId,
+        AgentInstanceId,
+        draft.AgentSessionId,
+        draft.CallId,
+        draft.CommandId,
+        draft.EventType,
+        draft.OccurredAtUtc,
+        draft.State,
+        draft.DataJson,
+        draft.CollectionId,
+        draft.CollectionBindingId,
+        draft.CallContextId);
 
     private static async Task<long> InsertEventAsync(
         SqliteConnection connection,

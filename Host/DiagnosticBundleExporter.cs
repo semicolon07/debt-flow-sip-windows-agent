@@ -21,7 +21,10 @@ public sealed class DiagnosticBundleExporter(string logDirectory)
         CancellationToken cancellationToken,
         int tlsCertificateProfileVersion = LocalTlsCertificateProfile.Version,
         int? tlsCertificateDaysRemaining = null,
-        string? tlsCertificateErrorCode = null)
+        string? tlsCertificateErrorCode = null,
+        AgentOperationalHealth? operationalHealth = null,
+        WebSocketOperationalHealth? webSocketHealth = null,
+        LoggerOperationalHealth? loggerHealth = null)
     {
         string fullPath = Path.GetFullPath(outputPath);
         string? directory = Path.GetDirectoryName(fullPath);
@@ -65,7 +68,32 @@ public sealed class DiagnosticBundleExporter(string logDirectory)
                             localConfigurationValid,
                             tlsCertificateProfileVersion,
                             tlsCertificateDaysRemaining,
-                            tlsCertificateErrorCode
+                            tlsCertificateErrorCode,
+                            coordinatorProcessorState = operationalHealth?.CoordinatorProcessorState,
+                            sipSignalPumpState = operationalHealth?.SipSignalPumpState,
+                            coordinatorQueueDepth = operationalHealth?.CoordinatorQueueDepth,
+                            coordinatorQueueHighWater = operationalHealth?.CoordinatorQueueHighWater,
+                            activeBackgroundTasks = operationalHealth?.ActiveBackgroundTasks,
+                            backgroundTaskFaultCount = operationalHealth?.BackgroundTaskFaultCount,
+                            lastBackgroundFaultOperation = operationalHealth?.LastBackgroundFaultOperation,
+                            sipSignalFailureCount = operationalHealth?.SipSignalFailureCount,
+                            lastSipSignalFailureCode = operationalHealth?.LastSipSignalFailureCode,
+                            lifetimeCancellationRequested = operationalHealth?.LifetimeCancellationRequested,
+                            webSocketSessionGeneration = webSocketHealth?.SessionGeneration,
+                            webSocketConnected = webSocketHealth?.Connected,
+                            webSocketControlQueueDepth = webSocketHealth?.ControlQueueDepth,
+                            webSocketDurableQueueDepth = webSocketHealth?.DurableQueueDepth,
+                            webSocketRealtimeQueueDepth = webSocketHealth?.RealtimeQueueDepth,
+                            webSocketControlQueueHighWater = webSocketHealth?.ControlQueueHighWater,
+                            webSocketDurableQueueHighWater = webSocketHealth?.DurableQueueHighWater,
+                            webSocketRealtimeQueueHighWater = webSocketHealth?.RealtimeQueueHighWater,
+                            webSocketDroppedRealtimeEvents = webSocketHealth?.DroppedRealtimeEvents,
+                            webSocketQueueAbortCount = webSocketHealth?.QueueAbortCount,
+                            webSocketWriterFaultCount = webSocketHealth?.WriterFaultCount,
+                            loggerQueueDepth = loggerHealth?.QueueDepth,
+                            loggerQueueHighWater = loggerHealth?.QueueHighWater,
+                            loggerDroppedRecords = loggerHealth?.DroppedRecords,
+                            loggerWriterFailures = loggerHealth?.WriterFailures
                         },
                         ProtocolJson.Options,
                         cancellationToken);

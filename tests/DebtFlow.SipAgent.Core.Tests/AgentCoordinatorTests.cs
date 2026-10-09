@@ -774,6 +774,94 @@ public sealed class AgentCoordinatorTests
     }
 
     [Fact]
+    public async Task SignalPump_WhenOneSignalFails_ProcessesLaterTerminalSignal()
+    {
+        string directory = Path.Combine(Path.GetTempPath(), $"sip-agent-signal-supervision-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(directory);
+        var innerStore = new SqliteAgentEventStore(Path.Combine(directory, "agent.db"));
+        await innerStore.InitializeAsync(CancellationToken.None);
+        var store = new FailingAppendEventStore(innerStore) { FailOnAppendAttempt = 3 };
+        var runtime = new FakeSipRuntime();
+        await using var coordinator = new AgentCoordinator(
+            runtime,
+            store,
+            new NullPublisher(),
+            new FixedClock(),
+            new GuidAgentIdGenerator());
+
+        try
+        {
+            await coordinator.ConfigureAsync(
+                new ConfigureCommand(NewId(), "192.0.2.10", 5060, "user", "password"),
+                CancellationToken.None);
+            await coordinator.StartRegistrationAsync(CancellationToken.None);
+            await runtime.EmitAsync(new SipSignal(SipSignalType.RegistrationRegistered));
+            await coordinator.StartCallAsync(
+                new CallStartCommand(NewId(), NewId(), "0812345678", "diagnostic-only"),
+                CancellationToken.None);
+
+            await Assert.ThrowsAnyAsync<Exception>(
+                () => runtime.EmitAsync(new SipSignal(SipSignalType.CallConnected)));
+            await runtime.EmitAsync(new SipSignal(SipSignalType.CallRemoteEnded));
+
+            AgentSnapshotPayload snapshot = await coordinator.GetSnapshotAsync(CancellationToken.None);
+            Assert.Equal("degraded", snapshot.AgentState);
+            Assert.Equal("sip_signal_processing_failed", snapshot.AgentStateCode);
+            Assert.Empty(snapshot.ActiveCalls);
+            IReadOnlyList<StoredDurableEvent> pending =
+                await innerStore.LoadPendingAsync(0, 100, CancellationToken.None);
+            Assert.Equal("call.ended", pending[^1].EventType);
+        }
+        finally
+        {
+            await coordinator.DisposeAsync();
+            await store.DisposeAsync();
+            Directory.Delete(directory, true);
+        }
+    }
+
+    [Fact]
+    public async Task PublisherFailure_AfterAtomicCommit_DoesNotDegradeOrLoseDurableEvents()
+    {
+        string directory = Path.Combine(Path.GetTempPath(), $"sip-agent-publisher-failure-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(directory);
+        var store = new SqliteAgentEventStore(Path.Combine(directory, "agent.db"));
+        await store.InitializeAsync(CancellationToken.None);
+        var runtime = new FakeSipRuntime();
+        await using var coordinator = new AgentCoordinator(
+            runtime,
+            store,
+            new FailingPublisher(),
+            new FixedClock(),
+            new GuidAgentIdGenerator());
+
+        try
+        {
+            await coordinator.ConfigureAsync(
+                new ConfigureCommand(NewId(), "192.0.2.10", 5060, "user", "password"),
+                CancellationToken.None);
+            await coordinator.StartRegistrationAsync(CancellationToken.None);
+            await runtime.EmitAsync(new SipSignal(SipSignalType.RegistrationRegistered));
+            await coordinator.StartCallAsync(
+                new CallStartCommand(NewId(), NewId(), "0812345678", "diagnostic-only"),
+                CancellationToken.None);
+
+            AgentSnapshotPayload snapshot = await coordinator.GetSnapshotAsync(CancellationToken.None);
+            Assert.Equal("ready", snapshot.AgentState);
+            Assert.Single(snapshot.ActiveCalls);
+            IReadOnlyList<StoredDurableEvent> pending =
+                await store.LoadPendingAsync(0, 100, CancellationToken.None);
+            Assert.Equal(["call.created", "call.state_changed"], pending.Select(item => item.EventType));
+        }
+        finally
+        {
+            await coordinator.DisposeAsync();
+            await store.DisposeAsync();
+            Directory.Delete(directory, true);
+        }
+    }
+
+    [Fact]
     public async Task Configure_WhenAgentStartsDegraded_DoesNotPassCredentialToSipRuntime()
     {
         string directory = Path.Combine(Path.GetTempPath(), $"sip-agent-degraded-configure-{Guid.NewGuid():N}");
@@ -1386,6 +1474,22 @@ public sealed class AgentCoordinatorTests
                 : inner.AppendCallEventAsync(draft, callState, terminal, cancellationToken);
         }
 
+        public Task<IReadOnlyList<StoredDurableEvent>> AppendCallTransitionAsync(
+            IReadOnlyList<DurableEventDraft> drafts,
+            CallSessionState callState,
+            bool terminal,
+            CancellationToken cancellationToken)
+        {
+            int finalAttempt = Interlocked.Add(ref _appendAttempts, drafts.Count);
+            int firstAttempt = finalAttempt - drafts.Count + 1;
+            bool failsWithinBatch = FailOnAppendAttempt is int failureAttempt &&
+                failureAttempt >= firstAttempt && failureAttempt <= finalAttempt;
+            return FailAppends || failsWithinBatch
+                ? Task.FromException<IReadOnlyList<StoredDurableEvent>>(
+                    AppendFailure ?? new IOException("simulated_outbox_failure"))
+                : inner.AppendCallTransitionAsync(drafts, callState, terminal, cancellationToken);
+        }
+
         public Task<IReadOnlyList<StoredDurableEvent>> LoadPendingAsync(
             long afterSequence,
             int maximumCount,
@@ -1441,6 +1545,18 @@ public sealed class AgentCoordinatorTests
             string eventType,
             RealtimeEventPayload payload,
             CancellationToken cancellationToken) => Task.CompletedTask;
+    }
+
+    private sealed class FailingPublisher : IAgentEventPublisher
+    {
+        public Task PublishDurableAsync(StoredDurableEvent storedEvent, CancellationToken cancellationToken) =>
+            Task.FromException(new IOException("simulated_transport_failure"));
+
+        public Task PublishRealtimeAsync(
+            string eventType,
+            RealtimeEventPayload payload,
+            CancellationToken cancellationToken) =>
+            Task.CompletedTask;
     }
 
     private sealed class BlockingPublisher : IAgentEventPublisher

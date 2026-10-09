@@ -30,6 +30,27 @@ public static class AgentPerformanceTelemetry
     private static readonly Counter<long> LogWriterFailures = Meter.CreateCounter<long>(
         "sip_agent.logging.writer_failures",
         unit: "{failure}");
+    private static readonly Counter<long> BackgroundTaskFaults = Meter.CreateCounter<long>(
+        "sip_agent.background_task.faults",
+        unit: "{fault}");
+    private static readonly Counter<long> SipSignalFailures = Meter.CreateCounter<long>(
+        "sip_agent.sip_signal.failures",
+        unit: "{failure}");
+    private static readonly Counter<long> PublisherFailures = Meter.CreateCounter<long>(
+        "sip_agent.publisher.failures",
+        unit: "{failure}");
+    private static readonly Counter<long> WebSocketQueueOverflows = Meter.CreateCounter<long>(
+        "sip_agent.websocket.queue_overflows",
+        unit: "{overflow}");
+    private static readonly Counter<long> DroppedRealtimeEvents = Meter.CreateCounter<long>(
+        "sip_agent.websocket.realtime.dropped_events",
+        unit: "{event}");
+    private static readonly Counter<long> CommandPruneFailures = Meter.CreateCounter<long>(
+        "sip_agent.command_prune.failures",
+        unit: "{failure}");
+    private static readonly Histogram<int> QueueDepthHighWater = Meter.CreateHistogram<int>(
+        "sip_agent.queue.high_water_mark",
+        unit: "{message}");
 
     public static void RecordCoordinatorQueueWait(TimeSpan elapsed) =>
         CoordinatorQueueWait.Record(Math.Max(0, elapsed.TotalMilliseconds));
@@ -62,4 +83,25 @@ public static class AgentPerformanceTelemetry
         LogWriterFailures.Add(
             1,
             new KeyValuePair<string, object?>("error_type", errorType));
+
+    public static void RecordBackgroundTaskFault(string operation) =>
+        BackgroundTaskFaults.Add(1, new KeyValuePair<string, object?>("operation", operation));
+
+    public static void RecordSipSignalFailure(string signalType) =>
+        SipSignalFailures.Add(1, new KeyValuePair<string, object?>("signal_type", signalType));
+
+    public static void RecordPublisherFailure(string channel) =>
+        PublisherFailures.Add(1, new KeyValuePair<string, object?>("channel", channel));
+
+    public static void RecordWebSocketQueueOverflow(string lane) =>
+        WebSocketQueueOverflows.Add(1, new KeyValuePair<string, object?>("lane", lane));
+
+    public static void RecordDroppedRealtimeEvent() => DroppedRealtimeEvents.Add(1);
+
+    public static void RecordCommandPruneFailure() => CommandPruneFailures.Add(1);
+
+    public static void RecordQueueHighWater(string queue, int depth) =>
+        QueueDepthHighWater.Record(
+            Math.Max(0, depth),
+            new KeyValuePair<string, object?>("queue", queue));
 }
