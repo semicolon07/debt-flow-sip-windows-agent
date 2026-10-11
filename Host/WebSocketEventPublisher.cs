@@ -11,9 +11,13 @@ public sealed record WebSocketOperationalHealth(
     int ControlQueueDepth,
     int DurableQueueDepth,
     int RealtimeQueueDepth,
+    int ActivationQueueDepth,
+    int DeferredQueueDepth,
     int ControlQueueHighWater,
     int DurableQueueHighWater,
     int RealtimeQueueHighWater,
+    int ActivationQueueHighWater,
+    int DeferredQueueHighWater,
     long DroppedRealtimeEvents,
     long QueueAbortCount,
     long WriterFaultCount);
@@ -156,7 +160,9 @@ public sealed class WebSocketEventPublisher : IAgentEventPublisher, IAsyncDispos
             {
                 ControlDepth = 0,
                 DurableDepth = 0,
-                RealtimeDepth = 0
+                RealtimeDepth = 0,
+                ActivationDepth = 0,
+                DeferredDepth = 0
             };
         return new WebSocketOperationalHealth(
             session?.Generation ?? Volatile.Read(ref _sessionGeneration),
@@ -164,9 +170,13 @@ public sealed class WebSocketEventPublisher : IAgentEventPublisher, IAsyncDispos
             queue.ControlDepth,
             queue.DurableDepth,
             queue.RealtimeDepth,
+            queue.ActivationDepth,
+            queue.DeferredDepth,
             queue.ControlHighWater,
             queue.DurableHighWater,
             queue.RealtimeHighWater,
+            queue.ActivationHighWater,
+            queue.DeferredHighWater,
             Volatile.Read(ref _droppedRealtimeEvents),
             Volatile.Read(ref _queueAbortCount),
             Volatile.Read(ref _writerFaultCount));
@@ -184,7 +194,12 @@ public sealed class WebSocketEventPublisher : IAgentEventPublisher, IAsyncDispos
         Session? session = Volatile.Read(ref _session);
         if (session == null)
         {
-            return Task.CompletedTask;
+            // Durable events are replayed and realtime events are explicitly lossy while
+            // offline. Control messages, however, represent request/response delivery and
+            // must never report success without a connected session.
+            return lane == OutboundLane.Control
+                ? Task.FromException(new WebSocketException("socket_not_open"))
+                : Task.CompletedTask;
         }
 
         var outbound = new OutboundMessage(
@@ -235,11 +250,15 @@ public sealed class WebSocketEventPublisher : IAgentEventPublisher, IAsyncDispos
         int ControlDepth,
         int DurableDepth,
         int RealtimeDepth,
+        int ActivationDepth,
+        int DeferredDepth,
         int ControlHighWater,
         int DurableHighWater,
-        int RealtimeHighWater)
+        int RealtimeHighWater,
+        int ActivationHighWater,
+        int DeferredHighWater)
     {
-        public static SessionQueueHealth Empty { get; } = new(0, 0, 0, 0, 0, 0);
+        public static SessionQueueHealth Empty { get; } = new(0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
     }
 
     private sealed class Session : IAsyncDisposable
@@ -259,6 +278,8 @@ public sealed class WebSocketEventPublisher : IAgentEventPublisher, IAsyncDispos
         private int _controlHighWater;
         private int _durableHighWater;
         private int _realtimeHighWater;
+        private int _activationHighWater;
+        private int _deferredHighWater;
 
         public Session(
             long generation,
@@ -293,9 +314,24 @@ public sealed class WebSocketEventPublisher : IAgentEventPublisher, IAsyncDispos
             _control.Reader.Count,
             _durable.Reader.Count,
             _realtime.Reader.Count,
+            _activation.Reader.Count,
+            DeferredCount,
             Volatile.Read(ref _controlHighWater),
             Volatile.Read(ref _durableHighWater),
-            Volatile.Read(ref _realtimeHighWater));
+            Volatile.Read(ref _realtimeHighWater),
+            Volatile.Read(ref _activationHighWater),
+            Volatile.Read(ref _deferredHighWater));
+
+        private int DeferredCount
+        {
+            get
+            {
+                lock (_stateGate)
+                {
+                    return _deferred.Count;
+                }
+            }
+        }
 
         public void Start() => _writerTask = WriteLoopAsync();
 
@@ -316,6 +352,7 @@ public sealed class WebSocketEventPublisher : IAgentEventPublisher, IAsyncDispos
                     }
 
                     _deferred.Enqueue(message);
+                    UpdateHighWater(ref _deferredHighWater, "deferred", _deferred.Count);
                     return true;
                 }
 
@@ -371,6 +408,7 @@ public sealed class WebSocketEventPublisher : IAgentEventPublisher, IAsyncDispos
                     else
                     {
                         _available.Release();
+                        UpdateHighWater(ref _activationHighWater, "activation", _activation.Reader.Count);
                     }
                 }
 
@@ -517,6 +555,9 @@ public sealed class WebSocketEventPublisher : IAgentEventPublisher, IAsyncDispos
         }
 
         private static void UpdateHighWater(ref int highWater, OutboundLane lane, int depth)
+            => UpdateHighWater(ref highWater, lane.ToString().ToLowerInvariant(), depth);
+
+        private static void UpdateHighWater(ref int highWater, string lane, int depth)
         {
             int observed = Volatile.Read(ref highWater);
             while (depth > observed)
@@ -525,7 +566,7 @@ public sealed class WebSocketEventPublisher : IAgentEventPublisher, IAsyncDispos
                 if (previous == observed)
                 {
                     AgentPerformanceTelemetry.RecordQueueHighWater(
-                        $"websocket_{lane.ToString().ToLowerInvariant()}",
+                        $"websocket_{lane}",
                         depth);
                     break;
                 }

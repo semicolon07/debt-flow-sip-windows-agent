@@ -469,7 +469,7 @@ public sealed class SqliteAgentEventStoreTests
     }
 
     [Fact]
-    public async Task Capacity_ReservesFinalTenPercentForExistingCallEvents()
+    public async Task Capacity_ReservesTerminalBatchAndChecksProjectedSize()
     {
         string directory = CreateTemporaryDirectory();
         try
@@ -483,9 +483,9 @@ public sealed class SqliteAgentEventStoreTests
                 await store.AppendAsync(CreateDraft(), CancellationToken.None);
             }
 
-            Assert.Equal(EventStoreCapacityState.Warning, (await store.GetHealthAsync(CancellationToken.None)).CapacityState);
-            await store.AppendAsync(CreateDraft(), CancellationToken.None);
-            Assert.Equal(EventStoreCapacityState.Critical, (await store.GetHealthAsync(CancellationToken.None)).CapacityState);
+            EventStoreHealth reserved = await store.GetHealthAsync(CancellationToken.None);
+            Assert.Equal(0, reserved.RegularEventSlotsRemaining);
+            Assert.True(reserved.TerminalReserveAvailable);
 
             AgentStoreException blocked = await Assert.ThrowsAsync<AgentStoreException>(
                 () => store.AppendAsync(CreateDraft(), CancellationToken.None));
@@ -495,15 +495,29 @@ public sealed class SqliteAgentEventStoreTests
                 Guid.NewGuid().ToString("D"),
                 null,
                 CallDirection.Inbound,
-                CallState.Incoming,
+                CallState.Ended,
                 DateTimeOffset.UtcNow,
                 null,
-                null,
-                null,
-                null,
+                DateTimeOffset.UtcNow,
+                CallOutcome.Cancelled,
+                "capacity_shutdown",
                 "0812341234");
-            await store.AppendCallEventAsync(CreateDraft(active.CallId), active, false, CancellationToken.None);
-            Assert.Equal(EventStoreCapacityState.Full, (await store.GetHealthAsync(CancellationToken.None)).CapacityState);
+            await store.AppendCallTransitionAsync(
+                [CreateDraft(active.CallId), CreateDraft(active.CallId)],
+                active,
+                terminal: true,
+                CancellationToken.None);
+            EventStoreHealth full = await store.GetHealthAsync(CancellationToken.None);
+            Assert.Equal(EventStoreCapacityState.Full, full.CapacityState);
+            Assert.False(full.TerminalReserveAvailable);
+
+            AgentStoreException exceeded = await Assert.ThrowsAsync<AgentStoreException>(
+                () => store.AppendCallEventAsync(
+                    CreateDraft(active.CallId),
+                    active,
+                    terminal: true,
+                    CancellationToken.None));
+            Assert.Equal("outbox_capacity_exceeded", exceeded.ErrorCode);
         }
         finally
         {

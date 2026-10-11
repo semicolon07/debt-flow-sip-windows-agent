@@ -1,5 +1,10 @@
 # SIP Windows Agent P5 D performance result
 
+> ใช้ร่วมกับ remaining performance/soak gatesใน
+> [`2026-10-11-sip-agent-post-hardening-remediation-result.md`](../plan-results/2026-10-11-sip-agent-post-hardening-remediation-result.md)
+> และเก็บ deferred/activation queue high-water, command maintenance task count,
+> shutdown duration และ resource trendของ exact candidate commit.
+
 ## Test identity
 
 | Field | Value |

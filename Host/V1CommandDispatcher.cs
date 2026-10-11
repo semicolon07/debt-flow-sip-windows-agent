@@ -23,11 +23,17 @@ public sealed class V1CommandDispatcher(
     IAgentEventStore eventStore,
     IAgentClock clock,
     ICommandFingerprintService fingerprintService,
-    CommandMaintenancePolicy? maintenancePolicy = null)
+    CommandMaintenancePolicy? maintenancePolicy = null) : IAsyncDisposable
 {
+    private static readonly TimeSpan CommandFinalizationTimeout = TimeSpan.FromSeconds(5);
+    private static readonly TimeSpan CommandExecutionTimeout = TimeSpan.FromMinutes(2);
+    private static readonly TimeSpan MaintenanceDrainTimeout = TimeSpan.FromSeconds(5);
     private long _nextPruneUtcTicks;
     private int _fingerprintKeyState;
+    private int _pruneScheduleInitialized;
+    private int _disposeStarted;
     private readonly BackgroundTaskSupervisor _maintenanceTasks = new();
+    private readonly CancellationTokenSource _lifetime = new();
     private readonly CommandMaintenancePolicy _maintenancePolicy = ValidateMaintenancePolicy(
         maintenancePolicy ?? CommandMaintenancePolicy.Default);
 
@@ -165,11 +171,17 @@ public sealed class V1CommandDispatcher(
             return Result(command.CommandId, envelope.Type, false, "outbox_unavailable");
         }
 
+        // Once the durable "executing" marker has been committed, request cancellation must
+        // not abandon the side effect or its final journal update.  The dispatcher lifetime
+        // becomes the owner of both operations from this point onward.
+        using var executionTimeout = CancellationTokenSource.CreateLinkedTokenSource(_lifetime.Token);
+        executionTimeout.CancelAfter(CommandExecutionTimeout);
+        CancellationToken executionToken = executionTimeout.Token;
         byte[] result;
         string executionState;
         try
         {
-            await command.Execute(cancellationToken);
+            await command.Execute(executionToken);
             result = Result(command.CommandId, envelope.Type, true, null);
             executionState = "completed";
         }
@@ -183,12 +195,24 @@ public sealed class V1CommandDispatcher(
             result = Result(command.CommandId, envelope.Type, false, exception.Code);
             executionState = "failed";
         }
-        catch
+        catch (OperationCanceledException) when (_lifetime.IsCancellationRequested)
+        {
+            result = Result(command.CommandId, envelope.Type, false, "agent_shutdown");
+            executionState = "failed";
+        }
+        catch (OperationCanceledException) when (executionTimeout.IsCancellationRequested)
+        {
+            result = Result(command.CommandId, envelope.Type, false, "command_timeout");
+            executionState = "failed";
+        }
+        catch (Exception exception) when (
+            exception is not OutOfMemoryException and not AccessViolationException)
         {
             result = Result(command.CommandId, envelope.Type, false, "internal_error");
             executionState = "failed";
         }
 
+        using var finalization = new CancellationTokenSource(CommandFinalizationTimeout);
         try
         {
             await eventStore.SaveCommandAsync(
@@ -199,7 +223,12 @@ public sealed class V1CommandDispatcher(
                     System.Text.Encoding.UTF8.GetString(result),
                     clock.UtcNow,
                     executionState),
-                cancellationToken);
+                finalization.Token);
+        }
+        catch (OperationCanceledException) when (finalization.IsCancellationRequested)
+        {
+            await coordinator.MarkDegradedAsync("command_journal_timeout", CancellationToken.None);
+            return Result(command.CommandId, envelope.Type, false, "command_outcome_unknown");
         }
         catch (AgentStoreException exception)
         {
@@ -491,6 +520,14 @@ public sealed class V1CommandDispatcher(
     private void ScheduleCommandPruneIfDue()
     {
         long nowTicks = clock.UtcNow.UtcTicks;
+        if (Interlocked.CompareExchange(ref _pruneScheduleInitialized, 1, 0) == 0)
+        {
+            Volatile.Write(
+                ref _nextPruneUtcTicks,
+                clock.UtcNow.Add(_maintenancePolicy.Interval).UtcTicks);
+            return;
+        }
+
         long nextTicks = Volatile.Read(ref _nextPruneUtcTicks);
         if (nowTicks < nextTicks ||
             Interlocked.CompareExchange(
@@ -506,18 +543,37 @@ public sealed class V1CommandDispatcher(
 
     private async Task PruneCommandsAsync()
     {
+        // Prevent storage maintenance from running inline on a request thread when an
+        // implementation happens to complete synchronously.
+        await Task.Yield();
         try
         {
             await eventStore.PruneCommandsAsync(
                 clock.UtcNow.Subtract(_maintenancePolicy.Retention),
                 _maintenancePolicy.MaximumRetained,
-                CancellationToken.None);
+                _lifetime.Token);
         }
-        catch (Exception exception) when (exception is not OperationCanceledException)
+        catch (OperationCanceledException) when (_lifetime.IsCancellationRequested)
+        {
+        }
+        catch (Exception exception) when (
+            exception is not OutOfMemoryException and not AccessViolationException)
         {
             AgentPerformanceTelemetry.RecordCommandPruneFailure();
             Volatile.Write(ref _nextPruneUtcTicks, clock.UtcNow.Add(_maintenancePolicy.FailureRetry).UtcTicks);
         }
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        if (Interlocked.Exchange(ref _disposeStarted, 1) != 0)
+        {
+            return;
+        }
+
+        await _lifetime.CancelAsync();
+        await _maintenanceTasks.DrainAsync(MaintenanceDrainTimeout);
+        _lifetime.Dispose();
     }
 
     private sealed record PreparedCommand(

@@ -1,5 +1,9 @@
 # P1 Windows/PBX verification result template
 
+> ก่อนเริ่มรอบใหม่ให้อ้างอิง source changes และ remaining gates จาก
+> [`2026-10-11-sip-agent-post-hardening-remediation-result.md`](../plan-results/2026-10-11-sip-agent-post-hardening-remediation-result.md)
+> และบันทึก exact candidate commit; ห้าม reuse PASS จาก commitก่อน remediation.
+
 สร้างสำเนาไฟล์นี้ต่อหนึ่ง verification run. ห้ามบันทึก password, SIP Authorization, SDP,
 เบอร์เต็ม, DTMF digit, raw SIP message หรือ unredacted log/screenshot
 

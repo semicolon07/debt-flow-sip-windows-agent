@@ -16,6 +16,8 @@ public sealed class SqliteAgentEventStore : IAgentEventStore
     public const int CurrentSchemaVersion = 4;
     private const int MaximumCommandRows = 50_000;
     private const int MaximumExecutingCommandRows = 1_024;
+    private const int TerminalEventReserve = 2;
+    private const long MaximumTerminalStorageReserveBytes = 1024L * 1024;
     private const int PassiveCheckpointAcknowledgementInterval = 250;
     private static readonly TimeSpan PassiveCheckpointTimeInterval = TimeSpan.FromSeconds(30);
     private readonly string _databasePath;
@@ -103,7 +105,7 @@ public sealed class SqliteAgentEventStore : IAgentEventStore
             await LoadCommandCountersAsync(cancellationToken);
             _lastPassiveCheckpointUtc = DateTimeOffset.UtcNow;
         }
-        catch (Exception exception)
+        catch (Exception exception) when (OperationalExceptionPolicy.IsNonFatal(exception))
         {
             if (_connection != null)
             {
@@ -595,18 +597,10 @@ public sealed class SqliteAgentEventStore : IAgentEventStore
         {
             RefreshStorageBytesCore();
             EventStoreHealth health = await GetHealthCoreAsync(cancellationToken);
-            if (health.CapacityState == EventStoreCapacityState.Full ||
-                !useReservedCapacity && health.CapacityState == EventStoreCapacityState.Critical)
-            {
-                throw new AgentStoreException(
-                    health.CapacityState == EventStoreCapacityState.Full
-                        ? "outbox_capacity_exceeded"
-                        : "outbox_capacity_critical");
-            }
-
             SqliteConnection connection = RequireConnection();
             await using SqliteTransaction transaction =
                 (SqliteTransaction)await connection.BeginTransactionAsync(cancellationToken);
+            EnsureProjectedCapacity([draft], terminal: useReservedCapacity, health);
             long sequence = await InsertEventAsync(connection, transaction, draft, cancellationToken);
             if (callState != null)
             {
@@ -685,14 +679,10 @@ public sealed class SqliteAgentEventStore : IAgentEventStore
         {
             RefreshStorageBytesCore();
             EventStoreHealth health = await GetHealthCoreAsync(cancellationToken);
-            if (health.CapacityState == EventStoreCapacityState.Full)
-            {
-                throw new AgentStoreException("outbox_capacity_exceeded");
-            }
-
             SqliteConnection connection = RequireConnection();
             await using SqliteTransaction transaction =
                 (SqliteTransaction)await connection.BeginTransactionAsync(cancellationToken);
+            EnsureProjectedCapacity(drafts, terminal, health);
             var storedEvents = new List<StoredDurableEvent>(drafts.Count);
             foreach (DurableEventDraft draft in drafts)
             {
@@ -749,6 +739,56 @@ public sealed class SqliteAgentEventStore : IAgentEventStore
         draft.CollectionId,
         draft.CollectionBindingId,
         draft.CallContextId);
+
+    private void EnsureProjectedCapacity(
+        IReadOnlyList<DurableEventDraft> drafts,
+        bool terminal,
+        EventStoreHealth currentHealth)
+    {
+        long eventLimit = terminal
+            ? _limits.MaximumPendingEvents
+            : _limits.MaximumPendingEvents - TerminalEventReserve;
+        long storageReserve = Math.Min(
+            _limits.MaximumStorageBytes / 10,
+            MaximumTerminalStorageReserveBytes);
+        long storageLimit = terminal
+            ? _limits.MaximumStorageBytes
+            : _limits.MaximumStorageBytes - storageReserve;
+        long projectedEvents = checked(_pendingEventCount + drafts.Count);
+        long projectedStorage = checked(_storageBytes + drafts.Sum(EstimateStorageBytes));
+
+        if (projectedEvents > _limits.MaximumPendingEvents ||
+            projectedStorage > _limits.MaximumStorageBytes)
+        {
+            throw new AgentStoreException("outbox_capacity_exceeded");
+        }
+
+        if (projectedEvents > eventLimit || projectedStorage > storageLimit)
+        {
+            throw new AgentStoreException(
+                currentHealth.CapacityState == EventStoreCapacityState.Full
+                    ? "outbox_capacity_exceeded"
+                    : "outbox_capacity_critical");
+        }
+    }
+
+    private static long EstimateStorageBytes(DurableEventDraft draft)
+    {
+        // SQLite page/WAL overhead is deliberately included so a single unusually large
+        // payload cannot jump across the hard limit before health is refreshed.
+        long characters =
+            draft.EventId.Length +
+            draft.AgentSessionId.Length +
+            draft.CallId.Length +
+            (draft.CommandId?.Length ?? 0) +
+            draft.EventType.Length +
+            (draft.State?.Length ?? 0) +
+            draft.DataJson.Length +
+            (draft.CollectionId?.Length ?? 0) +
+            (draft.CollectionBindingId?.Length ?? 0) +
+            (draft.CallContextId?.Length ?? 0);
+        return checked(4096 + characters * 4);
+    }
 
     private static async Task<long> InsertEventAsync(
         SqliteConnection connection,
@@ -976,7 +1016,17 @@ public sealed class SqliteAgentEventStore : IAgentEventStore
             pending,
             _storageBytes,
             state,
-            _oldestPendingAtUtc));
+            _oldestPendingAtUtc,
+            Math.Max(0, _limits.MaximumPendingEvents - TerminalEventReserve - pending),
+            pending <= _limits.MaximumPendingEvents - TerminalEventReserve &&
+                _storageBytes <= _limits.MaximumStorageBytes - Math.Min(
+                    _limits.MaximumStorageBytes / 10,
+                    MaximumTerminalStorageReserveBytes),
+            Math.Max(
+                0,
+                _limits.MaximumStorageBytes -
+                Math.Min(_limits.MaximumStorageBytes / 10, MaximumTerminalStorageReserveBytes) -
+                _storageBytes)));
     }
 
     private async Task<DateTimeOffset?> ReadOldestPendingAtUtcAsync(CancellationToken cancellationToken)

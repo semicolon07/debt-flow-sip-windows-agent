@@ -4,6 +4,11 @@
 Baseline commit: `012e15e42cc4302972375100af19cec3e3849432`  
 สถานะ: **Mandatory source hardening implemented 09/10/2026 — full DoD and external release gates pending**
 
+> Update 11/10/2026: post-hardening findings `SIP-POST-001..011` ได้รับ source remediationแล้ว.
+> Locked restore, Release cross-buildและ core tests 95/95 ผ่าน แต่ Windows Host execution, PBX/audio/flood,
+> shutdown timing, soak/privacyและ release rehearsalยัง pending. ดู
+> [`2026-10-11-sip-agent-post-hardening-remediation-result.md`](plan-results/2026-10-11-sip-agent-post-hardening-remediation-result.md).
+
 ## ข้อสรุปสำหรับการตัดสินใจ
 
 SIP Windows Agent มีพื้นฐานด้าน durable event, recovery journal, protocol validation, TLS และ deterministic build

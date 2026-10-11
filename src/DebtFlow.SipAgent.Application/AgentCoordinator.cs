@@ -10,6 +10,7 @@ namespace DebtFlow.SipAgent.Application;
 public sealed class AgentCoordinator : IAsyncDisposable
 {
     private const int QueueCapacity = 512;
+    private static readonly TimeSpan PostCommitCleanupTimeout = TimeSpan.FromSeconds(3);
     private readonly ISipRuntime _sipRuntime;
     private readonly IAgentEventStore _eventStore;
     private readonly IAgentEventPublisher _publisher;
@@ -294,15 +295,18 @@ public sealed class AgentCoordinator : IAsyncDisposable
             return;
         }
 
-        try
+        for (int attempt = 0; attempt < 2; attempt++)
         {
-            using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(10));
-            await ShutdownAsync(timeout.Token);
-        }
-        catch (Exception exception) when (
-            exception is not OutOfMemoryException and not AccessViolationException)
-        {
-            AgentPerformanceTelemetry.RecordBackgroundTaskFault("coordinator_shutdown");
+            try
+            {
+                using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+                await ShutdownAsync(timeout.Token);
+            }
+            catch (Exception exception) when (
+                exception is not OutOfMemoryException and not AccessViolationException)
+            {
+                AgentPerformanceTelemetry.RecordBackgroundTaskFault("coordinator_shutdown");
+            }
         }
 
         _work.Writer.TryComplete();
@@ -952,33 +956,30 @@ public sealed class AgentCoordinator : IAsyncDisposable
 
     private async Task ShutdownCoreAsync(CancellationToken cancellationToken)
     {
-        if (_agentState == "stopping")
+        Exception? shutdownFailure = null;
+        if (_agentState != "stopping")
         {
-            return;
+            _agentState = "stopping";
+            _agentStateCode = null;
+            await PublishRealtimeAsync("agent.state_changed", new { state = "stopping" }, cancellationToken);
         }
 
-        _agentState = "stopping";
-        _agentStateCode = null;
-        await PublishRealtimeAsync("agent.state_changed", new { state = "stopping" }, cancellationToken);
         if (_call is { State: not CallState.Ended } active)
         {
             try
             {
                 await _sipRuntime.HangupAsync(RequireActiveSipCall(active.CallId), cancellationToken);
-            }
-            catch (Exception exception) when (exception is not OperationCanceledException)
-            {
-            }
-
-            try
-            {
                 await EndCallCoreAsync(
                     active.AnsweredAtUtc.HasValue ? CallOutcome.Completed : CallOutcome.Cancelled,
                     "agent_shutdown",
                     cancellationToken);
             }
-            catch (AgentCommandException)
+            catch (Exception exception) when (
+                exception is not OperationCanceledException and
+                not OutOfMemoryException and
+                not AccessViolationException)
             {
+                shutdownFailure = exception;
             }
         }
 
@@ -988,9 +989,12 @@ public sealed class AgentCoordinator : IAsyncDisposable
             {
                 await StopRegistrationCoreAsync(cancellationToken);
             }
-            catch (Exception exception) when (exception is not OperationCanceledException)
+            catch (Exception exception) when (
+                exception is not OperationCanceledException and
+                not OutOfMemoryException and
+                not AccessViolationException)
             {
-                _registrationState = RegistrationState.Unconfigured;
+                shutdownFailure ??= exception;
             }
         }
 
@@ -1000,8 +1004,16 @@ public sealed class AgentCoordinator : IAsyncDisposable
         {
             await _eventStore.CheckpointAsync(cancellationToken);
         }
-        catch (Exception exception) when (exception is not OperationCanceledException)
+        catch (Exception exception) when (
+            exception is not OutOfMemoryException and
+            not AccessViolationException)
         {
+            shutdownFailure ??= exception;
+        }
+
+        if (shutdownFailure != null)
+        {
+            AgentPerformanceTelemetry.RecordBackgroundTaskFault("shutdown_incomplete");
         }
     }
 
@@ -1029,7 +1041,8 @@ public sealed class AgentCoordinator : IAsyncDisposable
         catch (OperationCanceledException) when (_lifetime.IsCancellationRequested)
         {
         }
-        catch
+        catch (Exception exception) when (
+            exception is not OutOfMemoryException and not AccessViolationException)
         {
             try
             {
@@ -1056,9 +1069,9 @@ public sealed class AgentCoordinator : IAsyncDisposable
                         _lifetime.Token);
                     signal.ProcessingCompletion?.TrySetResult(true);
                 }
-                catch (Exception exception)
+                catch (Exception exception) when (
+                    exception is not OutOfMemoryException and not AccessViolationException)
                 {
-                    signal.ProcessingCompletion?.TrySetException(exception);
                     Interlocked.Increment(ref _sipSignalFailureCount);
                     Volatile.Write(ref _lastSipSignalFailureCode, "sip_signal_processing_failed");
                     AgentPerformanceTelemetry.RecordSipSignalFailure(signal.Type.ToString());
@@ -1072,6 +1085,10 @@ public sealed class AgentCoordinator : IAsyncDisposable
                         degradedException is not OutOfMemoryException and not AccessViolationException)
                     {
                         AgentPerformanceTelemetry.RecordBackgroundTaskFault("signal_failure_policy");
+                    }
+                    finally
+                    {
+                        signal.ProcessingCompletion?.TrySetException(exception);
                     }
                 }
             }
@@ -1168,6 +1185,21 @@ public sealed class AgentCoordinator : IAsyncDisposable
                 _agentStateCode = signal.SafeCode ?? "sip_runtime_failed";
                 _registrationRequested = false;
                 _registrationState = RegistrationState.Failed;
+                SipCallHandle? runtimeCall = _activeSipCall ?? signal.Call;
+                if (runtimeCall != null)
+                {
+                    try
+                    {
+                        await _sipRuntime.HangupAsync(runtimeCall, cancellationToken);
+                    }
+                    catch (Exception exception) when (
+                        exception is not OperationCanceledException and
+                        not OutOfMemoryException and
+                        not AccessViolationException)
+                    {
+                        AgentPerformanceTelemetry.RecordBackgroundTaskFault("runtime_failure_hangup");
+                    }
+                }
                 if (_call is { State: not CallState.Ended })
                 {
                     await EndCallCoreAsync(CallOutcome.Failed, _agentStateCode, cancellationToken);
@@ -1289,23 +1321,57 @@ public sealed class AgentCoordinator : IAsyncDisposable
         }
 
         IReadOnlyList<StoredDurableEvent> stored = await PersistCallPlanAsync(plan, cancellationToken);
-        CallSessionState ended = plan.State;
         _call = plan.State;
         _activeSipCall = null;
         await PublishDurableBatchAsync(stored, cancellationToken);
-        await RefreshStorageHealthCoreAsync(cancellationToken);
+        using var postCommitTimeout = new CancellationTokenSource(PostCommitCleanupTimeout);
+        await RunPostCommitCallCleanupAsync(postCommitTimeout.Token);
+    }
 
+    private async Task RunPostCommitCallCleanupAsync(CancellationToken cancellationToken)
+    {
+        try
+        {
+            await RefreshStorageHealthCoreAsync(cancellationToken);
+        }
+        catch (Exception exception) when (
+            exception is not OutOfMemoryException and
+            not AccessViolationException)
+        {
+            _agentState = "degraded";
+            _agentStateCode = exception is AgentStoreException storeException
+                ? storeException.ErrorCode
+                : "outbox_unavailable";
+            AgentPerformanceTelemetry.RecordBackgroundTaskFault("post_commit_storage_health");
+        }
+
+        bool stopRegistration = false;
         if (_clearCredentialsAfterCall && !_portalConnected)
         {
             _clearCredentialsAfterCall = false;
-            if (_registrationState != RegistrationState.Unconfigured)
+            stopRegistration = true;
+        }
+        else if (_agentState == "degraded")
+        {
+            stopRegistration = true;
+        }
+
+        if (stopRegistration && _registrationState != RegistrationState.Unconfigured)
+        {
+            try
             {
                 await StopRegistrationCoreAsync(cancellationToken);
             }
-        }
-        else if (_agentState == "degraded" && _registrationState != RegistrationState.Unconfigured)
-        {
-            await StopRegistrationCoreAsync(cancellationToken);
+            catch (Exception exception) when (
+                exception is not OutOfMemoryException and
+                not AccessViolationException)
+            {
+                _registrationRequested = false;
+                _registrationState = RegistrationState.Failed;
+                _agentState = "degraded";
+                _agentStateCode ??= "registration_stop_failed";
+                AgentPerformanceTelemetry.RecordBackgroundTaskFault("post_commit_registration_stop");
+            }
         }
     }
 
@@ -1458,7 +1524,8 @@ public sealed class AgentCoordinator : IAsyncDisposable
         {
             await _publisher.PublishDurableAsync(storedEvent, cancellationToken);
         }
-        catch
+        catch (Exception exception) when (
+            exception is not OutOfMemoryException and not AccessViolationException)
         {
             // The durable event is already committed. Replay is responsible for delivery.
             AgentPerformanceTelemetry.RecordPublisherFailure("durable");
@@ -1481,7 +1548,8 @@ public sealed class AgentCoordinator : IAsyncDisposable
                     element),
                 cancellationToken);
         }
-        catch
+        catch (Exception exception) when (
+            exception is not OutOfMemoryException and not AccessViolationException)
         {
             AgentPerformanceTelemetry.RecordPublisherFailure("realtime");
         }
@@ -1881,7 +1949,7 @@ public sealed class AgentCoordinator : IAsyncDisposable
             {
                 Completion.TrySetCanceled(exception.CancellationToken);
             }
-            catch (Exception exception)
+            catch (Exception exception) when (OperationalExceptionPolicy.IsNonFatal(exception))
             {
                 Completion.TrySetException(exception);
             }

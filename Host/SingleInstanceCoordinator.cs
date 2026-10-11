@@ -2,6 +2,7 @@ using System.IO.Pipes;
 using System.Security.Cryptography;
 using System.Security.Principal;
 using System.Text;
+using DebtFlow.SipAgent.Application;
 
 namespace DebtFlow.SipAgent.Host;
 
@@ -99,7 +100,7 @@ public sealed class SingleInstanceCoordinator : IAsyncDisposable
                     {
                         ActivationRequested?.Invoke();
                     }
-                    catch
+                    catch (Exception exception) when (OperationalExceptionPolicy.IsNonFatal(exception))
                     {
                     }
                 }

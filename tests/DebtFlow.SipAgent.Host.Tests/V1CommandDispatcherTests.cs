@@ -88,6 +88,48 @@ public sealed class V1CommandDispatcherTests
         Assert.Null(await fixture.Store.FindCommandAsync(commandId, CancellationToken.None));
     }
 
+    [Fact]
+    public async Task RequestCancellationAfterExecutingMarker_DoesNotStrandCommandJournal()
+    {
+        string directory = Path.Combine(Path.GetTempPath(), $"sip-dispatcher-cancel-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(directory);
+        var store = new SqliteAgentEventStore(Path.Combine(directory, "agent.db"));
+        await store.InitializeAsync(CancellationToken.None);
+        using var request = new CancellationTokenSource();
+        var cancelingStore = new CancelAfterExecutingStore(store, request);
+        var coordinator = new AgentCoordinator(
+            new FakeSipRuntime(),
+            cancelingStore,
+            new NullPublisher(),
+            new SystemAgentClock(),
+            new GuidAgentIdGenerator());
+        await coordinator.InitializeAsync(CancellationToken.None);
+        var dispatcher = new V1CommandDispatcher(
+            coordinator,
+            cancelingStore,
+            new SystemAgentClock(),
+            new HashFingerprintService());
+        string commandId = ProtocolCodec.NewId();
+        try
+        {
+            byte[] response = await dispatcher.DispatchAsync(
+                Envelope("state.get", new CommandHeader(commandId)),
+                request.Token);
+
+            Assert.True(Result(response).Accepted);
+            ProcessedCommand persisted = Assert.IsType<ProcessedCommand>(
+                await store.FindCommandAsync(commandId, CancellationToken.None));
+            Assert.Equal("completed", persisted.ExecutionState);
+        }
+        finally
+        {
+            await dispatcher.DisposeAsync();
+            await coordinator.DisposeAsync();
+            await store.DisposeAsync();
+            Directory.Delete(directory, recursive: true);
+        }
+    }
+
     private static ProtocolEnvelope Envelope(string type, object payload) =>
         ProtocolCodec.Deserialize(ProtocolCodec.Serialize("command", type, payload));
 
@@ -143,6 +185,7 @@ public sealed class V1CommandDispatcherTests
 
         public async ValueTask DisposeAsync()
         {
+            await Dispatcher.DisposeAsync();
             await _coordinator.DisposeAsync();
             await Store.DisposeAsync();
             Directory.Delete(_directory, recursive: true);
@@ -154,6 +197,55 @@ public sealed class V1CommandDispatcherTests
         public CommandFingerprint Compute(ReadOnlySpan<byte> canonicalPayload) => new(
             $"v2:{Convert.ToHexString(SHA256.HashData(canonicalPayload)).ToLowerInvariant()}",
             false);
+    }
+
+    private sealed class CancelAfterExecutingStore(
+        IAgentEventStore inner,
+        CancellationTokenSource request) : IAgentEventStore
+    {
+        public string AgentInstanceId => inner.AgentInstanceId;
+        public long LastSequence => inner.LastSequence;
+        public long LastAcknowledgedSequence => inner.LastAcknowledgedSequence;
+        public Task InitializeAsync(CancellationToken token) => inner.InitializeAsync(token);
+        public Task<StoredDurableEvent> AppendAsync(DurableEventDraft draft, CancellationToken token) =>
+            inner.AppendAsync(draft, token);
+        public Task<StoredDurableEvent> AppendCallEventAsync(
+            DurableEventDraft draft,
+            CallSessionState state,
+            bool terminal,
+            CancellationToken token) => inner.AppendCallEventAsync(draft, state, terminal, token);
+        public Task<IReadOnlyList<StoredDurableEvent>> AppendCallTransitionAsync(
+            IReadOnlyList<DurableEventDraft> drafts,
+            CallSessionState state,
+            bool terminal,
+            CancellationToken token) => inner.AppendCallTransitionAsync(drafts, state, terminal, token);
+        public Task<IReadOnlyList<StoredDurableEvent>> LoadPendingAsync(long after, int count, CancellationToken token) =>
+            inner.LoadPendingAsync(after, count, token);
+        public Task<long> CountPendingAsync(CancellationToken token) => inner.CountPendingAsync(token);
+        public Task<EventStoreHealth> GetHealthAsync(CancellationToken token) => inner.GetHealthAsync(token);
+        public Task<CallSessionState?> LoadActiveCallAsync(CancellationToken token) => inner.LoadActiveCallAsync(token);
+        public Task AcknowledgeThroughAsync(long sequence, CancellationToken token) =>
+            inner.AcknowledgeThroughAsync(sequence, token);
+        public Task<ProcessedCommand?> FindCommandAsync(string commandId, CancellationToken token) =>
+            inner.FindCommandAsync(commandId, token);
+        public Task<bool> HasCommandRequestHashPrefixAsync(string prefix, CancellationToken token) =>
+            inner.HasCommandRequestHashPrefixAsync(prefix, token);
+
+        public async Task SaveCommandAsync(ProcessedCommand command, CancellationToken token)
+        {
+            await inner.SaveCommandAsync(command, token);
+            if (command.ExecutionState == "executing")
+            {
+                request.Cancel();
+            }
+        }
+
+        public Task RecoverExecutingCommandsAsync(DateTimeOffset recoveredAtUtc, CancellationToken token) =>
+            inner.RecoverExecutingCommandsAsync(recoveredAtUtc, token);
+        public Task PruneCommandsAsync(DateTimeOffset olderThanUtc, int maximumRetained, CancellationToken token) =>
+            inner.PruneCommandsAsync(olderThanUtc, maximumRetained, token);
+        public Task CheckpointAsync(CancellationToken token) => inner.CheckpointAsync(token);
+        public ValueTask DisposeAsync() => ValueTask.CompletedTask;
     }
 
     private sealed class NullPublisher : IAgentEventPublisher

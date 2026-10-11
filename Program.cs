@@ -111,7 +111,7 @@ public static class Program
         {
             return RunAsync(command, options).GetAwaiter().GetResult();
         }
-        catch (Exception exception)
+        catch (Exception exception) when (OperationalExceptionPolicy.IsNonFatal(exception))
         {
             if (consoleRequested)
             {
@@ -288,7 +288,9 @@ public static class Program
 
         builder.Services.AddSingleton(options);
         builder.Services.AddSingleton<IStartupRegistrationManager, StartupRegistrationManager>();
-        builder.Services.AddSingleton<IAgentEventStore>(eventStore);
+        // Factory registration transfers disposal ownership to the host container. Registering
+        // the pre-created instance directly would leave its async lifetime externally owned.
+        builder.Services.AddSingleton<IAgentEventStore>(_ => eventStore);
         builder.Services.AddSingleton(new DiagnosticBundleExporter(logDirectory));
         builder.Services.AddSingleton<WebSocketEventPublisher>();
         builder.Services.AddSingleton<IAgentEventPublisher>(provider => provider.GetRequiredService<WebSocketEventPublisher>());

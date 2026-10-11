@@ -53,6 +53,10 @@ public sealed class DiagnosticBundleExporterTests
                     5,
                     6,
                     7,
+                    8,
+                    9,
+                    10,
+                    11,
                     0,
                     0),
                 loggerHealth: new LoggerOperationalHealth(1, 9, 0, 0));

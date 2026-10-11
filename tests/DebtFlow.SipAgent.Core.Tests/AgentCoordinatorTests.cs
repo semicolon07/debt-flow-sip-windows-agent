@@ -690,6 +690,24 @@ public sealed class AgentCoordinatorTests
     }
 
     [Fact]
+    public async Task Shutdown_WhenHangupPhaseFails_CanResumeOnNextInvocation()
+    {
+        await using CoordinatorFixture fixture = await CoordinatorFixture.CreateAsync();
+        await fixture.RegisterAsync();
+        await fixture.Coordinator.StartCallAsync(
+            new CallStartCommand(NewId(), NewId(), "0812345678", "diagnostic-only"),
+            CancellationToken.None);
+        fixture.Runtime.HangupFailuresRemaining = 1;
+
+        await fixture.Coordinator.ShutdownAsync(CancellationToken.None);
+        Assert.Single((await fixture.Coordinator.GetSnapshotAsync(CancellationToken.None)).ActiveCalls);
+
+        await fixture.Coordinator.ShutdownAsync(CancellationToken.None);
+        Assert.Empty((await fixture.Coordinator.GetSnapshotAsync(CancellationToken.None)).ActiveCalls);
+        Assert.Equal(2, fixture.Runtime.HangupCount);
+    }
+
+    [Fact]
     public async Task OutboxFailureOnDialTransition_DoesNotStartSipOrLeaveActiveCall()
     {
         string directory = Path.Combine(Path.GetTempPath(), $"sip-agent-dial-outbox-{Guid.NewGuid():N}");
@@ -821,6 +839,28 @@ public sealed class AgentCoordinatorTests
     }
 
     [Fact]
+    public async Task RuntimeFailure_WithPhysicalCall_QuiescesSipBeforeEndingLogicalCall()
+    {
+        await using CoordinatorFixture fixture = await CoordinatorFixture.CreateAsync();
+        await fixture.RegisterAsync();
+        await fixture.Coordinator.StartCallAsync(
+            new CallStartCommand(NewId(), NewId(), "0812345678", "diagnostic-only"),
+            CancellationToken.None);
+        SipCallHandle active = Assert.IsType<SipCallHandle>(fixture.Runtime.ActiveCall);
+
+        await fixture.Runtime.EmitAsync(new SipSignal(
+            SipSignalType.RuntimeFailed,
+            SafeCode: "sip_signal_overflow",
+            Call: active));
+
+        AgentSnapshotPayload snapshot = await fixture.Coordinator.GetSnapshotAsync(CancellationToken.None);
+        Assert.Equal(1, fixture.Runtime.HangupCount);
+        Assert.Empty(snapshot.ActiveCalls);
+        Assert.Equal("degraded", snapshot.AgentState);
+        Assert.Equal("sip_signal_overflow", snapshot.AgentStateCode);
+    }
+
+    [Fact]
     public async Task PublisherFailure_AfterAtomicCommit_DoesNotDegradeOrLoseDurableEvents()
     {
         string directory = Path.Combine(Path.GetTempPath(), $"sip-agent-publisher-failure-{Guid.NewGuid():N}");
@@ -852,6 +892,53 @@ public sealed class AgentCoordinatorTests
             IReadOnlyList<StoredDurableEvent> pending =
                 await store.LoadPendingAsync(0, 100, CancellationToken.None);
             Assert.Equal(["call.created", "call.state_changed"], pending.Select(item => item.EventType));
+        }
+        finally
+        {
+            await coordinator.DisposeAsync();
+            await store.DisposeAsync();
+            Directory.Delete(directory, true);
+        }
+    }
+
+    [Fact]
+    public async Task TerminalCommit_WhenHealthRefreshFails_RemainsSuccessfulAndRunsCleanup()
+    {
+        string directory = Path.Combine(Path.GetTempPath(), $"sip-agent-post-commit-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(directory);
+        var innerStore = new SqliteAgentEventStore(Path.Combine(directory, "agent.db"));
+        await innerStore.InitializeAsync(CancellationToken.None);
+        var store = new FailingAppendEventStore(innerStore);
+        var runtime = new FakeSipRuntime();
+        await using var coordinator = new AgentCoordinator(
+            runtime,
+            store,
+            new NullPublisher(),
+            new FixedClock(),
+            new GuidAgentIdGenerator());
+        try
+        {
+            await coordinator.ConfigureAsync(
+                new ConfigureCommand(NewId(), "192.0.2.10", 5060, "user", "password"),
+                CancellationToken.None);
+            await coordinator.StartRegistrationAsync(CancellationToken.None);
+            await runtime.EmitAsync(new SipSignal(SipSignalType.RegistrationRegistered));
+            string callId = NewId();
+            await coordinator.StartCallAsync(
+                new CallStartCommand(NewId(), callId, "0812345678", "diagnostic-only"),
+                CancellationToken.None);
+            await runtime.EmitAsync(new SipSignal(SipSignalType.CallConnected));
+            store.FailHealth = true;
+
+            await coordinator.HangupAsync(new CallCommand(NewId(), callId), CancellationToken.None);
+
+            AgentSnapshotPayload snapshot = await coordinator.GetSnapshotAsync(CancellationToken.None);
+            Assert.Empty(snapshot.ActiveCalls);
+            Assert.Equal("degraded", snapshot.AgentState);
+            Assert.Equal(1, runtime.StopRegistrationCount);
+            IReadOnlyList<StoredDurableEvent> events =
+                await innerStore.LoadPendingAsync(0, 100, CancellationToken.None);
+            Assert.Equal("call.ended", events[^1].EventType);
         }
         finally
         {
@@ -1078,10 +1165,6 @@ public sealed class AgentCoordinatorTests
                 CancellationToken.None);
             await coordinator.StartRegistrationAsync(CancellationToken.None);
             await runtime.EmitAsync(new SipSignal(SipSignalType.RegistrationRegistered));
-            await store.AppendAsync(
-                new DurableEventDraft(NewId(), NewId(), NewId(), null, "test.event", DateTimeOffset.UtcNow, null, "{}"),
-                CancellationToken.None);
-
             AgentCommandException exception = await Assert.ThrowsAsync<AgentCommandException>(
                 () => coordinator.StartCallAsync(
                     new CallStartCommand(NewId(), NewId(), "1001", "context"),
@@ -1267,6 +1350,7 @@ public sealed class AgentCoordinatorTests
         public int StopRegistrationCount { get; private set; }
         public int RejectUnavailableCount { get; private set; }
         public int HangupCount { get; private set; }
+        public int HangupFailuresRemaining { get; set; }
         public int StartCallCount { get; private set; }
         public int ConfigureCount { get; private set; }
         public int StartRegistrationCount { get; private set; }
@@ -1349,6 +1433,11 @@ public sealed class AgentCoordinatorTests
         public Task HangupAsync(SipCallHandle call, CancellationToken cancellationToken)
         {
             HangupCount++;
+            if (HangupFailuresRemaining > 0)
+            {
+                HangupFailuresRemaining--;
+                throw new InvalidOperationException("hangup_failed");
+            }
             return Task.CompletedTask;
         }
         public Task SendDtmfAsync(SipCallHandle call, char digit, CancellationToken cancellationToken)
@@ -1443,6 +1532,7 @@ public sealed class AgentCoordinatorTests
     {
         private int _appendAttempts;
         public bool FailAppends { get; set; }
+        public bool FailHealth { get; set; }
         public int? FailOnAppendAttempt { get; init; }
         public Exception? AppendFailure { get; init; }
         public string AgentInstanceId => inner.AgentInstanceId;
@@ -1500,7 +1590,9 @@ public sealed class AgentCoordinatorTests
             inner.CountPendingAsync(cancellationToken);
 
         public Task<EventStoreHealth> GetHealthAsync(CancellationToken cancellationToken) =>
-            inner.GetHealthAsync(cancellationToken);
+            FailHealth
+                ? Task.FromException<EventStoreHealth>(new IOException("simulated_health_failure"))
+                : inner.GetHealthAsync(cancellationToken);
 
         public Task<CallSessionState?> LoadActiveCallAsync(CancellationToken cancellationToken) =>
             inner.LoadActiveCallAsync(cancellationToken);

@@ -10,6 +10,26 @@ namespace DebtFlow.SipAgent.Host.Tests;
 public sealed class WebSocketEventPublisherTests
 {
     [Fact]
+    public async Task Offline_ControlFailsExplicitlyWhileDurableAndRealtimeRemainNonBlocking()
+    {
+        await using var publisher = new WebSocketEventPublisher();
+
+        await Assert.ThrowsAsync<WebSocketException>(
+            () => publisher.SendControlAsync("pong", "session.pong", new { }, CancellationToken.None));
+        await publisher.PublishDurableAsync(StoredEvent(1), CancellationToken.None);
+        await publisher.PublishRealtimeAsync(
+            "audio.input.level",
+            new RealtimeEventPayload(
+                "realtime",
+                NewId(),
+                NewId(),
+                NewId(),
+                DateTimeOffset.UtcNow,
+                JsonSerializer.SerializeToElement(new { level = 1 })),
+            CancellationToken.None);
+    }
+
+    [Fact]
     public async Task Replay_WaitsForSocketDeliveryToApplyBackpressure()
     {
         await using var publisher = new WebSocketEventPublisher();

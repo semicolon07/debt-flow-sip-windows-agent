@@ -197,7 +197,7 @@ public sealed class TrayApplicationContext : ApplicationContext
                 Notify("registration_failed", TrayText.Get("RegistrationFailed"));
             }
         }
-        catch (Exception exception)
+        catch (Exception exception) when (OperationalExceptionPolicy.IsNonFatal(exception))
         {
             _logger.LogWarning("Tray status refresh failed with {ErrorType}", exception.GetType().Name);
         }
@@ -219,7 +219,7 @@ public sealed class TrayApplicationContext : ApplicationContext
         {
             snapshot = await GetSnapshotWithTimeoutAsync();
         }
-        catch (Exception exception)
+        catch (Exception exception) when (OperationalExceptionPolicy.IsNonFatal(exception))
         {
             _logger.LogWarning("Tray exit status check failed with {ErrorType}; shutdown will continue", exception.GetType().Name);
         }
@@ -245,7 +245,7 @@ public sealed class TrayApplicationContext : ApplicationContext
         {
             _logger.LogWarning("Graceful shutdown exceeded its time limit");
         }
-        catch (Exception exception)
+        catch (Exception exception) when (OperationalExceptionPolicy.IsNonFatal(exception))
         {
             _logger.LogWarning("Graceful shutdown failed with {ErrorType}", exception.GetType().Name);
         }
@@ -264,7 +264,7 @@ public sealed class TrayApplicationContext : ApplicationContext
         {
             snapshot = await GetSnapshotWithTimeoutAsync();
         }
-        catch (Exception exception)
+        catch (Exception exception) when (OperationalExceptionPolicy.IsNonFatal(exception))
         {
             _logger.LogWarning("Certificate maintenance status check failed with {ErrorType}", exception.GetType().Name);
             return;
@@ -373,7 +373,7 @@ public sealed class TrayApplicationContext : ApplicationContext
                 MessageBoxButtons.OK,
                 MessageBoxIcon.Information);
         }
-        catch (Exception exception)
+        catch (Exception exception) when (OperationalExceptionPolicy.IsNonFatal(exception))
         {
             _logger.LogWarning("Diagnostic export failed with {ErrorType}", exception.GetType().Name);
             MessageBox.Show(
@@ -407,7 +407,7 @@ public sealed class TrayApplicationContext : ApplicationContext
         {
             await action();
         }
-        catch (Exception exception)
+        catch (Exception exception) when (OperationalExceptionPolicy.IsNonFatal(exception))
         {
             _logger.LogWarning(
                 "Tray operation {Operation} failed with {ErrorType}",

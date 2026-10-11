@@ -4,6 +4,10 @@
 ฐานการตรวจ: `150241ee0f85` (`refactor: harden audio device enumeration and caching in SipRuntime`)  
 สถานะ: **Mandatory source remediation implemented — full architecture/Windows/PBX/performance DoD pending**
 
+> Follow-up 11/10/2026: post-hardening inspectionพบ P1/P2 findingsเพิ่มเติม. เอกสารนี้ยังเป็นหลักฐานของ
+> workstreamรอบ 09/10/2026 แต่ remediation authorityล่าสุดคือ
+> [`2026-10-11-sip-agent-post-hardening-remediation-plan.md`](2026-10-11-sip-agent-post-hardening-remediation-plan.md).
+
 ## บทสรุปและการตัดสินใจ
 
 SIP Windows Agent มีพื้นฐานที่เหมาะสมสำหรับระบบ production ได้แก่ bounded single-writer coordinator,

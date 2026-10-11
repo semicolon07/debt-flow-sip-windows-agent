@@ -1,9 +1,13 @@
 # Debt Flow SIP Windows Agent
 
 Per-user SIP/audio tray agent สำหรับ Debt Flow Portal บน Windows 10 1809 ขึ้นไป.
-สถานะปัจจุบันคือ **mandatory source hardening implemented — full DoD และ Windows/PBX/release gates pending**.
-ผล implementation และ DoDล่าสุดอยู่ที่
-[09/10/2026 comprehensive improvement result](docs/plan-results/2026-10-09-sip-agent-comprehensive-improvement-result.md).
+สถานะปัจจุบันคือ **post-hardening source remediation implemented — Windows/PBX/release evidence pending; ยังไม่ production ready**.
+ผล implementation รอบ 09/10/2026 อยู่ที่
+[comprehensive improvement result](docs/plan-results/2026-10-09-sip-agent-comprehensive-improvement-result.md)
+และ finding/remediation authority ล่าสุดอยู่ที่
+[11/10/2026 post-hardening remediation plan](docs/2026-10-11-sip-agent-post-hardening-remediation-plan.md).
+ผล source implementationและ gateที่ยังค้างอยู่ที่
+[11/10/2026 post-hardening remediation result](docs/plan-results/2026-10-11-sip-agent-post-hardening-remediation-result.md).
 
 ## Runtime
 
@@ -176,3 +180,7 @@ instance หลักกำลังทำงาน. Exit codeคือ `0` succ
 - comprehensive re-audit วันที่ 09/10/2026 พบ source-level gaps เพิ่มใน signal supervision,
   replay failure isolation และ atomic call lifecycle; confirmed implementation scope และ production gatesอยู่ที่
   [comprehensive improvement plan](docs/2026-10-09-sip-windows-agent-comprehensive-improvement-plan.md)
+- post-hardening recheck วันที่ 11/10/2026 พบ release blockersเพิ่มใน inbound answer ownership,
+  stale media cleanup, command cancellation finalization, terminal capacity reserve, signal overloadและshutdown;
+  แผนแก้ครบทุก findingและ DoDอยู่ที่
+  [post-hardening remediation plan](docs/2026-10-11-sip-agent-post-hardening-remediation-plan.md)

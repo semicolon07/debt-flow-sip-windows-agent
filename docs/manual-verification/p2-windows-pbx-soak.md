@@ -2,6 +2,10 @@
 
 สถานะ: **pending execution on Windows/PBX Sandbox**
 
+Source-under-test requirementsและ abort criteriaล่าสุดอยู่ที่
+[`2026-10-11-sip-agent-post-hardening-remediation-result.md`](../plan-results/2026-10-11-sip-agent-post-hardening-remediation-result.md).
+ทุก runหลัง remediationต้องบันทึก exact candidate commitและห้าม reuse evidenceเดิม.
+
 ใช้ checklist นี้หลัง commit source แล้วและก่อนประกาศ P2 complete. ห้ามกรอก PASS จาก cross-build,
 source inspection หรือผล P1 เดิมแทนการทดสอบจริง.
 
@@ -46,6 +50,12 @@ vulnerability count 0, self-contained multi-file ZIP, SHA-256 และ `p2-wind
 | NEXT-DB-01 | fail eventตัวที่สองของ start/terminal batch | transaction rollbackทั้ง eventsและ active-call journal | pending |
 | NEXT-CAN-01 | shutdownชน answer/hangup/audio operation | cancellationไม่กลายเป็น business error, ไม่มี double terminal | pending |
 | NEXT-LOG-01 | log directory denied/fullแล้ว recover | call controlไม่สะดุด, metricเพิ่ม, writer recover, shutdown bounded | pending |
+| POST-ANS-01 | inbound answer timeoutแล้ว PBXตอบ successช้า | late legถูก hangup, ไม่มี connected/ghost call, callใหม่ไม่เริ่มก่อน fenceจบ | pending |
+| POST-MEDIA-01 | remote hangupสาย Aชน startสาย B | cleanup Aไม่ปิด endpoint/sessionของ B | pending |
+| POST-CMD-01 | Portal disconnectหลัง command journalเป็น executing | side effectไม่ซ้ำและ journal finalizeใน processเดิม | pending |
+| POST-OVR-01 | flood SIP callbacksจน overflow | physical legลงก่อน logical terminal, Agent degradedและ block callใหม่ | pending |
+| POST-CAP-01 | outboxที่ max-2/max-1/max | regularถูก block, terminal pairใช้ reserveได้, hard maxไม่เกิน | pending |
+| POST-SHUT-01 | faultแต่ละ shutdown phaseแล้ว invokeซ้ำ | incomplete phase resumeและ total shutdownไม่เกิน 10s | pending |
 | NEXT-DIAG-01 | export diagnosticsระหว่าง queue/task fault | health fieldsครบ, ไม่มี identifier/PII/raw exception | pending |
 
 ## Soak gate

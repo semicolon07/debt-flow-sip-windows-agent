@@ -5,6 +5,10 @@ Plan authority: [`2026-10-09-sip-windows-agent-comprehensive-improvement-plan.md
 Baseline: `150241ee0f85`  
 สถานะ: **Mandatory source remediation implemented; full DoD และ production release evidence pending**
 
+> Follow-up 11/10/2026: post-hardening recheckพบ P1/P2 gapsเพิ่มเติม จึงยังห้ามใช้ผลเอกสารนี้ประกาศ
+> production ready. Remediation authorityล่าสุดคือ
+> [`2026-10-11-sip-agent-post-hardening-remediation-plan.md`](../2026-10-11-sip-agent-post-hardening-remediation-plan.md).
+
 ## Outcome
 
 รอบนี้ปรับเฉพาะ repository `sip-windows-agent`. Protocol ยังคง V1, agent versionยังเป็น 1.0.0,

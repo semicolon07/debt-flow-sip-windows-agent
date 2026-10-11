@@ -21,6 +21,7 @@ public sealed class SipRuntime : ISipRuntime
 {
     private static readonly TimeSpan OutboundCallTimeout = TimeSpan.FromSeconds(60);
     private static readonly TimeSpan AnswerTimeout = TimeSpan.FromSeconds(30);
+    private static readonly TimeSpan MediaCleanupTimeout = TimeSpan.FromSeconds(3);
     private static readonly TimeSpan PlaybackDeviceCacheLifetime = TimeSpan.FromMinutes(5);
     private static readonly TimeSpan MissingPlaybackDeviceCacheLifetime = TimeSpan.FromSeconds(10);
     private static readonly TimeSpan AudioInventoryCacheLifetime = TimeSpan.FromSeconds(30);
@@ -30,6 +31,7 @@ public sealed class SipRuntime : ISipRuntime
     private readonly SIPTransport _transport;
     private readonly SIPUserAgent _userAgent;
     private readonly SemaphoreSlim _mediaGate = new(1, 1);
+    private readonly object _mediaStateGate = new();
     private readonly object _callGate = new();
     private readonly object _audioNotificationGate = new();
     private readonly Channel<SipSignal> _signals = Channel.CreateBounded<SipSignal>(
@@ -51,10 +53,12 @@ public sealed class SipRuntime : ISipRuntime
     private SIPServerUserAgent? _pendingIncomingCall;
     private SipCallHandle? _pendingIncomingHandle;
     private SipCallHandle? _activeCallHandle;
+    private SipCallHandle? _answeringCallHandle;
     private SipCallHandle? _unmappedOutboundHandle;
     private WindowsAudioEndPoint? _audioEndPoint;
     private VoIPMediaSession? _mediaSession;
     private AudioExtrasSource? _fallbackAudioSource;
+    private SipCallHandle? _mediaCallHandle;
     private SipConfiguration? _configuration;
     private CancellationTokenSource? _audioNotificationDebounce;
     private int? _cachedPlaybackDevice;
@@ -73,6 +77,7 @@ public sealed class SipRuntime : ISipRuntime
     private long _registrationGeneration;
     private long _callGeneration;
     private int _signalOverflow;
+    private int _answerTerminationPending;
     private volatile bool _disposed;
     private string _audioState = "degraded";
 
@@ -104,7 +109,7 @@ public sealed class SipRuntime : ISipRuntime
             _audioNotificationClient.DeviceRemoved += (_, _) => ScheduleAudioInventoryRefresh();
             _audioNotificationClient.DefaultDeviceChanged += (_, _) => ScheduleAudioInventoryRefresh();
         }
-        catch (Exception exception)
+        catch (Exception exception) when (OperationalExceptionPolicy.IsNonFatal(exception))
         {
             _logger.LogWarning(
                 "Audio device notifications are unavailable because of {ErrorType}",
@@ -237,7 +242,7 @@ public sealed class SipRuntime : ISipRuntime
         catch (TimeoutException)
         {
             _userAgent.Cancel();
-            await CleanupMediaAsync();
+            await CleanupMediaBoundedAsync(call);
             ClearActiveCall(call);
             Emit(new SipSignal(SipSignalType.CallFailed, SafeCode: "call_timeout", Call: call));
             return;
@@ -245,13 +250,13 @@ public sealed class SipRuntime : ISipRuntime
         catch (OperationCanceledException)
         {
             _userAgent.Cancel();
-            await CleanupMediaAsync();
+            await CleanupMediaBoundedAsync(call);
             ClearActiveCall(call);
             throw;
         }
-        catch
+        catch (Exception exception) when (OperationalExceptionPolicy.IsNonFatal(exception))
         {
-            await CleanupMediaAsync();
+            await CleanupMediaBoundedAsync(call);
             ClearActiveCall(call);
             throw;
         }
@@ -262,7 +267,7 @@ public sealed class SipRuntime : ISipRuntime
         }
         else
         {
-            await CleanupMediaAsync();
+            await CleanupMediaBoundedAsync(call);
             ClearActiveCall(call);
             Emit(new SipSignal(SipSignalType.CallFailed, SafeCode: "call_unavailable", Call: call));
         }
@@ -272,31 +277,63 @@ public sealed class SipRuntime : ISipRuntime
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
         cancellationToken.ThrowIfCancellationRequested();
-        SIPServerUserAgent incoming = TakePendingIncoming(call);
+        SIPServerUserAgent incoming = GetPendingIncoming(call);
+        BeginAnswer(call);
+        Task<bool> answerTask;
+        try
+        {
+            answerTask = _userAgent.Answer(incoming, CreateMediaSession(call));
+        }
+        catch (Exception exception) when (OperationalExceptionPolicy.IsNonFatal(exception))
+        {
+            await CleanupMediaBoundedAsync(call);
+            ClearActiveCall(call);
+            EndAnswer(call);
+            throw;
+        }
         bool answered;
         try
         {
-            answered = await _userAgent.Answer(incoming, CreateMediaSession(call))
-                .WaitAsync(AnswerTimeout, cancellationToken);
+            answered = await answerTask.WaitAsync(AnswerTimeout, cancellationToken);
         }
         catch (TimeoutException)
         {
-            await CleanupMediaAsync();
-            ClearActiveCall(call);
+            await TerminateIncompleteAnswerAsync(incoming, call, answerTask);
             Emit(new SipSignal(SipSignalType.CallFailed, SafeCode: "answer_timeout", Call: call));
             return;
         }
-        catch
+        catch (OperationCanceledException)
         {
-            await CleanupMediaAsync();
-            ClearActiveCall(call);
+            await TerminateIncompleteAnswerAsync(incoming, call, answerTask);
             throw;
         }
+        catch (Exception exception) when (OperationalExceptionPolicy.IsNonFatal(exception))
+        {
+            ClearPendingIncoming(call);
+            await CleanupMediaBoundedAsync(call);
+            ClearActiveCall(call);
+            EndAnswer(call);
+            throw;
+        }
+        if (Volatile.Read(ref _answerTerminationPending) != 0 || !IsActiveCall(call))
+        {
+            if (answered && _userAgent.IsCallActive)
+            {
+                _userAgent.Hangup();
+            }
+            await CleanupMediaBoundedAsync(call);
+            ClearActiveCall(call);
+            EndAnswer(call);
+            return;
+        }
+
+        ClearPendingIncoming(call);
         if (!answered)
         {
-            await CleanupMediaAsync();
+            await CleanupMediaBoundedAsync(call);
             ClearActiveCall(call);
         }
+        EndAnswer(call);
         Emit(answered
             ? new SipSignal(SipSignalType.CallConnected, Call: call)
             : new SipSignal(SipSignalType.CallFailed, SafeCode: "answer_failed", Call: call));
@@ -344,7 +381,7 @@ public sealed class SipRuntime : ISipRuntime
             _userAgent.Hangup();
         }
 
-        await CleanupMediaAsync();
+        await CleanupMediaBoundedAsync(call);
         ClearActiveCall(call);
     }
 
@@ -545,7 +582,17 @@ public sealed class SipRuntime : ISipRuntime
             _userAgent.Hangup();
         }
 
-        await CleanupMediaAsync();
+        using (var cleanupTimeout = new CancellationTokenSource(MediaCleanupTimeout))
+        {
+            try
+            {
+                await CleanupMediaAsync(expectedCall: null, cleanupTimeout.Token);
+            }
+            catch (OperationCanceledException) when (cleanupTimeout.IsCancellationRequested)
+            {
+                _logger.LogWarning("Media cleanup did not complete before shutdown timeout");
+            }
+        }
         SipCallHandle? active = GetActiveCall();
         if (active != null) ClearActiveCall(active);
         lock (_audioNotificationGate)
@@ -582,6 +629,7 @@ public sealed class SipRuntime : ISipRuntime
                 lock (_callGate)
                 {
                     if (_pendingIncomingCall == null &&
+                        Volatile.Read(ref _answerTerminationPending) == 0 &&
                         _activeCallHandle == null &&
                         !agent.IsCallActive &&
                         !agent.IsCalling &&
@@ -609,7 +657,7 @@ public sealed class SipRuntime : ISipRuntime
                 string caller = request.Header?.From?.FromURI?.User ?? "unknown";
                 Emit(new SipSignal(SipSignalType.IncomingCall, Caller: caller, Call: call));
             }
-            catch (Exception exception)
+            catch (Exception exception) when (OperationalExceptionPolicy.IsNonFatal(exception))
             {
                 _logger.LogWarning(
                     "Incoming SIP call callback failed because of {ErrorType}",
@@ -621,6 +669,7 @@ public sealed class SipRuntime : ISipRuntime
         {
             SipCallHandle? call = ResolveIncomingHandle(incoming);
             if (call == null) return;
+            MarkAnswerTerminationPending(call);
             ClearPendingIncoming(call);
             TrackBackground(CleanupMediaForCallAsync(call));
             Emit(new SipSignal(SipSignalType.IncomingCancelled, Call: call));
@@ -629,6 +678,7 @@ public sealed class SipRuntime : ISipRuntime
         {
             SipCallHandle? call = ResolveIncomingHandle(incoming);
             if (call == null) return;
+            MarkAnswerTerminationPending(call);
             ClearPendingIncoming(call);
             TrackBackground(CleanupMediaForCallAsync(call));
             Emit(new SipSignal(SipSignalType.CallFailed, SafeCode: "answer_ack_timeout", Call: call));
@@ -642,6 +692,7 @@ public sealed class SipRuntime : ISipRuntime
         {
             SipCallHandle? call = ResolveEndedCall(dialogue?.CallId);
             if (call == null) return;
+            MarkAnswerTerminationPending(call);
             TrackBackground(CleanupMediaForCallAsync(call));
             Emit(new SipSignal(SipSignalType.CallRemoteEnded, Call: call));
         };
@@ -693,38 +744,37 @@ public sealed class SipRuntime : ISipRuntime
                 encoder,
                 inputDeviceId,
                 outputDeviceId);
-        _audioEndPoint = endpoint;
         bool hasCapture = captureDevice.HasValue;
         bool hasPlayback = playbackDevice.HasValue;
         Volatile.Write(ref _microphoneMuted, 0);
 
-        _audioEndPoint.OnAudioSourceError += _ =>
+        endpoint.OnAudioSourceError += _ =>
             Emit(new SipSignal(SipSignalType.MediaDegraded, SafeCode: "audio_source_error", Call: call));
-        _audioEndPoint.OnAudioSinkError += _ =>
+        endpoint.OnAudioSinkError += _ =>
             Emit(new SipSignal(SipSignalType.MediaDegraded, SafeCode: "audio_sink_error", Call: call));
 
         IAudioSource source;
+        AudioExtrasSource? fallback = null;
         if (hasCapture)
         {
-            source = _audioEndPoint;
-            _fallbackAudioSource = null;
+            source = endpoint;
         }
         else
         {
-            _fallbackAudioSource = new AudioExtrasSource(
+            fallback = new AudioExtrasSource(
                 encoder,
                 new AudioSourceOptions { AudioSource = AudioSourcesEnum.Silence });
-            source = _fallbackAudioSource;
+            source = fallback;
         }
 
-        IAudioSink? sink = hasPlayback ? _audioEndPoint : null;
+        IAudioSink? sink = hasPlayback ? endpoint : null;
         if (!hasCapture || !hasPlayback)
         {
             AudioState = "degraded";
             Emit(new SipSignal(SipSignalType.MediaDegraded, SafeCode: "audio_device_unavailable", Call: call));
         }
 
-        _mediaSession = new VoIPMediaSession(new MediaEndPoints
+        var mediaSession = new VoIPMediaSession(new MediaEndPoints
         {
             AudioSource = source,
             AudioSink = sink
@@ -733,13 +783,26 @@ public sealed class SipRuntime : ISipRuntime
             AcceptRtpFromAny = _acceptRtpFromAny
         };
 
-        _mediaSession.OnAudioFormatsNegotiated += formats =>
+        mediaSession.OnAudioFormatsNegotiated += formats =>
         {
             string codec = string.Join(",", formats.Select(format => $"{format.Codec}/{format.ClockRate}"));
             TrackBackground(ApplyRememberedVolumesAsync());
             Emit(new SipSignal(SipSignalType.MediaReady, Codec: codec, Call: call));
         };
-        return _mediaSession;
+        lock (_mediaStateGate)
+        {
+            if (_mediaSession != null)
+            {
+                mediaSession.Dispose();
+                throw new InvalidOperationException("Another media session is active.");
+            }
+
+            _audioEndPoint = endpoint;
+            _fallbackAudioSource = fallback;
+            _mediaSession = mediaSession;
+            _mediaCallHandle = call;
+        }
+        return mediaSession;
     }
 
     private static WindowsAudioEndPoint CreateWindowsAudioEndPoint(
@@ -768,7 +831,7 @@ public sealed class SipRuntime : ISipRuntime
                 captureDevice,
                 playbackDevice);
         }
-        catch (Exception exception)
+        catch (Exception exception) when (OperationalExceptionPolicy.IsNonFatal(exception))
         {
             _logger.LogWarning(
                 "Audio endpoint initialization is retrying after {ErrorType}",
@@ -785,7 +848,7 @@ public sealed class SipRuntime : ISipRuntime
                 captureDevice,
                 playbackDevice);
         }
-        catch (Exception exception)
+        catch (Exception exception) when (OperationalExceptionPolicy.IsNonFatal(exception))
         {
             _logger.LogWarning(
                 "Audio endpoint initialization is falling back to a single device after {ErrorType}",
@@ -801,7 +864,7 @@ public sealed class SipRuntime : ISipRuntime
                     captureDevice,
                     null);
             }
-            catch (Exception exception)
+            catch (Exception exception) when (OperationalExceptionPolicy.IsNonFatal(exception))
             {
                 _logger.LogWarning(
                     "Audio capture fallback is unavailable because of {ErrorType}",
@@ -821,7 +884,7 @@ public sealed class SipRuntime : ISipRuntime
                     null,
                     playbackDevice);
             }
-            catch (Exception exception)
+            catch (Exception exception) when (OperationalExceptionPolicy.IsNonFatal(exception))
             {
                 _logger.LogWarning(
                     "Audio playback fallback is unavailable because of {ErrorType}",
@@ -1038,7 +1101,7 @@ public sealed class SipRuntime : ISipRuntime
                 }
             }
         }
-        catch (Exception exception)
+        catch (Exception exception) when (OperationalExceptionPolicy.IsNonFatal(exception))
         {
             Volatile.Write(
                 ref _audioInventoryCacheExpiresAt,
@@ -1115,7 +1178,7 @@ public sealed class SipRuntime : ISipRuntime
                     index,
                     false));
             }
-            catch (Exception exception)
+            catch (Exception exception) when (OperationalExceptionPolicy.IsNonFatal(exception))
             {
                 _logger.LogWarning(
                     "Audio output device enumeration skipped index {DeviceIndex} because of {ErrorType}",
@@ -1148,7 +1211,7 @@ public sealed class SipRuntime : ISipRuntime
                     index,
                     false));
             }
-            catch (Exception exception)
+            catch (Exception exception) when (OperationalExceptionPolicy.IsNonFatal(exception))
             {
                 _logger.LogWarning(
                     "Audio input device enumeration skipped index {DeviceIndex} because of {ErrorType}",
@@ -1165,7 +1228,7 @@ public sealed class SipRuntime : ISipRuntime
         {
             return Math.Max(0, WaveOut.DeviceCount);
         }
-        catch (Exception exception)
+        catch (Exception exception) when (OperationalExceptionPolicy.IsNonFatal(exception))
         {
             _logger.LogWarning(
                 "Audio output device count is unavailable because of {ErrorType}",
@@ -1180,7 +1243,7 @@ public sealed class SipRuntime : ISipRuntime
         {
             return Math.Max(0, WaveIn.DeviceCount);
         }
-        catch (Exception exception)
+        catch (Exception exception) when (OperationalExceptionPolicy.IsNonFatal(exception))
         {
             _logger.LogWarning(
                 "Audio input device count is unavailable because of {ErrorType}",
@@ -1292,34 +1355,67 @@ public sealed class SipRuntime : ISipRuntime
     private static long GetExpirationTimestamp(TimeSpan lifetime) =>
         Stopwatch.GetTimestamp() + (long)(lifetime.TotalSeconds * Stopwatch.Frequency);
 
-    private async Task CleanupMediaAsync()
+    private async Task CleanupMediaAsync(
+        SipCallHandle? expectedCall,
+        CancellationToken cancellationToken)
     {
-        await _mediaGate.WaitAsync();
-        VoIPMediaSession? mediaSession = _mediaSession;
-        _mediaSession = null;
-        _fallbackAudioSource = null;
-        _audioEndPoint = null;
-        Volatile.Write(ref _microphoneMuted, 0);
+        await _mediaGate.WaitAsync(cancellationToken);
+        VoIPMediaSession? mediaSession;
         try
         {
-            mediaSession?.Close("call ended");
-        }
-        catch (Exception exception)
-        {
-            _logger.LogWarning("Media cleanup failed with {ErrorType}", exception.GetType().Name);
+            lock (_mediaStateGate)
+            {
+                if (expectedCall != null && !SameCall(_mediaCallHandle, expectedCall))
+                {
+                    return;
+                }
+
+                mediaSession = _mediaSession;
+                _mediaSession = null;
+                _mediaCallHandle = null;
+                _fallbackAudioSource = null;
+                _audioEndPoint = null;
+                Volatile.Write(ref _microphoneMuted, 0);
+            }
+
+            try
+            {
+                mediaSession?.Close("call ended");
+            }
+            catch (Exception exception) when (OperationalExceptionPolicy.IsNonFatal(exception))
+            {
+                _logger.LogWarning("Media cleanup failed with {ErrorType}", exception.GetType().Name);
+            }
+            finally
+            {
+                try
+                {
+                    mediaSession?.Dispose();
+                }
+                catch (Exception exception) when (OperationalExceptionPolicy.IsNonFatal(exception))
+                {
+                    _logger.LogWarning("Media disposal failed with {ErrorType}", exception.GetType().Name);
+                }
+            }
         }
         finally
         {
-            try
-            {
-                mediaSession?.Dispose();
-            }
-            catch (Exception exception)
-            {
-                _logger.LogWarning("Media disposal failed with {ErrorType}", exception.GetType().Name);
-            }
-
             _mediaGate.Release();
+        }
+    }
+
+    private async Task CleanupMediaBoundedAsync(SipCallHandle call)
+    {
+        using var timeout = new CancellationTokenSource(MediaCleanupTimeout);
+        try
+        {
+            await CleanupMediaAsync(call, timeout.Token);
+        }
+        catch (OperationCanceledException) when (timeout.IsCancellationRequested)
+        {
+            _logger.LogWarning(
+                "Media cleanup timed out for SIP call generation {CallGeneration}",
+                call.Generation);
         }
     }
 
@@ -1376,7 +1472,7 @@ public sealed class SipRuntime : ISipRuntime
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
         }
-        catch (Exception exception)
+        catch (Exception exception) when (OperationalExceptionPolicy.IsNonFatal(exception))
         {
             _logger.LogWarning(
                 "Audio inventory refresh failed because of {ErrorType}",
@@ -1422,7 +1518,8 @@ public sealed class SipRuntime : ISipRuntime
         {
             await _signals.Writer.WriteAsync(new SipSignal(
                 SipSignalType.RuntimeFailed,
-                SafeCode: "sip_signal_overflow"));
+                SafeCode: "sip_signal_overflow",
+                Call: GetActiveCall()));
         }
         catch (ChannelClosedException)
         {
@@ -1447,6 +1544,11 @@ public sealed class SipRuntime : ISipRuntime
     {
         lock (_callGate)
         {
+            if (Volatile.Read(ref _answerTerminationPending) != 0)
+            {
+                throw new InvalidOperationException("A previous SIP answer is still terminating.");
+            }
+
             if (_activeCallHandle != null && !SameCall(_activeCallHandle, call))
             {
                 throw new InvalidOperationException("Another SIP call is active.");
@@ -1491,6 +1593,150 @@ public sealed class SipRuntime : ISipRuntime
             _pendingIncomingCall = null;
             _pendingIncomingHandle = null;
             return incoming;
+        }
+    }
+
+    private SIPServerUserAgent GetPendingIncoming(SipCallHandle call)
+    {
+        lock (_callGate)
+        {
+            if (_pendingIncomingCall == null ||
+                !SameCall(_pendingIncomingHandle, call) ||
+                !SameCall(_activeCallHandle, call))
+            {
+                throw new InvalidOperationException("No matching incoming call is pending.");
+            }
+
+            return _pendingIncomingCall;
+        }
+    }
+
+    private void BeginAnswer(SipCallHandle call)
+    {
+        lock (_callGate)
+        {
+            if (!SameCall(_activeCallHandle, call) || _answeringCallHandle != null)
+            {
+                throw new InvalidOperationException("The incoming SIP call cannot enter answer state.");
+            }
+
+            _answeringCallHandle = call;
+        }
+    }
+
+    private bool IsActiveCall(SipCallHandle call)
+    {
+        lock (_callGate)
+        {
+            return SameCall(_activeCallHandle, call);
+        }
+    }
+
+    private void MarkAnswerTerminationPending(SipCallHandle call)
+    {
+        lock (_callGate)
+        {
+            if (SameCall(_answeringCallHandle, call))
+            {
+                Interlocked.Exchange(ref _answerTerminationPending, 1);
+            }
+        }
+    }
+
+    private void EndAnswer(SipCallHandle call)
+    {
+        lock (_callGate)
+        {
+            if (SameCall(_answeringCallHandle, call))
+            {
+                _answeringCallHandle = null;
+                Interlocked.Exchange(ref _answerTerminationPending, 0);
+            }
+        }
+    }
+
+    private async Task TerminateIncompleteAnswerAsync(
+        SIPServerUserAgent incoming,
+        SipCallHandle call,
+        Task<bool> answerTask)
+    {
+        Interlocked.Exchange(ref _answerTerminationPending, 1);
+        try
+        {
+            try
+            {
+                incoming.Reject(
+                    SIPResponseStatusCodesEnum.TemporarilyUnavailable,
+                    "Answer operation terminated");
+            }
+            catch (Exception exception) when (
+                exception is not OutOfMemoryException and not AccessViolationException)
+            {
+                _logger.LogWarning(
+                    "Incomplete SIP answer rejection failed because of {ErrorType}",
+                    exception.GetType().Name);
+                if (_userAgent.IsCallActive)
+                {
+                    _userAgent.Hangup();
+                }
+                else
+                {
+                    _userAgent.Cancel();
+                }
+            }
+
+            ClearPendingIncoming(call);
+            await CleanupMediaBoundedAsync(call);
+
+            if (!answerTask.IsCompleted)
+            {
+                Task completed = await Task.WhenAny(
+                    answerTask,
+                    Task.Delay(TimeSpan.FromSeconds(2)));
+                if (!ReferenceEquals(completed, answerTask))
+                {
+                    TrackBackground(ObserveTerminatedAnswerAsync(answerTask, call));
+                    Emit(new SipSignal(
+                        SipSignalType.RuntimeFailed,
+                        SafeCode: "answer_termination_pending",
+                        Call: call));
+                    return;
+                }
+            }
+
+            await ObserveTerminatedAnswerAsync(answerTask, call);
+        }
+        catch (Exception exception) when (OperationalExceptionPolicy.IsNonFatal(exception))
+        {
+            EndAnswer(call);
+            throw;
+        }
+    }
+
+    private async Task ObserveTerminatedAnswerAsync(Task<bool> answerTask, SipCallHandle call)
+    {
+        try
+        {
+            bool answered = await answerTask;
+            if (answered && _userAgent.IsCallActive)
+            {
+                _logger.LogWarning(
+                    "A terminated SIP answer completed late; forcing the physical leg down");
+                _userAgent.Hangup();
+            }
+        }
+        catch (Exception exception) when (
+            exception is not OutOfMemoryException and not AccessViolationException)
+        {
+            _logger.LogDebug(
+                "Terminated SIP answer completed with {ErrorType}",
+                exception.GetType().Name);
+        }
+        finally
+        {
+            await CleanupMediaBoundedAsync(call);
+            ClearActiveCall(call);
+            EndAnswer(call);
         }
     }
 
@@ -1601,14 +1847,13 @@ public sealed class SipRuntime : ISipRuntime
     {
         try
         {
-            EnsureActiveCall(call);
-            await CleanupMediaAsync();
+            await CleanupMediaBoundedAsync(call);
             ClearActiveCall(call);
         }
         catch (InvalidOperationException)
         {
         }
-        catch (Exception exception)
+        catch (Exception exception) when (OperationalExceptionPolicy.IsNonFatal(exception))
         {
             _logger.LogWarning("Media cleanup callback failed because of {ErrorType}", exception.GetType().Name);
         }

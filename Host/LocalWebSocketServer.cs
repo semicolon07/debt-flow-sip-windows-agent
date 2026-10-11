@@ -157,6 +157,11 @@ public sealed class LocalWebSocketServer(
             logger.LogInformation("WebSocket client closed the session");
             await TryCloseAsync(socket, WebSocketCloseStatus.NormalClosure, "client_closed");
         }
+        catch (OperationCanceledException) when (context.RequestAborted.IsCancellationRequested)
+        {
+            logger.LogInformation("WebSocket request was aborted by the client or host");
+            await TryCloseAsync(socket, WebSocketCloseStatus.NormalClosure, "request_aborted");
+        }
         catch (OperationCanceledException)
         {
             await TryCloseAsync(socket, WebSocketCloseStatus.EndpointUnavailable, "timeout");
@@ -165,7 +170,8 @@ public sealed class LocalWebSocketServer(
         {
             logger.LogInformation("WebSocket disconnected with {ErrorType}", exception.GetType().Name);
         }
-        catch (Exception exception)
+        catch (Exception exception) when (
+            exception is not OutOfMemoryException and not AccessViolationException)
         {
             logger.LogError("WebSocket session failed with {ErrorType}", exception.GetType().Name);
         }
@@ -183,7 +189,10 @@ public sealed class LocalWebSocketServer(
                 {
                     await coordinator.PortalDisconnectedAsync(CancellationToken.None);
                 }
-                catch (Exception exception) when (exception is not OperationCanceledException)
+                catch (Exception exception) when (
+                    exception is not OperationCanceledException and
+                    not OutOfMemoryException and
+                    not AccessViolationException)
                 {
                     logger.LogWarning("Portal disconnect cleanup failed with {ErrorType}", exception.GetType().Name);
                 }

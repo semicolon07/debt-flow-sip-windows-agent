@@ -102,7 +102,10 @@ public sealed record EventStoreHealth(
     long PendingEventCount,
     long StorageBytes,
     EventStoreCapacityState CapacityState,
-    DateTimeOffset? OldestPendingAtUtc = null);
+    DateTimeOffset? OldestPendingAtUtc = null,
+    long RegularEventSlotsRemaining = 0,
+    bool TerminalReserveAvailable = false,
+    long RegularStorageBytesRemaining = 0);
 
 public sealed record AgentOperationalHealth(
     string CoordinatorProcessorState,
@@ -120,6 +123,12 @@ public sealed class AgentStoreException(string errorCode, Exception? innerExcept
     : Exception(errorCode, innerException)
 {
     public string ErrorCode { get; } = errorCode;
+}
+
+public static class OperationalExceptionPolicy
+{
+    public static bool IsNonFatal(Exception exception) =>
+        exception is not OutOfMemoryException and not AccessViolationException;
 }
 
 public interface IAgentEventStore : IAsyncDisposable
