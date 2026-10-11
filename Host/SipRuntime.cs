@@ -41,7 +41,8 @@ public sealed class SipRuntime : ISipRuntime
             AllowSynchronousContinuations = false
         });
     private readonly BackgroundTaskSupervisor _backgroundTasks = new();
-    private readonly Dictionary<string, SipCallHandle> _callHandlesBySipCallId = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, SipCallHandle> _callHandlesBySipCallId =
+        new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<ISIPServerUserAgent, SipCallHandle> _incomingHandles = new();
     private readonly AudioSessionVolumeController _volumeController = new();
     private readonly MMDeviceEnumerator? _audioDeviceEnumerator;
@@ -639,7 +640,7 @@ public sealed class SipRuntime : ISipRuntime
         };
         _userAgent.OnCallHungup += dialogue =>
         {
-            SipCallHandle? call = ResolveSipCallId(dialogue.CallId);
+            SipCallHandle? call = ResolveEndedCall(dialogue?.CallId);
             if (call == null) return;
             TrackBackground(CleanupMediaForCallAsync(call));
             Emit(new SipSignal(SipSignalType.CallRemoteEnded, Call: call));
@@ -1555,12 +1556,14 @@ public sealed class SipRuntime : ISipRuntime
         }
     }
 
-    private SipCallHandle? ResolveSipCallId(string? sipCallId)
+    private SipCallHandle? ResolveEndedCall(string? sipCallId)
     {
-        if (string.IsNullOrWhiteSpace(sipCallId)) return null;
         lock (_callGate)
         {
-            return _callHandlesBySipCallId.GetValueOrDefault(sipCallId);
+            return SipCallTerminationResolver.Resolve(
+                sipCallId,
+                _callHandlesBySipCallId,
+                _activeCallHandle);
         }
     }
 
