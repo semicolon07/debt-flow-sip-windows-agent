@@ -232,6 +232,8 @@ OutputBaseFilename=debt-flow-sip-agent-{#AppVersion}-win-x64-setup
 - รองรับ English และ Thai installer UI; strings ของ custom messages ต้องอยู่ใน language-specific entries.
 - Desktop shortcut เป็น optional task และ default off.
 - Start Menu shortcut และ Add/Remove Programs entry ต้องสร้างเสมอ.
+- ใช้ owner-approved multi-resolution ICO ชุดเดียวกันกับ Host executable, tray, setup EXE, shortcuts และ
+  Add/Remove Programs; build manifestบันทึก icon SHA-256 เพื่อ trace branding input.
 - Finish page launch checkbox default on สำหรับ interactive fresh install/upgrade และ `skipifsilent`.
 
 ## 7. Installer-to-Agent maintenance protocol

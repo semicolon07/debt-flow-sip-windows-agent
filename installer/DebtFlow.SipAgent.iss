@@ -10,6 +10,9 @@
 #ifndef OutputDirectory
   #error OutputDirectory must be supplied by build-installer.ps1
 #endif
+#ifndef AppIconPath
+  #error AppIconPath must be supplied by build-installer.ps1
+#endif
 #ifndef ExpectedProtocolVersion
   #define ExpectedProtocolVersion "1"
 #endif
@@ -48,6 +51,7 @@ OutputBaseFilename=debt-flow-sip-agent-{#AppVersion}-win-x64-setup
 Compression=lzma2/ultra64
 SolidCompression=yes
 SetupLogging=yes
+SetupIconFile={#AppIconPath}
 UninstallDisplayIcon={app}\versions\{#AppVersion}\{#AppExe}
 UninstallDisplayName=Debt Flow SIP Agent {#AppVersion}
 

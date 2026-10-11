@@ -27,8 +27,11 @@ $packageRoot = (Resolve-Path -LiteralPath $PackageDirectory).Path
 $outputRoot = [System.IO.Path]::GetFullPath($OutputDirectory)
 $manifestPath = Join-Path $packageRoot "release-manifest.json"
 $scriptPath = Join-Path $repositoryRoot "installer\DebtFlow.SipAgent.iss"
+$applicationIconPath = Join-Path $repositoryRoot "assets\branding\DebtFlow.SipAgent.ico"
 if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) { throw "release_manifest_missing" }
 if (-not (Test-Path -LiteralPath $scriptPath -PathType Leaf)) { throw "inno_script_missing" }
+if (-not (Test-Path -LiteralPath $applicationIconPath -PathType Leaf)) { throw "application_icon_missing" }
+$applicationIconHash = (Get-FileHash -LiteralPath $applicationIconPath -Algorithm SHA256).Hash.ToLowerInvariant()
 New-Item -ItemType Directory -Force -Path $outputRoot | Out-Null
 if ([string]::IsNullOrWhiteSpace($LogPath)) { $LogPath = Join-Path $outputRoot "inno-compile.log" }
 $logRoot = Split-Path -Parent ([System.IO.Path]::GetFullPath($LogPath))
@@ -169,6 +172,7 @@ $arguments = @(
     "/DGitCommit=$GitCommit",
     "/DPackageDirectory=$packageRoot",
     "/DOutputDirectory=$outputRoot",
+    "/DAppIconPath=$applicationIconPath",
     "/DExpectedProtocolVersion=1",
     "/DExpectedSqliteSchemaVersion=4",
     $scriptPath
@@ -206,6 +210,7 @@ $installerManifestPath = Join-Path $outputRoot "installer-manifest.json"
     gitCommit = $GitCommit.ToLowerInvariant()
     tag = $Tag
     appId = "{476433C5-E4DF-4CD6-9E42-29F01E4BC339}"
+    applicationIconSha256 = $applicationIconHash
     innoSetup = [ordered]@{
         version = $innoVersion
         architecture = "x64"

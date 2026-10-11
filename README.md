@@ -115,6 +115,9 @@ Normal uninstallเก็บ `%LOCALAPPDATA%\DebtFlow\SipAgent` และ certif
 `/PURGEDATA=1` เป็น destructive opt-in แยกกัน. Rollbackใช้ operator script
 `scripts/invoke-installer-rollback.ps1` เท่านั้น.
 
+Host executable, normal/recovery tray, setup EXE, shortcuts และ Add/Remove Programsใช้ Debt Flow SIP Agent
+multi-resolution iconชุดเดียวกัน; installer manifestบันทึก SHA-256 ของ source ICO สำหรับตรวจ provenance.
+
 แผนและ contract โดยละเอียดอยู่ที่
 [Inno Setup installer implementation plan](docs/2026-10-11-sip-agent-inno-setup-installer-plan.md).
 ผล implementation และ DoD evidence/pending gates อยู่ที่

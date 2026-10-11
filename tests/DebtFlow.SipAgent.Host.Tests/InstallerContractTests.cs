@@ -21,6 +21,7 @@ public sealed class InstallerContractTests
         Assert.Contains("CloseApplications=no", script, StringComparison.Ordinal);
         Assert.Contains("RestartApplications=no", script, StringComparison.Ordinal);
         Assert.Contains("skipifsilent", script, StringComparison.Ordinal);
+        Assert.Contains("SetupIconFile={#AppIconPath}", script, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -65,6 +66,8 @@ public sealed class InstallerContractTests
         Assert.Contains("inno_compiler_version_command_failed", script, StringComparison.Ordinal);
         Assert.DoesNotContain("$iscc.VersionInfo.ProductVersion", script, StringComparison.Ordinal);
         Assert.Contains("version = $innoVersion", script, StringComparison.Ordinal);
+        Assert.Contains("/DAppIconPath=$applicationIconPath", script, StringComparison.Ordinal);
+        Assert.Contains("applicationIconSha256 = $applicationIconHash", script, StringComparison.Ordinal);
         Assert.True(
             script.IndexOf("Get-AuthenticodeSignature -LiteralPath $iscc.FullName", StringComparison.Ordinal) <
             script.IndexOf("$innoVersion = Get-InnoCompilerVersion $iscc.FullName", StringComparison.Ordinal),

@@ -43,6 +43,7 @@ public sealed class TlsRecoveryApplicationContext : ApplicationContext
     private readonly SingleInstanceCoordinator _singleInstance;
     private readonly TlsDiagnosticExporter _diagnosticExporter;
     private readonly string _logDirectory;
+    private readonly Icon _applicationIcon;
     private readonly NotifyIcon _notifyIcon;
     private readonly ToolStripMenuItem _status;
     private readonly SynchronizationContext _uiContext;
@@ -86,9 +87,10 @@ public sealed class TlsRecoveryApplicationContext : ApplicationContext
             new ToolStripSeparator(),
             exit
         ]);
+        _applicationIcon = ApplicationIconProvider.Load();
         _notifyIcon = new NotifyIcon
         {
-            Icon = SystemIcons.Warning,
+            Icon = _applicationIcon,
             Text = TrayText.Get("AppName"),
             ContextMenuStrip = menu,
             Visible = true
@@ -111,6 +113,7 @@ public sealed class TlsRecoveryApplicationContext : ApplicationContext
             _singleInstance.PrepareUpdateRequested -= OnPrepareUpdateRequestedAsync;
             _notifyIcon.Visible = false;
             _notifyIcon.Dispose();
+            _applicationIcon.Dispose();
         }
 
         base.Dispose(disposing);

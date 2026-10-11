@@ -77,6 +77,7 @@ public static class AgentSettingsProvisioner
 
 internal sealed class OriginConfigurationDialog : Form
 {
+    private readonly Icon _applicationIcon = ApplicationIconProvider.Load();
     private readonly CheckBox _allowAll = new()
     {
         AutoSize = true,
@@ -95,6 +96,7 @@ internal sealed class OriginConfigurationDialog : Form
     internal OriginConfigurationDialog()
     {
         Text = "Debt Flow SIP Agent setup";
+        Icon = _applicationIcon;
         StartPosition = FormStartPosition.CenterScreen;
         FormBorderStyle = FormBorderStyle.FixedDialog;
         MaximizeBox = false;
@@ -143,6 +145,16 @@ internal sealed class OriginConfigurationDialog : Form
 
         _allowAll.CheckedChanged += (_, _) => _origins.Enabled = !_allowAll.Checked;
         save.Click += (_, _) => ValidateBeforeClose();
+    }
+
+    protected override void Dispose(bool disposing)
+    {
+        if (disposing)
+        {
+            _applicationIcon.Dispose();
+        }
+
+        base.Dispose(disposing);
     }
 
     internal bool IsAllowAllOrigins => _allowAll.Checked;

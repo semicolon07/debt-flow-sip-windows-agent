@@ -30,5 +30,8 @@
     <None Include="../../scripts/verify-p5-release.ps1"
           Link="Scripts/verify-p5-release.ps1"
           CopyToOutputDirectory="PreserveNewest" />
+    <None Include="../../assets/branding/DebtFlow.SipAgent.ico"
+          Link="Assets/Branding/DebtFlow.SipAgent.ico"
+          CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 </Project>

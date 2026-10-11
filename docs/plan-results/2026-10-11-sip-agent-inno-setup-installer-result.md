@@ -142,6 +142,12 @@ P5 rerunถัดมาสร้าง setup EXEและ installer manifestส�
 ก่อน P2/buildเพื่อ fail fast และใช้ gateเดียวกันซ้ำก่อน installer test. เอกสารระบุชัดว่าต้องรัน P5ด้วย dedicated
 clean Windows user profile; Windows clean-profile P5 rerunยังเป็น pending gate.
 
+เพิ่ม owner-approved SIP Agent icon master PNG และ Windows ICO แบบ 32-bit alpha 7 เฟรม
+(`16/24/32/48/64/128/256`). Host apphost embed iconโดยตรง, normal trayและ TLS recovery trayโหลด associated
+iconจาก executableพร้อม owned fallback, configuration dialogใช้ iconเดียวกัน, Inno setupรับ ICOผ่าน explicit
+`AppIconPath` และ installer manifestบันทึก SHA-256 ของ branding input. Shortcutsและ Add/Remove Programsอ้างอิง
+iconจาก versioned Host EXE จึงไม่มี loose runtime icon dependency; Windows visual/P5 rerunยังเป็น pending gate.
+
 ## Deviations and follow-up
 
 - Setup failureจาก `PrepareToInstall` ใช้ standard Inno non-zero exit 7; exit 30–33เป็น contractของ Agent
@@ -181,6 +187,7 @@ clean Windows user profile; Windows clean-profile P5 rerunยังเป็น 
 - [x] Normal uninstall preserves data/certificate.
 - [x] Explicit certificate/data purge validates exact owned targets; data purge rejects reparse-point trees.
 - [x] Operator-only rollback workflow implemented.
+- [x] Application, tray, setup, shortcuts and Add/Remove Programs share the approved multi-resolution icon source.
 
 ### P3 — Release pipeline และ artifacts
 

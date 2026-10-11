@@ -24,6 +24,7 @@ public sealed class TrayApplicationContext : ApplicationContext
     private readonly string _logDirectory;
     private readonly int? _tlsDaysRemaining;
     private readonly string? _tlsWarningCode;
+    private readonly Icon _applicationIcon;
     private readonly NotifyIcon _notifyIcon;
     private readonly ToolStripMenuItem _agentStatus;
     private readonly ToolStripMenuItem _portalStatus;
@@ -112,9 +113,10 @@ public sealed class TrayApplicationContext : ApplicationContext
             exit
         ]);
 
+        _applicationIcon = ApplicationIconProvider.Load();
         _notifyIcon = new NotifyIcon
         {
-            Icon = SystemIcons.Application,
+            Icon = _applicationIcon,
             Text = TrayText.Get("AppName"),
             ContextMenuStrip = menu,
             Visible = true
@@ -161,6 +163,7 @@ public sealed class TrayApplicationContext : ApplicationContext
             _timer.Dispose();
             _notifyIcon.Visible = false;
             _notifyIcon.Dispose();
+            _applicationIcon.Dispose();
         }
 
         base.Dispose(disposing);
@@ -195,7 +198,7 @@ public sealed class TrayApplicationContext : ApplicationContext
                 "CallStatus",
                 snapshot.ActiveCalls.Count == 0 ? TrayText.Get("Idle") : TrayText.State(snapshot.ActiveCalls[0].State));
             _audioStatus.Text = TrayText.Format("AudioStatus", TrayText.State(snapshot.AudioState));
-            _notifyIcon.Icon = agentState == "degraded" ? SystemIcons.Warning : SystemIcons.Application;
+            _notifyIcon.Icon = agentState == "degraded" ? SystemIcons.Warning : _applicationIcon;
             _notifyIcon.Text = TruncateTooltip($"{TrayText.Get("AppName")} — {localizedAgentState}");
 
             if (snapshot.RegistrationState == "failed")
