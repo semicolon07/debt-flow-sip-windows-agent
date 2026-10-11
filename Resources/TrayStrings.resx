@@ -17,6 +17,7 @@
   <data name="ExportDiagnostics" xml:space="preserve"><value>Export safe diagnostics</value></data>
   <data name="DiagnosticExported" xml:space="preserve"><value>Safe diagnostic bundle exported to: {0}</value></data>
   <data name="DiagnosticExportFailed" xml:space="preserve"><value>Unable to export the diagnostic bundle.</value></data>
+  <data name="DiagnosticExportFailedWithCode" xml:space="preserve"><value>Unable to export the diagnostic bundle. Error code: {0}</value></data>
   <data name="StartWithWindows" xml:space="preserve"><value>Start with Windows</value></data>
   <data name="Exit" xml:space="preserve"><value>Exit</value></data>
   <data name="ExitTitle" xml:space="preserve"><value>Exit SIP Agent</value></data>

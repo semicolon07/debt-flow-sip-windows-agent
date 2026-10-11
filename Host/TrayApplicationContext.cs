@@ -10,6 +10,8 @@ namespace DebtFlow.SipAgent.Host;
 public sealed class TrayApplicationContext : ApplicationContext
 {
     internal const int StatusRefreshIntervalMilliseconds = 5_000;
+    private static readonly TimeSpan DiagnosticCollectionTimeout = TimeSpan.FromSeconds(2);
+    private static readonly TimeSpan DiagnosticExportTimeout = TimeSpan.FromSeconds(30);
     private readonly AgentCoordinator _coordinator;
     private readonly LocalWebSocketServer _webSocketServer;
     private readonly IStartupRegistrationManager _startup;
@@ -346,27 +348,35 @@ public sealed class TrayApplicationContext : ApplicationContext
     {
         try
         {
-            using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(5));
-            AgentSnapshotPayload snapshot = await _coordinator.GetSnapshotAsync(timeout.Token);
-            EventStoreHealth health = await _eventStore.GetHealthAsync(timeout.Token);
-            AudioDevicesSnapshot? audioDevices = snapshot.AudioDevices;
+            var collectionErrorCodes = new List<string>();
+            AgentSnapshotPayload? snapshot = await TryCollectDiagnosticValueAsync(
+                "snapshot",
+                cancellationToken => _coordinator.GetSnapshotAsync(cancellationToken),
+                collectionErrorCodes);
+            EventStoreHealth? health = await TryCollectDiagnosticValueAsync(
+                "storage_health",
+                cancellationToken => _eventStore.GetHealthAsync(cancellationToken),
+                collectionErrorCodes);
+            AudioDevicesSnapshot? audioDevices = snapshot?.AudioDevices;
             string outputPath = Path.Combine(
                 AgentStoragePaths.DiagnosticDirectory,
                 $"debt-flow-sip-agent-diagnostics-{DateTime.UtcNow:yyyyMMdd-HHmmss}.zip");
+            using var exportTimeout = new CancellationTokenSource(DiagnosticExportTimeout);
             string exported = await _diagnosticExporter.ExportAsync(
                 outputPath,
                 snapshot,
                 health,
-                Math.Max(0, (audioDevices?.InputDevices.Count ?? 1) - 1),
-                Math.Max(0, (audioDevices?.OutputDevices.Count ?? 1) - 1),
+                audioDevices == null ? null : Math.Max(0, audioDevices.InputDevices.Count - 1),
+                audioDevices == null ? null : Math.Max(0, audioDevices.OutputDevices.Count - 1),
                 _options.IsOperational,
-                timeout.Token,
+                exportTimeout.Token,
                 LocalTlsCertificateProfile.Version,
                 _tlsDaysRemaining,
                 _tlsWarningCode,
                 _coordinator.GetOperationalHealth(),
                 _webSocketServer.GetOperationalHealth(),
-                _logProvider.GetOperationalHealth());
+                _logProvider.GetOperationalHealth(),
+                collectionErrorCodes);
             MessageBox.Show(
                 TrayText.Format("DiagnosticExported", exported),
                 TrayText.Get("AppName"),
@@ -377,10 +387,32 @@ public sealed class TrayApplicationContext : ApplicationContext
         {
             _logger.LogWarning("Diagnostic export failed with {ErrorType}", exception.GetType().Name);
             MessageBox.Show(
-                TrayText.Get("DiagnosticExportFailed"),
+                TrayText.Format("DiagnosticExportFailedWithCode", exception.GetType().Name),
                 TrayText.Get("ActionRequired"),
                 MessageBoxButtons.OK,
                 MessageBoxIcon.Warning);
+        }
+    }
+
+    private async Task<T?> TryCollectDiagnosticValueAsync<T>(
+        string component,
+        Func<CancellationToken, Task<T>> collect,
+        ICollection<string> errorCodes)
+        where T : class
+    {
+        using var timeout = new CancellationTokenSource(DiagnosticCollectionTimeout);
+        try
+        {
+            return await collect(timeout.Token).WaitAsync(timeout.Token);
+        }
+        catch (Exception exception) when (OperationalExceptionPolicy.IsNonFatal(exception))
+        {
+            errorCodes.Add($"{component}_unavailable");
+            _logger.LogWarning(
+                "Diagnostic component {Component} collection failed with {ErrorType}; export will continue",
+                component,
+                exception.GetType().Name);
+            return null;
         }
     }
 
