@@ -173,14 +173,25 @@ end;
 
 function CompareSemVer3(const LeftValue, RightValue: string; var Valid: Boolean): Integer;
 var
-  LM, Lm, LP, RM, Rm, RP: Integer;
+  LeftMajor, LeftMinor, LeftPatch: Integer;
+  RightMajor, RightMinor, RightPatch: Integer;
 begin
-  Valid := ParseSemVer3(LeftValue, LM, Lm, LP) and ParseSemVer3(RightValue, RM, Rm, RP);
+  Valid := ParseSemVer3(LeftValue, LeftMajor, LeftMinor, LeftPatch) and
+    ParseSemVer3(RightValue, RightMajor, RightMinor, RightPatch);
   Result := 0;
   if not Valid then Exit;
-  if LM <> RM then begin if LM < RM then Result := -1 else Result := 1; Exit; end;
-  if Lm <> Rm then begin if Lm < Rm then Result := -1 else Result := 1; Exit; end;
-  if LP <> RP then begin if LP < RP then Result := -1 else Result := 1; Exit; end;
+  if LeftMajor <> RightMajor then begin
+    if LeftMajor < RightMajor then Result := -1 else Result := 1;
+    Exit;
+  end;
+  if LeftMinor <> RightMinor then begin
+    if LeftMinor < RightMinor then Result := -1 else Result := 1;
+    Exit;
+  end;
+  if LeftPatch <> RightPatch then begin
+    if LeftPatch < RightPatch then Result := -1 else Result := 1;
+    Exit;
+  end;
 end;
 
 function LoadExistingState: Boolean;

@@ -39,6 +39,20 @@ public sealed class InstallerContractTests
     }
 
     [Fact]
+    public void Inno_script_uses_unambiguous_semantic_version_identifiers()
+    {
+        string script = File.ReadAllText(Path.Combine(
+            AppContext.BaseDirectory,
+            "Installer",
+            "DebtFlow.SipAgent.iss"));
+
+        Assert.DoesNotContain("LM, Lm", script, StringComparison.Ordinal);
+        Assert.DoesNotContain("RM, Rm", script, StringComparison.Ordinal);
+        Assert.Contains("LeftMajor, LeftMinor, LeftPatch", script, StringComparison.Ordinal);
+        Assert.Contains("RightMajor, RightMinor, RightPatch", script, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void Installer_build_reads_the_canonical_compiler_engine_version()
     {
         string script = File.ReadAllText(Path.Combine(

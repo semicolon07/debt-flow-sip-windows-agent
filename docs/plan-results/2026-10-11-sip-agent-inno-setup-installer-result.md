@@ -129,6 +129,12 @@ compiler engine version contractและคืน placeholder `0.0.0.0` ได�
 `$iscc.VersionInfo.ProductVersion`. Release cross-buildผ่าน 0 warnings/0 errorsและ Core testsผ่าน 100/100;
 Windows Host testsและ P5 rerunยังเป็น pending gates.
 
+P5 rerunถัดมาเรียก Inno compilerได้แล้วแต่ `.iss` compileหยุดที่ `Duplicate identifier 'Lm'`.
+Root causeคือ Pascal Script identifiersเป็น case-insensitive ทำให้ shorthand `LM`/`Lm` และ `RM`/`Rm`
+ใน semantic-version comparatorชนกัน. เปลี่ยนเป็นชื่อเต็ม `LeftMajor`/`LeftMinor`/`LeftPatch` และ
+`RightMajor`/`RightMinor`/`RightPatch`, ขยาย comparison branchesให้อ่านและตรวจได้ชัดเจน และเพิ่ม host contract
+regression assertionสำหรับ collisionนี้; Windows Inno/P5 rerunยังเป็น pending gate.
+
 ## Deviations and follow-up
 
 - Setup failureจาก `PrepareToInstall` ใช้ standard Inno non-zero exit 7; exit 30–33เป็น contractของ Agent
