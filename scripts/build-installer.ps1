@@ -34,6 +34,46 @@ if ([string]::IsNullOrWhiteSpace($LogPath)) { $LogPath = Join-Path $outputRoot "
 $logRoot = Split-Path -Parent ([System.IO.Path]::GetFullPath($LogPath))
 New-Item -ItemType Directory -Force -Path $logRoot | Out-Null
 
+function Get-InnoCompilerVersion([string]$CompilerPath) {
+    $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
+    $startInfo.FileName = $CompilerPath
+    $startInfo.UseShellExecute = $false
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $true
+    $startInfo.CreateNoWindow = $true
+    $startInfo.ArgumentList.Add("--version")
+
+    $process = [System.Diagnostics.Process]::new()
+    $process.StartInfo = $startInfo
+    try {
+        if (-not $process.Start()) { throw "inno_compiler_version_command_start_failed" }
+        $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+        $stderrTask = $process.StandardError.ReadToEndAsync()
+        if (-not $process.WaitForExit(10000)) {
+            try { $process.Kill($true) } catch { }
+            $process.WaitForExit()
+            throw "inno_compiler_version_command_timeout"
+        }
+
+        $stdout = $stdoutTask.GetAwaiter().GetResult().Trim()
+        $stderr = $stderrTask.GetAwaiter().GetResult().Trim()
+        if ($process.ExitCode -ne 0) {
+            throw "inno_compiler_version_command_failed:exit_code=$($process.ExitCode)"
+        }
+        if (-not [string]::IsNullOrWhiteSpace($stderr)) {
+            throw "inno_compiler_version_command_unexpected_stderr"
+        }
+        if ($stdout -notmatch '^7\.1\.0(?:\.0)?$') {
+            $reportedVersion = if ([string]::IsNullOrWhiteSpace($stdout)) { "empty" } else { $stdout }
+            throw "inno_compiler_version_mismatch:expected=7.1.0 actual=$reportedVersion"
+        }
+        return $stdout
+    }
+    finally {
+        $process.Dispose()
+    }
+}
+
 $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
 if ($manifest.schemaVersion -ne 1 -or
     $manifest.version -ne $Version -or
@@ -99,10 +139,6 @@ if ([string]::IsNullOrWhiteSpace($IsccPath) -or -not (Test-Path -LiteralPath $Is
     throw "inno_compiler_7_1_0_not_found"
 }
 $iscc = Get-Item -LiteralPath $IsccPath
-$innoVersion = $iscc.VersionInfo.ProductVersion
-if ($innoVersion -notmatch '^7\.1\.0(?:\.0)?$') {
-    throw "inno_compiler_version_mismatch:expected=7.1.0 actual=$innoVersion"
-}
 function Get-PeMachine([string]$Path) {
     $stream = [System.IO.File]::OpenRead($Path)
     $reader = [System.IO.BinaryReader]::new($stream)
@@ -126,6 +162,7 @@ if ($compilerSignature.Status -ne [System.Management.Automation.SignatureStatus]
     throw "inno_compiler_authenticode_invalid:$($compilerSignature.Status)"
 }
 $compilerHash = (Get-FileHash -LiteralPath $iscc.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+$innoVersion = Get-InnoCompilerVersion $iscc.FullName
 
 $arguments = @(
     "/DAppVersion=$Version",
@@ -170,7 +207,7 @@ $installerManifestPath = Join-Path $outputRoot "installer-manifest.json"
     tag = $Tag
     appId = "{476433C5-E4DF-4CD6-9E42-29F01E4BC339}"
     innoSetup = [ordered]@{
-        version = "7.1.0"
+        version = $innoVersion
         architecture = "x64"
         compilerSha256 = $compilerHash
         authenticodeStatus = [string]$compilerSignature.Status

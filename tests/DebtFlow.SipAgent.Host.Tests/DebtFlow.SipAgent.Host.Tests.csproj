@@ -21,5 +21,8 @@
     <None Include="../../installer/DebtFlow.SipAgent.iss"
           Link="Installer/DebtFlow.SipAgent.iss"
           CopyToOutputDirectory="PreserveNewest" />
+    <None Include="../../scripts/build-installer.ps1"
+          Link="Scripts/build-installer.ps1"
+          CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 </Project>

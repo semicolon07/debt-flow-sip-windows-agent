@@ -120,6 +120,15 @@ assembly จึงรายงาน `1.0.0` เสมอ. แก้ให้ท
 Release cross-buildที่ส่ง `Version=1.1.6` ผ่าน 0 warnings/0 errors, generated Host assembly attributesเป็น
 `AssemblyVersion=1.1.6.0` และ `FileVersion=1.1.6.0`, Core testsผ่าน 100/100 และ `git diff --check` ผ่าน.
 
+P5 rerunถัดมาหยุดด้วย `inno_compiler_version_mismatch:expected=7.1.0 actual=0.0.0.0` แม้ติดตั้ง Inno Setup
+7.1.0 แล้ว. Root causeคือ build scriptอ่าน Windows `ProductVersion` resourceของ `ISCC.exe` ซึ่งไม่ใช่
+compiler engine version contractและคืน placeholder `0.0.0.0` ได้. แก้ให้เรียก canonical Inno 7.1
+`ISCC.exe --version` ผ่าน redirected subprocess, จำกัดเวลา 10 วินาที, ตรวจ exit code/stderr/outputแบบ fail-closed
+โดยตรวจ PE x64 และ Authenticode trustก่อน execute แล้วบันทึก versionที่ตรวจจริงลง installer manifest.
+เพิ่ม host contract regression testเพื่อป้องกันการย้อนกลับไปอ่าน
+`$iscc.VersionInfo.ProductVersion`. Release cross-buildผ่าน 0 warnings/0 errorsและ Core testsผ่าน 100/100;
+Windows Host testsและ P5 rerunยังเป็น pending gates.
+
 ## Deviations and follow-up
 
 - Setup failureจาก `PrepareToInstall` ใช้ standard Inno non-zero exit 7; exit 30–33เป็น contractของ Agent
@@ -169,6 +178,7 @@ Release cross-buildที่ส่ง `Version=1.1.6` ผ่าน 0 warnings/0 
 - [x] Unsigned/signed state is validated and recorded truthfully.
 - [x] P5-to-P2 wrapper forwards named parameters without treating `-Phase` as a positional value.
 - [x] Publish version propagates consistently to assembly, file, informational and runtime release metadata sources.
+- [x] Inno compiler engine version is read from canonical `ISCC.exe --version`, not placeholder PE product metadata.
 
 ### P4 — Automated verification
 

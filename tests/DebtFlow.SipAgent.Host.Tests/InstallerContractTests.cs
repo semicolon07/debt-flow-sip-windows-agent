@@ -37,4 +37,23 @@ public sealed class InstallerContractTests
         Assert.Contains("--prepare-update", script, StringComparison.Ordinal);
         Assert.Contains("UpdateActiveCall = 30", script, StringComparison.Ordinal);
     }
+
+    [Fact]
+    public void Installer_build_reads_the_canonical_compiler_engine_version()
+    {
+        string script = File.ReadAllText(Path.Combine(
+            AppContext.BaseDirectory,
+            "Scripts",
+            "build-installer.ps1"));
+
+        Assert.Contains("ArgumentList.Add(\"--version\")", script, StringComparison.Ordinal);
+        Assert.Contains("WaitForExit(10000)", script, StringComparison.Ordinal);
+        Assert.Contains("inno_compiler_version_command_failed", script, StringComparison.Ordinal);
+        Assert.DoesNotContain("$iscc.VersionInfo.ProductVersion", script, StringComparison.Ordinal);
+        Assert.Contains("version = $innoVersion", script, StringComparison.Ordinal);
+        Assert.True(
+            script.IndexOf("Get-AuthenticodeSignature -LiteralPath $iscc.FullName", StringComparison.Ordinal) <
+            script.IndexOf("$innoVersion = Get-InnoCompilerVersion $iscc.FullName", StringComparison.Ordinal),
+            "ISCC trust must be verified before executing its canonical version command.");
+    }
 }

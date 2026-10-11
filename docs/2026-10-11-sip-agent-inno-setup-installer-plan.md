@@ -512,7 +512,8 @@ Scriptต้อง:
 6. parse release manifestและเทียบ version/RID/protocol/schema.
 7. recompute SHA-256ทุก package fileและ reject missing/extra fileตาม policy.
 8. locate `ISCC.exe` จาก explicit parameterหรือ pinned install path.
-9. verify compiler versionเท่ากับ `7.1.0`; mismatchคือ failure.
+9. verify PE x64 และ Authenticode trustก่อน execute จากนั้น verify compiler engine versionจาก canonical
+   `ISCC.exe --version` เท่ากับ `7.1.0`; ห้ามใช้ PE `ProductVersion` placeholder และ mismatchคือ failure.
 10. invoke ISCCด้วย `--define` valuesและ capture log.
 11. verify setup filename/version resource/size/hash.
 12. หาก signed build ให้ verify Authenticode status/publisher/timestamp.
