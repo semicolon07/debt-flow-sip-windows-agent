@@ -286,7 +286,7 @@ public sealed class SqliteAgentEventStoreTests
         string path = Path.Combine(directory, "agent.db");
         try
         {
-            await using (var connection = new SqliteConnection($"Data Source={path}"))
+            await using (var connection = CreateConnection(path))
             {
                 await connection.OpenAsync();
                 await using SqliteCommand command = connection.CreateCommand();
@@ -299,7 +299,7 @@ public sealed class SqliteAgentEventStoreTests
                 () => store.InitializeAsync(CancellationToken.None));
             Assert.Equal("outbox_schema_newer", exception.ErrorCode);
 
-            await using var reopened = new SqliteConnection($"Data Source={path}");
+            await using var reopened = CreateConnection(path);
             await reopened.OpenAsync();
             await using SqliteCommand verify = reopened.CreateCommand();
             verify.CommandText = "SELECT Value FROM Sentinel;";
@@ -537,7 +537,7 @@ public sealed class SqliteAgentEventStoreTests
 
     private static async Task CreateVersionOneDatabaseAsync(string path)
     {
-        await using var connection = new SqliteConnection($"Data Source={path}");
+        await using var connection = CreateConnection(path);
         await connection.OpenAsync();
         await using SqliteCommand command = connection.CreateCommand();
         command.CommandText =
@@ -575,7 +575,7 @@ public sealed class SqliteAgentEventStoreTests
 
     private static async Task CreateVersionTwoDatabaseAsync(string path, bool includePendingEvent)
     {
-        await using var connection = new SqliteConnection($"Data Source={path}");
+        await using var connection = CreateConnection(path);
         await connection.OpenAsync();
         await using SqliteCommand command = connection.CreateCommand();
         command.CommandText =
@@ -636,7 +636,7 @@ public sealed class SqliteAgentEventStoreTests
 
     private static async Task CreateVersionThreeDatabaseAsync(string path)
     {
-        await using var connection = new SqliteConnection($"Data Source={path}");
+        await using var connection = CreateConnection(path);
         await connection.OpenAsync();
         await using SqliteCommand command = connection.CreateCommand();
         command.CommandText =
@@ -700,4 +700,11 @@ public sealed class SqliteAgentEventStoreTests
         Directory.CreateDirectory(path);
         return path;
     }
+
+    private static SqliteConnection CreateConnection(string path) =>
+        new(new SqliteConnectionStringBuilder
+        {
+            DataSource = path,
+            Pooling = false
+        }.ToString());
 }

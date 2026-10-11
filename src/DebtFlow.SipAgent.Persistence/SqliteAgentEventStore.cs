@@ -67,7 +67,10 @@ public sealed class SqliteAgentEventStore : IAgentEventStore
             {
                 DataSource = _databasePath,
                 Mode = SqliteOpenMode.ReadWriteCreate,
-                Cache = SqliteCacheMode.Private
+                Cache = SqliteCacheMode.Private,
+                // The store owns one process-lifetime connection. Pooling adds no reuse here and
+                // can retain the database file handle after disposal on Windows.
+                Pooling = false
             }.ToString());
 
             await connection.OpenAsync(cancellationToken);

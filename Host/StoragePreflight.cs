@@ -31,7 +31,9 @@ public static class StoragePreflight
             {
                 DataSource = databasePath,
                 Mode = SqliteOpenMode.ReadOnly,
-                Cache = SqliteCacheMode.Private
+                Cache = SqliteCacheMode.Private,
+                // Preflight is a one-shot operation and must release the file before installer mutation.
+                Pooling = false
             }.ToString());
             await connection.OpenAsync(cancellationToken);
             string integrity = Convert.ToString(

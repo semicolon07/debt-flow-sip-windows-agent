@@ -67,6 +67,13 @@ Follow-up note: parameter-forwarding regressionใน P2 wrapperถูกแก�
 Environmentนี้ไม่มี `pwsh` และไม่ใช่ Windows จึงยังไม่ถือว่า P2/P5 Windows executionผ่าน; ต้อง rerunคำสั่ง P5
 บน clean exact-tagged Windows commitเพื่อปิด evidence gate.
 
+Windows P5 core-test logที่ได้รับภายหลังแสดง 37/97 ผ่านและ 60/97 ล้มระหว่าง fixture cleanupด้วย
+`The process cannot access the file 'agent.db' because it is being used by another process.` Root causeคือ
+Microsoft.Data.Sqlite connection poolingยัง retain file handleหลัง logical connection disposalบน Windows ขณะที่ store
+ใช้ connectionเดียวตลอด process lifetimeและ preflightเป็น one-shot จึงไม่มีประโยชน์จาก pooling. Sourceแก้โดยกำหนด
+`Pooling=false` ใน event storeและ storage preflight รวมถึง test database helpers. หลังแก้ cross-platform Release build
+ผ่าน 0 warnings/0 errorsและ Core testsผ่าน 97/97; Windows P5 rerunยังเป็น pending gate.
+
 ## Deviations and follow-up
 
 - Setup failureจาก `PrepareToInstall` ใช้ standard Inno non-zero exit 7; exit 30–33เป็น contractของ Agent
@@ -120,6 +127,8 @@ Environmentนี้ไม่มี `pwsh` และไม่ใช่ Windows �
 
 - [x] Locked restore and Release cross-build pass (macOS arm64, 0 warnings/errors).
 - [x] Core tests pass (97/97), including atomic active-call refusal without hangup.
+- [x] SQLite connections used by the store, preflight and database tests release file handles deterministically;
+  Windows P5 rerun remains required to confirm the platform-specific regression.
 - [ ] Windows Host tests pass.
 - [ ] Installer fresh/repair/upgrade/uninstall automation passes on Windows.
 - [ ] Manifest/hash/tampered-path negative tests pass.

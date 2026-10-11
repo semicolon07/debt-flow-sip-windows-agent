@@ -61,7 +61,11 @@ public sealed class StoragePreflightTests
         string path = Path.Combine(directory, "agent.db");
         try
         {
-            await using var connection = new SqliteConnection($"Data Source={path}");
+            await using var connection = new SqliteConnection(new SqliteConnectionStringBuilder
+            {
+                DataSource = path,
+                Pooling = false
+            }.ToString());
             await connection.OpenAsync();
             await using SqliteCommand command = connection.CreateCommand();
             command.CommandText =
