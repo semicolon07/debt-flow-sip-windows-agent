@@ -146,7 +146,9 @@ clean Windows user profile; Windows clean-profile P5 rerunยังเป็น 
 (`16/24/32/48/64/128/256`). Host apphost embed iconโดยตรง, normal trayและ TLS recovery trayโหลด associated
 iconจาก executableพร้อม owned fallback, configuration dialogใช้ iconเดียวกัน, Inno setupรับ ICOผ่าน explicit
 `AppIconPath` และ installer manifestบันทึก SHA-256 ของ branding input. Shortcutsและ Add/Remove Programsอ้างอิง
-iconจาก versioned Host EXE จึงไม่มี loose runtime icon dependency; Windows visual/P5 rerunยังเป็น pending gate.
+iconจาก versioned Host EXE จึงไม่มี loose runtime icon dependency. Icon contract testเปิดไฟล์ผ่าน Windows
+`System.Drawing` และตรวจ ICO directory entriesโดยตรงครบทั้ง 7 ขนาด เพราะ GDI+ ไม่รับประกันว่าจะคืน requested
+PNG-compressed 256px frameจาก `Icon(path, width, height)`; Windows visual/P5 rerunยังเป็น pending gate.
 
 ## Deviations and follow-up
 
