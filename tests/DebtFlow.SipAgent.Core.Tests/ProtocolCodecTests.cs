@@ -22,6 +22,52 @@ public sealed class ProtocolCodecTests
     }
 
     [Fact]
+    public void Serialize_CommandResultWithNullError_RoundTripsStrictPayload()
+    {
+        string commandId = ProtocolCodec.NewId();
+        byte[] message = ProtocolCodec.Serialize(
+            "command_result",
+            "state.get.result",
+            new CommandResultPayload(commandId, true, null));
+
+        ProtocolEnvelope envelope = ProtocolCodec.Deserialize(message);
+        CommandResultPayload payload = ProtocolCodec.DeserializePayload<CommandResultPayload>(envelope.Payload);
+
+        Assert.Equal(commandId, payload.CommandId);
+        Assert.True(payload.Accepted);
+        Assert.Null(payload.ErrorCode);
+    }
+
+    [Fact]
+    public void Serialize_DurableEventWithNullableMembers_RoundTripsStrictPayload()
+    {
+        var payload = new DurableEventPayload(
+            "durable",
+            ProtocolCodec.NewId(),
+            ProtocolCodec.NewId(),
+            ProtocolCodec.NewId(),
+            1,
+            ProtocolCodec.NewId(),
+            null,
+            DateTimeOffset.UtcNow,
+            null,
+            System.Text.Json.JsonSerializer.SerializeToElement(new { }),
+            null,
+            null,
+            null);
+
+        ProtocolEnvelope envelope = ProtocolCodec.Deserialize(
+            ProtocolCodec.Serialize("event", "call.created", payload));
+        DurableEventPayload roundTripped =
+            ProtocolCodec.DeserializePayload<DurableEventPayload>(envelope.Payload);
+
+        Assert.Equal(1, roundTripped.Sequence);
+        Assert.Null(roundTripped.CommandId);
+        Assert.Null(roundTripped.State);
+        Assert.Null(roundTripped.CollectionId);
+    }
+
+    [Fact]
     public void Deserialize_UnknownEnvelopeField_IsRejected()
     {
         string id = Guid.NewGuid().ToString("D").ToLowerInvariant();

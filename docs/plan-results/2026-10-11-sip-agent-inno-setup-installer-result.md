@@ -72,7 +72,21 @@ Windows P5 core-test logที่ได้รับภายหลังแส�
 Microsoft.Data.Sqlite connection poolingยัง retain file handleหลัง logical connection disposalบน Windows ขณะที่ store
 ใช้ connectionเดียวตลอด process lifetimeและ preflightเป็น one-shot จึงไม่มีประโยชน์จาก pooling. Sourceแก้โดยกำหนด
 `Pooling=false` ใน event storeและ storage preflight รวมถึง test database helpers. หลังแก้ cross-platform Release build
-ผ่าน 0 warnings/0 errorsและ Core testsผ่าน 97/97; Windows P5 rerunยังเป็น pending gate.
+ผ่าน 0 warnings/0 errorsและ Core testsผ่าน 100/100 หลังเพิ่ม regression coverage; Windows P5 rerunยังเป็น pending gate.
+
+Windows P5 host-test logที่ได้รับภายหลังพบ failuresอีก 6 กลุ่มและแก้ source/test contractดังนี้:
+
+- Protocol writerเคย omit nullable positional-record members แต่ strict readerถือ constructor membersเหล่านั้นเป็น required;
+  เปลี่ยน wire JSONให้เขียน explicit `null` และเพิ่ม command-result/durable-event round-trip regression tests.
+- SQLite store disposalเคย throwเมื่อ cleanupซ้ำ; ทำ `DisposeAsync` ให้ idempotentและเพิ่ม regression test.
+- Logger recovery testเปิดอ่าน active logด้วย incompatible Windows share mode; เปลี่ยน readerเป็น read/write/delete sharing.
+- TLS fake certificateเคยผูกกับ ephemeral RSA ownerที่ถูก dispose; cloneผ่าน exportable ephemeral PKCS#12ก่อนคืนค่า.
+- Diagnostic assertion mapค่า queue high-waterผิดตำแหน่ง; แก้ expected realtime valueจาก 6 เป็น 8.
+- Unsupported-command testเคย deserialize protocol-level `ErrorPayload` เป็น `CommandResultPayload`; แก้ให้ตรวจ
+  error envelope, correlation ID และไม่เกิด journal insertionตาม protocol contractจริง.
+
+Sourceทั้งหมด compileผ่าน แต่ Host testsต้อง rerunบน Windows เพราะ workspaceนี้ไม่มี Windows Desktop runtime;
+ดังนั้น Host/P5 DoDยังคง pendingจนกว่าจะมี Windows logใหม่ที่ผ่าน.
 
 ## Deviations and follow-up
 
@@ -126,7 +140,8 @@ Microsoft.Data.Sqlite connection poolingยัง retain file handleหลัง
 ### P4 — Automated verification
 
 - [x] Locked restore and Release cross-build pass (macOS arm64, 0 warnings/errors).
-- [x] Core tests pass (97/97), including atomic active-call refusal without hangup.
+- [x] Core tests pass (100/100), including protocol null round trips, idempotent store disposalและ
+  atomic active-call refusal without hangup.
 - [x] SQLite connections used by the store, preflight and database tests release file handles deterministically;
   Windows P5 rerun remains required to confirm the platform-specific regression.
 - [ ] Windows Host tests pass.

@@ -81,7 +81,7 @@ public sealed class DiagnosticBundleExporterTests
             Assert.Contains("tls_certificate_rotation_failed", combined, StringComparison.Ordinal);
             Assert.Contains("\"tlsCertificateDaysRemaining\":24", combined, StringComparison.Ordinal);
             Assert.Contains("\"sipSignalPumpState\":\"running\"", combined, StringComparison.Ordinal);
-            Assert.Contains("\"webSocketRealtimeQueueHighWater\":6", combined, StringComparison.Ordinal);
+            Assert.Contains("\"webSocketRealtimeQueueHighWater\":8", combined, StringComparison.Ordinal);
             Assert.Contains("\"loggerQueueHighWater\":9", combined, StringComparison.Ordinal);
             Assert.Contains("[REDACTED]", combined, StringComparison.Ordinal);
         }

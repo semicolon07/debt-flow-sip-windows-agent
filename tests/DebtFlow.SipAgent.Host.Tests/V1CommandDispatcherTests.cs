@@ -79,12 +79,16 @@ public sealed class V1CommandDispatcherTests
     {
         await using DispatcherFixture fixture = await DispatcherFixture.CreateAsync();
         string commandId = ProtocolCodec.NewId();
+        ProtocolEnvelope command = Envelope("call.transfer", new CommandHeader(commandId));
 
-        byte[] response = await fixture.Dispatcher.DispatchAsync(
-            Envelope("call.transfer", new CommandHeader(commandId)),
-            CancellationToken.None);
+        byte[] response = await fixture.Dispatcher.DispatchAsync(command, CancellationToken.None);
+        ProtocolEnvelope envelope = ProtocolCodec.Deserialize(response);
+        ErrorPayload error = ProtocolCodec.DeserializePayload<ErrorPayload>(envelope.Payload);
 
-        Assert.Equal("invalid_message", Result(response).ErrorCode);
+        Assert.Equal("error", envelope.Kind);
+        Assert.Equal("protocol.error", envelope.Type);
+        Assert.Equal(command.MessageId, error.CorrelationMessageId);
+        Assert.Equal("invalid_message", error.Code);
         Assert.Null(await fixture.Store.FindCommandAsync(commandId, CancellationToken.None));
     }
 

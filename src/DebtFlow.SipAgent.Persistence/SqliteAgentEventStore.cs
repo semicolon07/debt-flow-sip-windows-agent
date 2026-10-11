@@ -32,6 +32,7 @@ public sealed class SqliteAgentEventStore : IAgentEventStore
     private int _executingCommandRowCount;
     private long _acknowledgedSinceCheckpoint;
     private DateTimeOffset _lastPassiveCheckpointUtc;
+    private int _disposeStarted;
 
     public SqliteAgentEventStore(string databasePath, EventStoreLimits? limits = null)
     {
@@ -563,6 +564,11 @@ public sealed class SqliteAgentEventStore : IAgentEventStore
 
     public async ValueTask DisposeAsync()
     {
+        if (Interlocked.Exchange(ref _disposeStarted, 1) != 0)
+        {
+            return;
+        }
+
         await _gate.WaitAsync();
         try
         {

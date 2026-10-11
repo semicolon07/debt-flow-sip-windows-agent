@@ -294,7 +294,10 @@ public sealed class LocalTlsCertificateManagerTests
             certificate != null && string.Equals(certificate.Thumbprint, thumbprint, StringComparison.OrdinalIgnoreCase);
 
         private static X509Certificate2 CloneWithPrivateKey(X509Certificate2 certificate) =>
-            X509CertificateLoader.LoadPkcs12(certificate.Export(X509ContentType.Pkcs12), null);
+            X509CertificateLoader.LoadPkcs12(
+                certificate.Export(X509ContentType.Pkcs12),
+                null,
+                X509KeyStorageFlags.EphemeralKeySet | X509KeyStorageFlags.Exportable);
     }
 
     private static class CertificateFactory
@@ -319,7 +322,13 @@ public sealed class LocalTlsCertificateManagerTests
             san.AddIpAddress(IPAddress.Loopback);
             if (includeIpv6) san.AddIpAddress(IPAddress.IPv6Loopback);
             request.CertificateExtensions.Add(san.Build(true));
-            return request.CreateSelfSigned(now.AddMinutes(-5), now.AddDays(365));
+            using X509Certificate2 certificate = request.CreateSelfSigned(
+                now.AddMinutes(-5),
+                now.AddDays(365));
+            return X509CertificateLoader.LoadPkcs12(
+                certificate.Export(X509ContentType.Pkcs12),
+                null,
+                X509KeyStorageFlags.EphemeralKeySet | X509KeyStorageFlags.Exportable);
         }
     }
 }

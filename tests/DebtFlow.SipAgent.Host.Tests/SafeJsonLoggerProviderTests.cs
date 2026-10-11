@@ -127,7 +127,15 @@ public sealed class SafeJsonLoggerProviderTests
         {
             foreach (string path in Directory.GetFiles(directory, "*.jsonl"))
             {
-                string content = await File.ReadAllTextAsync(path);
+                await using var stream = new FileStream(
+                    path,
+                    FileMode.Open,
+                    FileAccess.Read,
+                    FileShare.ReadWrite | FileShare.Delete,
+                    4096,
+                    FileOptions.Asynchronous | FileOptions.SequentialScan);
+                using var reader = new StreamReader(stream);
+                string content = await reader.ReadToEndAsync();
                 if (content.Contains(expected, StringComparison.Ordinal))
                 {
                     return;

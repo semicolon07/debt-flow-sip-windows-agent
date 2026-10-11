@@ -139,7 +139,9 @@ public static class ProtocolJson
 {
     public static readonly JsonSerializerOptions Options = new(JsonSerializerDefaults.Web)
     {
-        DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
+        // Nullable positional-record members are still constructor parameters. Keep explicit
+        // nulls on the wire so strict self-deserialization does not reject Agent messages.
+        DefaultIgnoreCondition = JsonIgnoreCondition.Never,
         PropertyNameCaseInsensitive = false,
         UnmappedMemberHandling = JsonUnmappedMemberHandling.Disallow,
         RespectRequiredConstructorParameters = true,

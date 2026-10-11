@@ -7,6 +7,25 @@ namespace DebtFlow.SipAgent.Core.Tests;
 public sealed class SqliteAgentEventStoreTests
 {
     [Fact]
+    public async Task DisposeAsync_CanBeCalledMoreThanOnceAndReleasesDatabaseFile()
+    {
+        string directory = CreateTemporaryDirectory();
+        var store = new SqliteAgentEventStore(Path.Combine(directory, "agent.db"));
+        try
+        {
+            await store.InitializeAsync(CancellationToken.None);
+
+            await store.DisposeAsync();
+            await store.DisposeAsync();
+        }
+        finally
+        {
+            await store.DisposeAsync();
+            Directory.Delete(directory, true);
+        }
+    }
+
+    [Fact]
     public async Task Reopen_PreservesIdentitySequenceAndPendingReplay()
     {
         string directory = CreateTemporaryDirectory();
