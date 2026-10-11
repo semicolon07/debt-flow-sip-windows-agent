@@ -99,6 +99,10 @@ CI เรียก P2 verifierและอัปโหลด ZIP, TRX, checksum/
 ./scripts/verify-p5-release.ps1
 ```
 
+P5 installer automationต้องรันภายใต้ dedicated clean Windows user profile ที่ไม่มี Agent install/data/state/startup
+หรือ processเดิมอยู่ เนื่องจาก testมี explicit purge scenarioและจะไม่ลบหรือย้าย profileจริงเพื่อเตรียม fixture.
+Profile preflightทำงานก่อน P2/buildและรายงาน conflict IDsพร้อม JSON evidenceเมื่อ profileไม่สะอาด.
+
 ผลลัพธ์คือ unsigned self-contained multi-file ZIP และ per-user Inno Setup EXE พร้อม
 SPDX SBOM, release/installer manifests และ SHA-256 checksums; target machineไม่ต้องติดตั้ง .NET Runtime/SDK.
 Release runner pin Inno Setup 7.1.0 x64 และตรวจ compiler version ก่อน build.

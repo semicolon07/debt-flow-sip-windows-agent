@@ -571,7 +571,9 @@ artifactโดย CIเมื่อทำได้ และห้าม publish
 
 ### 14.2 Automated Windows installer tests
 
-`verify-installer-windows.ps1` ใช้ isolated test install root/current userและต้องครอบคลุม:
+`verify-installer-windows.ps1` ต้องรันด้วย dedicated clean Windows user profile เท่านั้น เพราะ Inno contractใช้
+canonical current-user pathsจริง. Read-only profile preflightต้องรันก่อน P2/build, ระบุ conflict IDsและ evidence
+โดยไม่ลบ ย้าย หรือ backup/restore program data, registry, shortcut หรือ processของ profileนั้น แล้วจึงครอบคลุม:
 
 1. Silent fresh install.
 2. Filesอยู่ใต้ expected version directoryเท่านั้น.

@@ -135,6 +135,13 @@ Root causeคือ Pascal Script identifiersเป็น case-insensitive ท�
 `RightMajor`/`RightMinor`/`RightPatch`, ขยาย comparison branchesให้อ่านและตรวจได้ชัดเจน และเพิ่ม host contract
 regression assertionสำหรับ collisionนี้; Windows Inno/P5 rerunยังเป็น pending gate.
 
+P5 rerunถัดมาสร้าง setup EXEและ installer manifestสำเร็จ แต่ automated installer verificationหยุดที่
+`installer_verification_requires_clean_current_user_profile`. Gateนี้ถูกต้องเพราะ testมี explicit data-purge scenario
+และห้ามแตะ Agent install/data/registry/startupของ profileใช้งานจริง. ปรับให้มี read-only
+`verify-installer-profile.ps1` ตรวจและรายงาน conflict IDsกับ JSON evidenceโดยไม่ cleanupหรือ mutate, เรียก preflight
+ก่อน P2/buildเพื่อ fail fast และใช้ gateเดียวกันซ้ำก่อน installer test. เอกสารระบุชัดว่าต้องรัน P5ด้วย dedicated
+clean Windows user profile; Windows clean-profile P5 rerunยังเป็น pending gate.
+
 ## Deviations and follow-up
 
 - Setup failureจาก `PrepareToInstall` ใช้ standard Inno non-zero exit 7; exit 30–33เป็น contractของ Agent

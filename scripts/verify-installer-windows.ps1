@@ -27,14 +27,8 @@ $runName = "DebtFlowSipAgent"
 $uninstallKey = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\{476433C5-E4DF-4CD6-9E42-29F01E4BC339}_is1"
 $startMenuShortcut = Join-Path $env:APPDATA "Microsoft\Windows\Start Menu\Programs\Debt Flow SIP Agent.lnk"
 
-if ((Test-Path -LiteralPath $installRoot) -or
-    (Test-Path -LiteralPath $dataRoot) -or
-    (Test-Path -LiteralPath $stateKey) -or
-    (Test-Path -LiteralPath $uninstallKey)) {
-    throw "installer_verification_requires_clean_current_user_profile"
-}
-$existingRun = Get-ItemProperty -LiteralPath $runKey -Name $runName -ErrorAction SilentlyContinue
-if ($null -ne $existingRun) { throw "installer_verification_requires_absent_agent_run_value" }
+& (Join-Path $PSScriptRoot "verify-installer-profile.ps1") `
+    -OutputDirectory (Join-Path $outputRoot "profile-preflight")
 
 function Invoke-Setup([string[]]$Arguments, [string]$Phase) {
     $process = Start-Process -FilePath $installer -ArgumentList $Arguments -Wait -PassThru
@@ -126,6 +120,7 @@ if (Test-Path -LiteralPath $dataRoot) { throw "explicit_data_purge_failed" }
 [ordered]@{
     schemaVersion = 1
     version = $ExpectedVersion
+    cleanProfilePreflight = "passed"
     freshSilentInstall = "passed"
     silentLaunchPolicy = "passed"
     installedMetadata = "passed"

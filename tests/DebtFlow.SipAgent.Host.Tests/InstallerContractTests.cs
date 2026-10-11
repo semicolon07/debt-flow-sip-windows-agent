@@ -70,4 +70,28 @@ public sealed class InstallerContractTests
             script.IndexOf("$innoVersion = Get-InnoCompilerVersion $iscc.FullName", StringComparison.Ordinal),
             "ISCC trust must be verified before executing its canonical version command.");
     }
+
+    [Fact]
+    public void Release_checks_a_non_destructive_clean_profile_before_expensive_verification()
+    {
+        string profileScript = File.ReadAllText(Path.Combine(
+            AppContext.BaseDirectory,
+            "Scripts",
+            "verify-installer-profile.ps1"));
+        string releaseScript = File.ReadAllText(Path.Combine(
+            AppContext.BaseDirectory,
+            "Scripts",
+            "verify-p5-release.ps1"));
+
+        Assert.Contains("conflicts=$conflictList", profileScript, StringComparison.Ordinal);
+        Assert.Contains("install_root", profileScript, StringComparison.Ordinal);
+        Assert.Contains("data_root", profileScript, StringComparison.Ordinal);
+        Assert.Contains("running_agent_process", profileScript, StringComparison.Ordinal);
+        Assert.DoesNotContain("Remove-Item", profileScript, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("Remove-ItemProperty", profileScript, StringComparison.OrdinalIgnoreCase);
+        Assert.True(
+            releaseScript.IndexOf("verify-installer-profile.ps1", StringComparison.Ordinal) <
+            releaseScript.IndexOf("verify-p2-windows.ps1", StringComparison.Ordinal),
+            "The clean-profile gate must fail before the expensive P2 and release build stages.");
+    }
 }

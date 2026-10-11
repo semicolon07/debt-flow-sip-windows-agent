@@ -24,5 +24,11 @@
     <None Include="../../scripts/build-installer.ps1"
           Link="Scripts/build-installer.ps1"
           CopyToOutputDirectory="PreserveNewest" />
+    <None Include="../../scripts/verify-installer-profile.ps1"
+          Link="Scripts/verify-installer-profile.ps1"
+          CopyToOutputDirectory="PreserveNewest" />
+    <None Include="../../scripts/verify-p5-release.ps1"
+          Link="Scripts/verify-p5-release.ps1"
+          CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 </Project>

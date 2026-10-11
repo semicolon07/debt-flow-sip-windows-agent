@@ -44,6 +44,10 @@ $logDirectory = Join-Path $runRoot "logs"
 $artifactPath = Join-Path $runRoot $artifactName
 New-Item -ItemType Directory -Force -Path $runRoot, $logDirectory | Out-Null
 
+& (Join-Path $PSScriptRoot "verify-installer-profile.ps1") `
+    -OutputDirectory (Join-Path $verificationRoot "installer-profile") 2>&1 |
+    Tee-Object -FilePath (Join-Path $logDirectory "installer-profile-preflight.log")
+
 & (Join-Path $PSScriptRoot "verify-p2-windows.ps1") -OutputRoot $verificationRoot
 if ($LASTEXITCODE -ne 0) { throw "p2_verification_failed" }
 

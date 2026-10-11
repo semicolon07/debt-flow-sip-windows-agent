@@ -17,10 +17,12 @@ test account และข้อมูลที่ไม่มี production cred
 ## 2. Automated Windows gate
 
 ```powershell
+./scripts/verify-installer-profile.ps1
 ./scripts/verify-p2-windows.ps1
 ./scripts/verify-installer-windows.ps1 -InstallerPath <setup.exe> -ExpectedVersion <X.Y.Z>
 ```
 
+- [ ] รันด้วย dedicated clean Windows user profile; profile preflightระบุ `clean=true` และไม่มีการ cleanupอัตโนมัติ.
 - [ ] Locked restore, Release build, Core/Host tests และ vulnerability scanผ่าน.
 - [ ] Silent fresh install/metadata/repair/default uninstall/data purge automationผ่านบน clean current-user profile.
 - [ ] `git diff --check` ผ่านบน exact release commit.
