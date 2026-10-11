@@ -54,7 +54,7 @@ public sealed class SipRuntime : ISipRuntime
     private SipCallHandle? _pendingIncomingHandle;
     private SipCallHandle? _activeCallHandle;
     private SipCallHandle? _answeringCallHandle;
-    private SipCallHandle? _unmappedOutboundHandle;
+    private SipCallHandle? _outboundCallHandle;
     private WindowsAudioEndPoint? _audioEndPoint;
     private VoIPMediaSession? _mediaSession;
     private AudioExtrasSource? _fallbackAudioSource;
@@ -224,7 +224,7 @@ public sealed class SipRuntime : ISipRuntime
         SetActiveCall(call);
         lock (_callGate)
         {
-            _unmappedOutboundHandle = call;
+            _outboundCallHandle = call;
         }
         VoIPMediaSession mediaSession = CreateMediaSession(call);
         string destinationUri = SipEndpointFormatter.FormatDestination(configuration, destination, _useTcp);
@@ -691,6 +691,10 @@ public sealed class SipRuntime : ISipRuntime
         _userAgent.OnCallHungup += dialogue =>
         {
             SipCallHandle? call = ResolveEndedCall(dialogue?.CallId);
+            _logger.LogInformation(
+                "SIP remote hangup callback received; dialogue Call-ID present: {CallIdPresent}; active call resolved: {CallResolved}",
+                !string.IsNullOrWhiteSpace(dialogue?.CallId),
+                call != null);
             if (call == null) return;
             MarkAnswerTerminationPending(call);
             TrackBackground(CleanupMediaForCallAsync(call));
@@ -713,9 +717,11 @@ public sealed class SipRuntime : ISipRuntime
         };
         _userAgent.ClientCallFailed += (_, _, response) =>
         {
-            SipCallHandle? call = response == null
-                ? GetUnmappedOutboundCall()
-                : ResolveOrRememberOutboundHandle(response.Header?.CallId);
+            SipCallHandle? call = ResolveOutboundFailureCall(response?.Header?.CallId);
+            _logger.LogInformation(
+                "Outbound SIP failure callback received with status {SipStatusCode}; active outbound call resolved: {CallResolved}",
+                response == null ? null : (int)response.Status,
+                call != null);
             if (call == null) return;
             TrackBackground(CleanupMediaForCallAsync(call));
             Emit(new SipSignal(
@@ -1766,9 +1772,9 @@ public sealed class SipRuntime : ISipRuntime
         {
             if (!SameCall(_activeCallHandle, call)) return;
             _activeCallHandle = null;
-            if (SameCall(_unmappedOutboundHandle, call))
+            if (SameCall(_outboundCallHandle, call))
             {
-                _unmappedOutboundHandle = null;
+                _outboundCallHandle = null;
             }
             if (SameCall(_pendingIncomingHandle, call))
             {
@@ -1825,21 +1831,24 @@ public sealed class SipRuntime : ISipRuntime
 
             if (string.IsNullOrWhiteSpace(sipCallId)) return null;
 
-            SipCallHandle? outbound = _unmappedOutboundHandle;
+            SipCallHandle? outbound = _outboundCallHandle;
             if (outbound == null || !SameCall(outbound, _activeCallHandle)) return null;
             RememberSipCallId(sipCallId, outbound);
-            _unmappedOutboundHandle = null;
             return outbound;
         }
     }
 
-    private SipCallHandle? GetUnmappedOutboundCall()
+    private SipCallHandle? ResolveOutboundFailureCall(string? sipCallId)
     {
         lock (_callGate)
         {
-            return SameCall(_unmappedOutboundHandle, _activeCallHandle)
-                ? _unmappedOutboundHandle
+            SipCallHandle? outbound = SameCall(_outboundCallHandle, _activeCallHandle)
+                ? _outboundCallHandle
                 : null;
+            return SipCallTerminationResolver.Resolve(
+                sipCallId,
+                _callHandlesBySipCallId,
+                outbound);
         }
     }
 
