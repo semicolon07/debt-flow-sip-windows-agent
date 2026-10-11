@@ -37,6 +37,9 @@ Authority: [`2026-10-11-sip-agent-inno-setup-installer-plan.md`](../2026-10-11-s
   operator-only `invoke-installer-rollback.ps1`.
 - P5 release pipeline build ZIP และ setupจาก publish directoryเดียวกัน, สร้าง checksums/installer manifest,
   รัน installer automation และ upload logs/evidenceด้วย `if: always()`.
+- แก้ P5-to-P2 verifier forwarding regression: `verify-p2-windows.ps1` ใช้ named-parameter hashtable
+  splatting เพื่อส่ง `Phase=p2` และ optional `OutputRoot`; array splattingเดิมส่ง literal `-Phase` เป็นค่า
+  ของ `Phase` และทำให้ release verificationหยุดก่อนเริ่ม P2.
 - อัปเดต README, Thai/English deployment guide และ manual Windows/PBX installer checklist.
 
 ## Evidence executed on this workspace
@@ -59,6 +62,10 @@ NOT RUNNABLE HERE — testhost requires Microsoft.WindowsDesktop.App 10.0.0, una
 
 Host/installer test source compileผ่านใน solution build. ห้ามเปลี่ยน Windows/Inno/PBX checklistเป็น PASSจาก
 cross-buildหรือ source inspection; ต้องรัน P2/P5 และ manual matrixบน exact release commit.
+
+Follow-up note: parameter-forwarding regressionใน P2 wrapperถูกแก้จาก array splattingเป็น hashtable splatting.
+Environmentนี้ไม่มี `pwsh` และไม่ใช่ Windows จึงยังไม่ถือว่า P2/P5 Windows executionผ่าน; ต้อง rerunคำสั่ง P5
+บน clean exact-tagged Windows commitเพื่อปิด evidence gate.
 
 ## Deviations and follow-up
 
@@ -107,6 +114,7 @@ cross-buildหรือ source inspection; ต้องรัน P2/P5 และ
 - [x] Pipeline source produces setup EXE, SHA-256 and installer manifest.
 - [x] Release workflow uploads installer artifacts and logs, including safe failure evidence.
 - [x] Unsigned/signed state is validated and recorded truthfully.
+- [x] P5-to-P2 wrapper forwards named parameters without treating `-Phase` as a positional value.
 
 ### P4 — Automated verification
 

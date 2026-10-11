@@ -6,12 +6,14 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
-$arguments = @("-Phase", "p2")
+$verificationParameters = @{
+    Phase = "p2"
+}
 if (-not [string]::IsNullOrWhiteSpace($OutputRoot)) {
-    $arguments += @("-OutputRoot", $OutputRoot)
+    $verificationParameters.OutputRoot = $OutputRoot
 }
 
-& (Join-Path $PSScriptRoot "verify-p1-windows.ps1") @arguments
+& (Join-Path $PSScriptRoot "verify-p1-windows.ps1") @verificationParameters
 if ($LASTEXITCODE -ne 0) {
     exit $LASTEXITCODE
 }
