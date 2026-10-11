@@ -110,6 +110,16 @@ streams, wait for exit, reject stderr/empty/invalid JSON และตรวจ r
 installer verificationและ rollbackใช้ helperเดียวกันเพื่อไม่ให้ behavior drift. Source buildผ่าน 0 warnings/0 errors;
 Windows metadata/P5 rerunยัง pending.
 
+P5 rerunถัดมาสามารถอ่าน metadataได้แล้ว แต่ fail ด้วย `release_metadata_mismatch:tag=v1.1.6`. Tag และค่า
+`-p:Version=1.1.6` ที่ส่งให้ publishถูกต้อง; root causeคือ `Directory.Build.props` pin `AssemblyVersion`,
+`FileVersion` และ `InformationalVersion` ไว้ที่ `1.0.0` ขณะที่ `AgentReleaseMetadata.Current()` อ่าน versionจาก
+assembly จึงรายงาน `1.0.0` เสมอ. แก้ให้ทั้งสามค่าคำนวณจาก `$(Version)` และเพิ่มค่าจริงของ metadataทุก field
+ใน mismatch error เพื่อให้วิเคราะห์ release failureรอบต่อไปได้ทันที. MSBuild property evaluationด้วย
+`Version=1.1.6` ยืนยันผล `AssemblyVersion=1.1.6.0`, `FileVersion=1.1.6.0` และ
+`InformationalVersion=1.1.6`; Windows P5 rerunบน clean commitและ semantic tagใหม่ยังเป็น pending gate.
+Release cross-buildที่ส่ง `Version=1.1.6` ผ่าน 0 warnings/0 errors, generated Host assembly attributesเป็น
+`AssemblyVersion=1.1.6.0` และ `FileVersion=1.1.6.0`, Core testsผ่าน 100/100 และ `git diff --check` ผ่าน.
+
 ## Deviations and follow-up
 
 - Setup failureจาก `PrepareToInstall` ใช้ standard Inno non-zero exit 7; exit 30–33เป็น contractของ Agent
@@ -158,6 +168,7 @@ Windows metadata/P5 rerunยัง pending.
 - [x] Release workflow uploads installer artifacts and logs, including safe failure evidence.
 - [x] Unsigned/signed state is validated and recorded truthfully.
 - [x] P5-to-P2 wrapper forwards named parameters without treating `-Phase` as a positional value.
+- [x] Publish version propagates consistently to assembly, file, informational and runtime release metadata sources.
 
 ### P4 — Automated verification
 

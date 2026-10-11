@@ -69,7 +69,9 @@ try {
         $releaseMetadata.runtimeIdentifier -ne "win-x64" -or
         $releaseMetadata.protocolVersion -ne 1 -or
         $releaseMetadata.sqliteSchemaVersion -ne 4) {
-        throw "release_metadata_mismatch:tag=$tag"
+        throw "release_metadata_mismatch:tag=$tag metadata_version=$($releaseMetadata.version) " +
+            "runtime=$($releaseMetadata.runtimeIdentifier) protocol=$($releaseMetadata.protocolVersion) " +
+            "sqlite_schema=$($releaseMetadata.sqliteSchemaVersion)"
     }
 
     Copy-Item -LiteralPath (Join-Path $repositoryRoot "release\README-th-en.md") `
