@@ -88,6 +88,12 @@ Windows P5 host-test logที่ได้รับภายหลังพบ f
 Sourceทั้งหมด compileผ่าน แต่ Host testsต้อง rerunบน Windows เพราะ workspaceนี้ไม่มี Windows Desktop runtime;
 ดังนั้น Host/P5 DoDยังคง pendingจนกว่าจะมี Windows logใหม่ที่ผ่าน.
 
+Windows rerunถัดมาผ่าน Host tests 98/100 และยืนยันว่า 15 failuresเดิมถูกปิด เหลือ test-harness portability
+2 จุด: Kestrel test certificateสูญเสีย private-key ownerก่อน TLS handshakeบน Windows และ logger recovery test
+อาศัย global telemetry signalที่อาจมาจาก parallel testพร้อม timeoutสั้นกว่า production retry budget. แก้โดย clone
+test certificateผ่าน exportable ephemeral PKCS#12 และให้ logger testรอ provider-local failure healthพร้อม recovery budget
+10 วินาที. Source compileผ่าน 0 warnings/0 errors; Windows rerunสำหรับ 2 testsนี้และ P5 gateยัง pending.
+
 ## Deviations and follow-up
 
 - Setup failureจาก `PrepareToInstall` ใช้ standard Inno non-zero exit 7; exit 30–33เป็น contractของ Agent

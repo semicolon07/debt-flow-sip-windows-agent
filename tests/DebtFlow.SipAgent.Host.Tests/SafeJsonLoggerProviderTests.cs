@@ -95,10 +95,16 @@ public sealed class SafeJsonLoggerProviderTests
 
             logger.LogInformation("recoverable-log-line");
             await failureObserved.Task.WaitAsync(TimeSpan.FromSeconds(2));
+            await WaitUntilAsync(
+                () => provider.GetOperationalHealth().WriterFailures > 0,
+                TimeSpan.FromSeconds(2));
 
             File.Delete(directory);
             Directory.CreateDirectory(directory);
-            await WaitForLogLineAsync(directory, "recoverable-log-line");
+            await WaitForLogLineAsync(
+                directory,
+                "recoverable-log-line",
+                TimeSpan.FromSeconds(10));
             provider.Dispose();
             provider = null;
 
@@ -121,9 +127,13 @@ public sealed class SafeJsonLoggerProviderTests
         }
     }
 
-    private static async Task WaitForLogLineAsync(string directory, string expected)
+    private static async Task WaitForLogLineAsync(
+        string directory,
+        string expected,
+        TimeSpan timeout)
     {
-        for (int attempt = 0; attempt < 50; attempt++)
+        using var cancellation = new CancellationTokenSource(timeout);
+        while (!cancellation.IsCancellationRequested)
         {
             foreach (string path in Directory.GetFiles(directory, "*.jsonl"))
             {
@@ -142,9 +152,22 @@ public sealed class SafeJsonLoggerProviderTests
                 }
             }
 
-            await Task.Delay(TimeSpan.FromMilliseconds(50));
+            await Task.Delay(TimeSpan.FromMilliseconds(50), cancellation.Token)
+                .ConfigureAwait(ConfigureAwaitOptions.SuppressThrowing);
         }
 
         throw new TimeoutException("The recovered logger did not persist the pending log line.");
+    }
+
+    private static async Task WaitUntilAsync(Func<bool> condition, TimeSpan timeout)
+    {
+        using var cancellation = new CancellationTokenSource(timeout);
+        while (!condition() && !cancellation.IsCancellationRequested)
+        {
+            await Task.Delay(TimeSpan.FromMilliseconds(20), cancellation.Token)
+                .ConfigureAwait(ConfigureAwaitOptions.SuppressThrowing);
+        }
+
+        Assert.True(condition(), "The logger provider did not report its own writer failure.");
     }
 }
