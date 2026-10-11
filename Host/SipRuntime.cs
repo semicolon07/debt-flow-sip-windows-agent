@@ -98,6 +98,10 @@ public sealed class SipRuntime : ISipRuntime
         _transport.AddSIPChannel(new SIPUDPChannel(new IPEndPoint(IPAddress.Any, 0)));
         _transport.AddSIPChannel(new SIPTCPChannel(new IPEndPoint(IPAddress.Any, 0)));
         _userAgent = new SIPUserAgent(_transport, null, true);
+        // The regular transport response event only receives responses that do not match a
+        // transaction. Trace events observe parsed messages before transaction dispatch.
+        _transport.SIPRequestOutTraceEvent += OnSipRequestSent;
+        _transport.SIPResponseInTraceEvent += OnSipResponseReceived;
         WireUserAgentEvents();
         AudioState = "degraded";
         try
@@ -241,14 +245,19 @@ public sealed class SipRuntime : ISipRuntime
         }
         catch (TimeoutException)
         {
+            bool terminalOwned = TryCompleteOutboundAttempt(call);
             _userAgent.Cancel();
             await CleanupMediaBoundedAsync(call);
             ClearActiveCall(call);
-            Emit(new SipSignal(SipSignalType.CallFailed, SafeCode: "call_timeout", Call: call));
+            if (terminalOwned)
+            {
+                Emit(new SipSignal(SipSignalType.CallFailed, SafeCode: "call_timeout", Call: call));
+            }
             return;
         }
         catch (OperationCanceledException)
         {
+            _ = TryCompleteOutboundAttempt(call);
             _userAgent.Cancel();
             await CleanupMediaBoundedAsync(call);
             ClearActiveCall(call);
@@ -263,13 +272,20 @@ public sealed class SipRuntime : ISipRuntime
 
         if (result)
         {
-            Emit(new SipSignal(SipSignalType.CallConnected, Call: call));
+            if (TryCompleteOutboundAttempt(call))
+            {
+                Emit(new SipSignal(SipSignalType.CallConnected, Call: call));
+            }
         }
         else
         {
+            bool terminalOwned = TryCompleteOutboundAttempt(call);
             await CleanupMediaBoundedAsync(call);
             ClearActiveCall(call);
-            Emit(new SipSignal(SipSignalType.CallFailed, SafeCode: "call_unavailable", Call: call));
+            if (terminalOwned)
+            {
+                Emit(new SipSignal(SipSignalType.CallFailed, SafeCode: "call_unavailable", Call: call));
+            }
         }
     }
 
@@ -374,6 +390,7 @@ public sealed class SipRuntime : ISipRuntime
         }
         else if (_userAgent.IsCalling || _userAgent.IsRinging)
         {
+            _ = TryCompleteOutboundAttempt(call);
             _userAgent.Cancel();
         }
         else if (_userAgent.IsCallActive)
@@ -603,6 +620,8 @@ public sealed class SipRuntime : ISipRuntime
         }
         _audioNotificationClient?.Dispose();
         _audioDeviceEnumerator?.Dispose();
+        _transport.SIPRequestOutTraceEvent -= OnSipRequestSent;
+        _transport.SIPResponseInTraceEvent -= OnSipResponseReceived;
         _transport.Shutdown();
         _configuration = null;
         await _backgroundTasks.DrainAsync(TimeSpan.FromSeconds(2));
@@ -671,8 +690,8 @@ public sealed class SipRuntime : ISipRuntime
             if (call == null) return;
             MarkAnswerTerminationPending(call);
             ClearPendingIncoming(call);
-            TrackBackground(CleanupMediaForCallAsync(call));
             Emit(new SipSignal(SipSignalType.IncomingCancelled, Call: call));
+            TrackBackground(CleanupMediaForCallAsync(call));
         };
         _userAgent.ServerCallRingTimeout += incoming =>
         {
@@ -680,8 +699,8 @@ public sealed class SipRuntime : ISipRuntime
             if (call == null) return;
             MarkAnswerTerminationPending(call);
             ClearPendingIncoming(call);
-            TrackBackground(CleanupMediaForCallAsync(call));
             Emit(new SipSignal(SipSignalType.CallFailed, SafeCode: "answer_ack_timeout", Call: call));
+            TrackBackground(CleanupMediaForCallAsync(call));
         };
         _userAgent.OnDtmfTone += (_, _) =>
         {
@@ -696,9 +715,10 @@ public sealed class SipRuntime : ISipRuntime
                 !string.IsNullOrWhiteSpace(dialogue?.CallId),
                 call != null);
             if (call == null) return;
+            _ = TryCompleteOutboundAttempt(call);
             MarkAnswerTerminationPending(call);
-            TrackBackground(CleanupMediaForCallAsync(call));
             Emit(new SipSignal(SipSignalType.CallRemoteEnded, Call: call));
+            TrackBackground(CleanupMediaForCallAsync(call));
         };
         _userAgent.ClientCallTrying += (_, response) =>
         {
@@ -713,23 +733,91 @@ public sealed class SipRuntime : ISipRuntime
         _userAgent.ClientCallAnswered += (_, response) =>
         {
             SipCallHandle? call = ResolveOrRememberOutboundHandle(response.Header?.CallId);
-            if (call != null) Emit(new SipSignal(SipSignalType.CallConnected, (int)response.Status, Call: call));
+            if (call != null && TryCompleteOutboundAttempt(call))
+            {
+                Emit(new SipSignal(SipSignalType.CallConnected, (int)response.Status, Call: call));
+            }
         };
         _userAgent.ClientCallFailed += (_, _, response) =>
         {
-            SipCallHandle? call = ResolveOutboundFailureCall(response?.Header?.CallId);
+            string? sipCallId = response?.Header?.CallId;
+            SipCallHandle? call = TryResolveOutboundFailureCall(
+                sipCallId,
+                requireMappedCall: !string.IsNullOrWhiteSpace(sipCallId));
             _logger.LogInformation(
                 "Outbound SIP failure callback received with status {SipStatusCode}; active outbound call resolved: {CallResolved}",
                 response == null ? null : (int)response.Status,
                 call != null);
             if (call == null) return;
-            TrackBackground(CleanupMediaForCallAsync(call));
             Emit(new SipSignal(
                 SipSignalType.CallFailed,
                 response == null ? null : (int)response.Status,
                 "sip_call_failed",
                 Call: call));
+            TrackBackground(CleanupMediaForCallAsync(call));
         };
+    }
+
+    private void OnSipRequestSent(
+        SIPEndPoint localEndPoint,
+        SIPEndPoint remoteEndPoint,
+        SIPRequest request)
+    {
+        try
+        {
+            if (request.Method == SIPMethodsEnum.INVITE)
+            {
+                _ = ResolveOrRememberOutboundHandle(request.Header.CallId);
+            }
+        }
+        catch (Exception exception) when (OperationalExceptionPolicy.IsNonFatal(exception))
+        {
+            _logger.LogWarning(
+                "Outbound SIP Call-ID tracking failed because of {ErrorType}",
+                exception.GetType().Name);
+        }
+    }
+
+    private void OnSipResponseReceived(
+        SIPEndPoint localEndPoint,
+        SIPEndPoint remoteEndPoint,
+        SIPResponse response)
+    {
+        try
+        {
+            int statusCode = (int)response.Status;
+            if (!SipCallTerminationResolver.IsTerminalInviteFailure(
+                    response.Header.CSeqMethod,
+                    statusCode))
+            {
+                return;
+            }
+
+            SipCallHandle? call = TryResolveOutboundFailureCall(
+                response.Header.CallId,
+                requireMappedCall: true);
+            _logger.LogInformation(
+                "Transport-level outbound SIP final response received with status {SipStatusCode}; active outbound call resolved: {CallResolved}",
+                statusCode,
+                call != null);
+            if (call == null)
+            {
+                return;
+            }
+
+            Emit(new SipSignal(
+                SipSignalType.CallFailed,
+                statusCode,
+                "sip_call_failed",
+                Call: call));
+            TrackBackground(CleanupMediaForCallAsync(call));
+        }
+        catch (Exception exception) when (OperationalExceptionPolicy.IsNonFatal(exception))
+        {
+            _logger.LogWarning(
+                "Transport-level SIP response fallback failed because of {ErrorType}",
+                exception.GetType().Name);
+        }
     }
 
     private VoIPMediaSession CreateMediaSession(SipCallHandle call)
@@ -1838,17 +1926,43 @@ public sealed class SipRuntime : ISipRuntime
         }
     }
 
-    private SipCallHandle? ResolveOutboundFailureCall(string? sipCallId)
+    private SipCallHandle? TryResolveOutboundFailureCall(string? sipCallId, bool requireMappedCall)
     {
         lock (_callGate)
         {
             SipCallHandle? outbound = SameCall(_outboundCallHandle, _activeCallHandle)
                 ? _outboundCallHandle
                 : null;
-            return SipCallTerminationResolver.Resolve(
-                sipCallId,
-                _callHandlesBySipCallId,
-                outbound);
+            SipCallHandle? resolved = requireMappedCall
+                ? SipCallTerminationResolver.ResolveMapped(
+                    sipCallId,
+                    _callHandlesBySipCallId,
+                    outbound)
+                : SipCallTerminationResolver.Resolve(
+                    sipCallId,
+                    _callHandlesBySipCallId,
+                    outbound);
+            if (resolved == null)
+            {
+                return null;
+            }
+
+            _outboundCallHandle = null;
+            return resolved;
+        }
+    }
+
+    private bool TryCompleteOutboundAttempt(SipCallHandle call)
+    {
+        lock (_callGate)
+        {
+            if (!SameCall(_outboundCallHandle, call) || !SameCall(_activeCallHandle, call))
+            {
+                return false;
+            }
+
+            _outboundCallHandle = null;
+            return true;
         }
     }
 
