@@ -82,9 +82,10 @@ if (-not (Test-Path -LiteralPath $startMenuShortcut -PathType Leaf)) { throw "in
 if ($null -ne (Get-Process -Name "DebtFlow.SipAgent.Host" -ErrorAction SilentlyContinue)) {
     throw "silent_install_started_agent"
 }
-& $expectedAgent --print-release-metadata | Set-Content -LiteralPath (Join-Path $outputRoot "installed-release-metadata.json") -Encoding UTF8
-if ($LASTEXITCODE -ne 0) { throw "installed_agent_metadata_failed" }
-$metadata = Get-Content -LiteralPath (Join-Path $outputRoot "installed-release-metadata.json") -Raw | ConvertFrom-Json
+$metadata = & (Join-Path $PSScriptRoot "read-agent-release-metadata.ps1") -AgentPath $expectedAgent
+$metadata | ConvertTo-Json -Depth 8 | Set-Content `
+    -LiteralPath (Join-Path $outputRoot "installed-release-metadata.json") `
+    -Encoding UTF8
 if ($metadata.version -ne $ExpectedVersion -or $metadata.runtimeIdentifier -ne "win-x64" -or
     $metadata.protocolVersion -ne 1 -or $metadata.sqliteSchemaVersion -ne 4) {
     throw "installed_agent_metadata_mismatch"

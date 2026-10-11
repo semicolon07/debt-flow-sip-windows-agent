@@ -102,6 +102,14 @@ writer recoveryทำงานและไฟล์มีข้อมูล แ�
 Windows จึงแยก test concernให้ใช้ loopback HTTP/WS; certificate profile/manager testsและ installed-agent P5 smokeยัง
 คง TLS coverage. Release buildผ่าน 0 warnings/0 errorsและ Core testsผ่าน 100/100; Windows Host/P5 rerunยัง pending.
 
+P5 rerunผ่าน restore, P2 และ publishแล้วหยุดที่ release metadataด้วย strict-mode errorว่าไม่มี property `version`.
+Root causeคือ Hostเป็น Windows `WinExe` และ `ConsoleSession.EnsureAttached` ไปแทน redirected standard streamsเมื่อ
+PowerShellต้อง capture `--print-release-metadata`, ทำให้ callerได้ empty output. แก้ให้ ConsoleSessionรักษา redirected
+stdout/stderr และเพิ่ม `read-agent-release-metadata.ps1` ซึ่งเรียก processด้วย `UseShellExecute=false`, redirectทั้งสอง
+streams, wait for exit, reject stderr/empty/invalid JSON และตรวจ required schema propertiesก่อนคืน object. P5,
+installer verificationและ rollbackใช้ helperเดียวกันเพื่อไม่ให้ behavior drift. Source buildผ่าน 0 warnings/0 errors;
+Windows metadata/P5 rerunยัง pending.
+
 ## Deviations and follow-up
 
 - Setup failureจาก `PrepareToInstall` ใช้ standard Inno non-zero exit 7; exit 30–33เป็น contractของ Agent

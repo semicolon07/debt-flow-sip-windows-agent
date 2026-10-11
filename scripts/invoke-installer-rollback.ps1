@@ -80,9 +80,7 @@ function Read-VerifiedManifest([string]$AgentPath, [string]$ExpectedVersion) {
 $currentManifest = Read-VerifiedManifest $currentPath $currentVersion
 $previousManifest = Read-VerifiedManifest $previousPath $previousVersion
 function Read-AgentMetadata([string]$AgentPath, [string]$ExpectedVersion) {
-    $json = & $AgentPath --print-release-metadata
-    if ($LASTEXITCODE -ne 0) { throw "rollback_release_metadata_command_failed:$ExpectedVersion" }
-    $metadata = $json | ConvertFrom-Json
+    $metadata = & (Join-Path $PSScriptRoot "read-agent-release-metadata.ps1") -AgentPath $AgentPath
     if ($metadata.version -ne $ExpectedVersion -or $metadata.runtimeIdentifier -ne "win-x64") {
         throw "rollback_release_metadata_identity_mismatch:$ExpectedVersion"
     }

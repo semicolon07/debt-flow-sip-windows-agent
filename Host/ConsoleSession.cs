@@ -9,7 +9,9 @@ public static class ConsoleSession
 
     public static void EnsureAttached()
     {
-        if (!AttachConsole(AttachParentProcess))
+        bool outputRedirected = Console.IsOutputRedirected;
+        bool errorRedirected = Console.IsErrorRedirected;
+        if (!outputRedirected && !errorRedirected && !AttachConsole(AttachParentProcess))
         {
             _ = AllocConsole();
         }

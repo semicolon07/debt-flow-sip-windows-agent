@@ -63,14 +63,13 @@ try {
     ) (Join-Path $logDirectory "publish.log")
 
     $agentExecutable = Join-Path $publishDirectory "DebtFlow.SipAgent.Host.exe"
-    $releaseMetadataJson = (& $agentExecutable --print-release-metadata)
-    if ($LASTEXITCODE -ne 0) { throw "release_metadata_command_failed" }
-    $releaseMetadata = $releaseMetadataJson | ConvertFrom-Json
+    $releaseMetadata = & (Join-Path $PSScriptRoot "read-agent-release-metadata.ps1") `
+        -AgentPath $agentExecutable
     if ($releaseMetadata.version -ne $version -or
         $releaseMetadata.runtimeIdentifier -ne "win-x64" -or
         $releaseMetadata.protocolVersion -ne 1 -or
         $releaseMetadata.sqliteSchemaVersion -ne 4) {
-        throw "release_metadata_mismatch:tag=$tag metadata=$releaseMetadataJson"
+        throw "release_metadata_mismatch:tag=$tag"
     }
 
     Copy-Item -LiteralPath (Join-Path $repositoryRoot "release\README-th-en.md") `
