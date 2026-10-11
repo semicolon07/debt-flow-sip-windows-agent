@@ -380,7 +380,11 @@ public sealed class SafeJsonLoggerProvider : ILoggerProvider
 
         foreach ((string key, object? value) in values)
         {
-            result[key] = IsSensitiveKey(key) ? "[REDACTED]" : value;
+            // OriginalFormat is the logging framework's message-template field, not an
+            // origin/URL property. Its value is sanitized separately before it is written.
+            result[key] = string.Equals(key, "{OriginalFormat}", StringComparison.Ordinal)
+                ? value
+                : IsSensitiveKey(key) ? "[REDACTED]" : value;
         }
 
         return result;

@@ -94,6 +94,14 @@ Windows rerunถัดมาผ่าน Host tests 98/100 และยืนย
 test certificateผ่าน exportable ephemeral PKCS#12 และให้ logger testรอ provider-local failure healthพร้อม recovery budget
 10 วินาที. Source compileผ่าน 0 warnings/0 errors; Windows rerunสำหรับ 2 testsนี้และ P5 gateยัง pending.
 
+Windows rerunอีกครั้งยังได้ 98/100 และทำให้ตรวจพบ root causeที่ลึกกว่าเดิม. Standalone logger reproductionยืนยันว่า
+writer recoveryทำงานและไฟล์มีข้อมูล แต่ `{OriginalFormat}` ถูก `IsSensitiveKey` จัดเป็น origin propertyเพราะ substring
+`origin` ทำให้ safe message templateถูกแทนด้วย `[REDACTED]`; แก้ special-case framework keyแล้วปล่อยค่าผ่าน
+`SafeLogSanitizer` ตามเดิม โดย property `Origin` จริงยังถูก redact. Standalone recoveryหลังแก้พบข้อความภายในประมาณ
+1 วินาที. WebSocket security/session testไม่ได้มีหน้าที่ทดสอบ TLS และ test-only certificateยัง handshakeไม่เสถียรบน
+Windows จึงแยก test concernให้ใช้ loopback HTTP/WS; certificate profile/manager testsและ installed-agent P5 smokeยัง
+คง TLS coverage. Release buildผ่าน 0 warnings/0 errorsและ Core testsผ่าน 100/100; Windows Host/P5 rerunยัง pending.
+
 ## Deviations and follow-up
 
 - Setup failureจาก `PrepareToInstall` ใช้ standard Inno non-zero exit 7; exit 30–33เป็น contractของ Agent
