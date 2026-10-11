@@ -1,47 +1,129 @@
-# Debt Flow SIP Agent 1.0.0
+# Debt Flow SIP Agent — Windows deployment guide
 
 ## ภาษาไทย
 
-ชุดนี้เป็น portable แบบ self-contained สำหรับ Windows x64 ไม่ต้องติดตั้ง .NET Runtime/SDK เพิ่มเติม
+ชุด release มี 2 รูปแบบจาก publish เดียวกัน:
 
-1. ปิด Debt Flow SIP Agent เวอร์ชันเดิมจาก tray icon
-2. รัน `DebtFlow.SipAgent.Host.exe --storage-preflight`; ไปต่อเฉพาะ exit 0 (exit 20/21 ให้หยุดและติดต่อ owner)
-3. แตก ZIP ไปยังโฟลเดอร์เวอร์ชันใหม่ ห้ามรันจากใน ZIP
-4. เปิด `DebtFlow.SipAgent.Host.exe` จากโฟลเดอร์ใหม่
-5. การเปิดครั้งแรกให้ตรวจข้อความ consent แล้วอนุญาตให้ Agent สร้างและติดตั้งใบรับรอง `localhost`
-6. ตรวจว่า tray icon แสดงสถานะพร้อมใช้งานและทดสอบโทรหนึ่งสายบน HTTPS Portal ด้วย Edge หรือ Chrome
-7. เมื่อยืนยันแล้วจึงลบโฟลเดอร์โปรแกรมเวอร์ชันเดิม
+- `debt-flow-sip-agent-X.Y.Z-win-x64-setup.exe` — แนะนำสำหรับติดตั้ง/อัปเกรดภายในองค์กร
+- `debt-flow-sip-agent-X.Y.Z-win-x64.zip` — portable fallback สำหรับ operator
 
-ข้อมูลตั้งค่า, SQLite outbox และ log อยู่ที่ `%LOCALAPPDATA%\DebtFlow\SipAgent` และไม่ถูกลบเมื่อเปลี่ยนโฟลเดอร์โปรแกรม หากต้อง rollback รุ่นแรก ให้ปิด Phone ของ Collection จาก Admin แล้ว Exit Agent โดยเก็บโฟลเดอร์ AppData ไว้
+รองรับ Windows 10 build 17763 ขึ้นไปและ Windows 11 แบบ x64, ติดตั้งเฉพาะผู้ใช้ปัจจุบันโดยไม่ใช้ UAC
+และไม่ต้องติดตั้ง .NET Runtime/SDK เพิ่ม. ตรวจไฟล์ `.sha256` และ `installer-manifest.json` ก่อนแจกจ่ายเสมอ.
 
-Agent ใช้ `wss://localhost:8443/agent/v1` เท่านั้น หากสถานะ certificate ไม่พร้อม ให้เลือก
-**ซ่อมแซมใบรับรองภายในเครื่อง** จาก tray. เมื่อต้องการถอน certificate ให้เลือก
-**ลบใบรับรองภายในเครื่องและออก** หรือรัน `DebtFlow.SipAgent.Host.exe --remove-local-certificate`.
-การลบโฟลเดอร์โปรแกรมเพียงอย่างเดียวจะไม่ถอน certificate.
+### ติดตั้งหรืออัปเกรด
 
-ก่อนส่งไฟล์ให้ผู้ใช้ ให้ตรวจ SHA-256 กับไฟล์ `.sha256` ทุกครั้ง ชุด 1.0.0 ยังไม่มี Authenticode signature ตามข้อยกเว้นความเสี่ยงที่ได้รับอนุมัติ
-SQLite/WAL ยังเป็น plaintextตามข้อยกเว้นที่อนุมัติ; ห้ามคัดลอก AppData ออกนอก incident/data procedure.
-RTP strict เป็นค่าเริ่มต้น และห้ามเปิด `acceptRtpFromAny` หากไม่มี PBX compatibility approval.
+เปิด setup EXE แล้วทำตาม wizard. โปรแกรมอยู่ที่
+`%LOCALAPPDATA%\Programs\DebtFlow\SipAgent\versions\X.Y.Z`; ข้อมูลใช้งานอยู่แยกที่
+`%LOCALAPPDATA%\DebtFlow\SipAgent`.
+
+Installer จะขอให้ Agent หยุดอย่างปลอดภัยและตรวจ storage ก่อนเปลี่ยน version. หากมีสายอยู่จะยกเลิกด้วย
+`update_blocked_active_call`/exit 30 โดยไม่ตัดสาย; ให้จบสายแล้วรัน installer ใหม่. หาก Agent รุ่น portable เก่าไม่รองรับ
+maintenance protocol ให้ Exit จาก tray แล้วเลือก Retry. Downgrade ด้วย setup ถูกปิดโดยออกแบบ.
+
+Silent install/repair สำหรับ IT:
+
+```powershell
+./debt-flow-sip-agent-X.Y.Z-win-x64-setup.exe /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /LOG="installer.log"
+```
+
+Silent mode จะไม่เปิด Agent และไม่ยอมรับ TLS consent แทนผู้ใช้. ผู้ใช้ต้องเปิด Agent เองครั้งแรกจาก Start Menu.
+
+### ถอนการติดตั้ง
+
+Normal uninstall เก็บ settings, SQLite/outbox, logs, audio preferences และ localhost certificate ทั้งหมด.
+
+```powershell
+& "$env:LOCALAPPDATA\Programs\DebtFlow\SipAgent\unins000.exe" /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /LOG="uninstall.log"
+```
+
+ตัวเลือก destructive ต้องระบุแยกอย่างชัดเจนและไม่มีค่าใด imply อีกค่า:
+
+```powershell
+# ถอนเฉพาะ Agent-owned localhost certificate เพิ่มเติม
+& "$env:LOCALAPPDATA\Programs\DebtFlow\SipAgent\unins000.exe" /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /PURGECERT=1
+
+# ลบข้อมูล Agent ของผู้ใช้ปัจจุบันอย่างถาวรเพิ่มเติม
+& "$env:LOCALAPPDATA\Programs\DebtFlow\SipAgent\unins000.exe" /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /PURGEDATA=1
+```
+
+Interactive uninstall จะถาม certificate และ data แยกกัน โดยค่าเริ่มต้นเป็นไม่ลบ. หากมี active call uninstall จะหยุด.
+
+### Rollback และ portable fallback
+
+Rollback เป็นงานของ operator เท่านั้นและทำได้เมื่อ previous version ที่ installer เก็บไว้ผ่าน hash/schema/protocol check:
+
+```powershell
+./scripts/invoke-installer-rollback.ps1 -TargetVersion X.Y.Z
+```
+
+ห้ามนำ setup รุ่นเก่ามาทำ downgrade. หากจำเป็นต้องใช้ ZIP fallback ให้ Exit Agent, รัน
+`DebtFlow.SipAgent.Host.exe --storage-preflight`, แตก ZIP ลงโฟลเดอร์ version ใหม่และเปิด executable จากโฟลเดอร์นั้น.
+ไปต่อเฉพาะ preflight exit 0; exit 20/21 ให้หยุดและติดต่อ owner.
+
+Agent ใช้ `wss://localhost:8443/agent/v1` เท่านั้น. การเปิดครั้งแรกจะขอ consent ก่อนสร้าง/trust certificate.
+Artifact ยัง unsigned ตาม approved exception จึงอาจมี SmartScreen warning; self-signed localhost certificate
+ไม่ใช่ Authenticode signature. SQLite/WAL ยังเป็น plaintext ตาม accepted exception.
 
 ## English
 
-This is a self-contained portable Windows x64 package. The target computer does not need a separate .NET Runtime or SDK.
+Each release provides two artifacts produced from the same verified publish directory:
 
-1. Exit the previous Debt Flow SIP Agent from its tray icon.
-2. Run `DebtFlow.SipAgent.Host.exe --storage-preflight`; continue only for exit 0 (stop and contact the owner for exit 20/21).
-3. Extract the ZIP into a new versioned folder; do not run it inside the ZIP.
-4. Start `DebtFlow.SipAgent.Host.exe` from the new folder.
-5. On first launch, review the consent prompt and allow the Agent to create and trust its localhost certificate.
-6. Confirm the tray status is ready and complete one test call from the HTTPS Portal in Edge or Chrome.
-7. Delete the old program folder only after the check succeeds.
+- `debt-flow-sip-agent-X.Y.Z-win-x64-setup.exe` — recommended internal install/upgrade artifact
+- `debt-flow-sip-agent-X.Y.Z-win-x64.zip` — operator portable fallback
 
-Configuration, the SQLite outbox, and logs remain under `%LOCALAPPDATA%\DebtFlow\SipAgent`. For the first 1.0.0 rollback, disable Phone for the Collection in Admin and exit the Agent while preserving AppData.
+The Agent supports x64 Windows 10 build 17763 or later and Windows 11. Installation is per-user,
+non-elevated, and self-contained. Always verify the `.sha256` file and `installer-manifest.json` before distribution.
 
-The Agent exposes only `wss://localhost:8443/agent/v1`. If certificate status is not ready, choose
-**Repair local certificate** from the tray. To remove the certificate, choose
-**Remove local certificate and exit** or run `DebtFlow.SipAgent.Host.exe --remove-local-certificate`.
-Deleting the program folder alone does not remove the certificate.
+### Install or upgrade
 
-Verify the SHA-256 checksum before distribution. Version 1.0.0 is intentionally unsigned under the approved production risk exception.
-SQLite/WAL remain plaintext under an approved exception; never copy AppData outside the incident/data procedure.
-Strict RTP source handling is the default. Do not enable `acceptRtpFromAny` without approved PBX compatibility evidence.
+Run the setup EXE and follow the wizard. Program files are versioned under
+`%LOCALAPPDATA%\Programs\DebtFlow\SipAgent\versions\X.Y.Z`; runtime data remains separate under
+`%LOCALAPPDATA%\DebtFlow\SipAgent`.
+
+Setup requests a graceful Agent shutdown and runs storage preflight before changing versions. An active call aborts
+with `update_blocked_active_call`/exit 30 without hanging up; finish the call and rerun setup. For an older portable
+Agent without the maintenance protocol, exit it from the tray and choose Retry. Setup downgrade is intentionally blocked.
+
+IT silent install/repair:
+
+```powershell
+./debt-flow-sip-agent-X.Y.Z-win-x64-setup.exe /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /LOG="installer.log"
+```
+
+Silent mode does not launch the Agent or accept TLS consent. The user starts it from the Start Menu on first use.
+
+### Uninstall
+
+Normal uninstall preserves settings, SQLite/outbox, logs, audio preferences, and the localhost certificate:
+
+```powershell
+& "$env:LOCALAPPDATA\Programs\DebtFlow\SipAgent\unins000.exe" /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /LOG="uninstall.log"
+```
+
+Destructive choices are separate and explicit; neither option implies the other:
+
+```powershell
+# Also remove the Agent-owned localhost certificate
+& "$env:LOCALAPPDATA\Programs\DebtFlow\SipAgent\unins000.exe" /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /PURGECERT=1
+
+# Also permanently remove current-user Agent data
+& "$env:LOCALAPPDATA\Programs\DebtFlow\SipAgent\unins000.exe" /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /PURGEDATA=1
+```
+
+Interactive uninstall asks about certificate and data separately, defaulting both to preserve. An active call blocks uninstall.
+
+### Rollback and portable fallback
+
+Rollback is operator-only. It requires a retained previous version that passes file hash, schema, and protocol checks:
+
+```powershell
+./scripts/invoke-installer-rollback.ps1 -TargetVersion X.Y.Z
+```
+
+Do not use an older setup EXE to downgrade. For ZIP fallback, exit the Agent, run
+`DebtFlow.SipAgent.Host.exe --storage-preflight`, extract into a new version folder, and launch from that folder.
+Continue only for exit 0; stop and contact the owner for exit 20/21.
+
+The Agent exposes only `wss://localhost:8443/agent/v1`. First launch requests consent before creating/trusting its
+localhost certificate. Artifacts remain unsigned under the approved exception and may trigger SmartScreen; the localhost
+self-signed certificate is not an Authenticode signature. SQLite/WAL remain plaintext under the accepted exception.

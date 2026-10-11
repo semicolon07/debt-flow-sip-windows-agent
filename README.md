@@ -67,6 +67,11 @@ matrixยืนยันว่าจำเป็นและ ownerรับค�
 exit 20 ต้องใช้ migration procedure และ exit 21 ต้องหยุดเพื่อรักษา DB/WALสำหรับวิเคราะห์. คำสั่งนี้อ่าน storage
 อย่างเดียวและไม่เริ่ม TLS, UI, WSS หรือ SIP.
 
+Installer/operation toolingใช้ `--query-maintenance` เพื่อตรวจ idle/active-callโดยไม่หยุด Agent และ
+`--prepare-update` เพื่อขอ graceful shutdown. ทั้งสองคำสั่งคืน 0 เมื่อพร้อม, 30 เมื่อมี active call,
+31 เมื่อ shutdown/state checkล้มเหลว, 32 เมื่อ IPCไม่แน่นอน และ 33 เมื่อ protocolไม่รองรับ. ห้ามใช้ force kill
+เพื่อ bypass exit เหล่านี้.
+
 ## Build, test และ publish
 
 Windows:
@@ -94,8 +99,24 @@ CI เรียก P2 verifierและอัปโหลด ZIP, TRX, checksum/
 ./scripts/verify-p5-release.ps1
 ```
 
-ผลลัพธ์คือ unsigned self-contained multi-file `debt-flow-sip-agent-1.0.0-win-x64.zip` พร้อม
-SPDX SBOM, release manifestและ SHA-256 checksum; target machineไม่ต้องติดตั้ง .NET Runtime/SDK.
+ผลลัพธ์คือ unsigned self-contained multi-file ZIP และ per-user Inno Setup EXE พร้อม
+SPDX SBOM, release/installer manifests และ SHA-256 checksums; target machineไม่ต้องติดตั้ง .NET Runtime/SDK.
+Release runner pin Inno Setup 7.1.0 x64 และตรวจ compiler version ก่อน build.
+
+Per-user Windows installer ใช้ fixed AppId, ติดตั้ง side-by-side ที่
+`%LOCALAPPDATA%\Programs\DebtFlow\SipAgent\versions\X.Y.Z`, block downgrade และเรียก
+`--prepare-update` ก่อน upgrade/repair/uninstall. หากมี active call คำสั่งคืน exit 30 โดยไม่ตัดสาย;
+exit 31/32/33 เป็น shutdown failure, IPC ambiguity และ legacy protocol ตามลำดับ. Silent installไม่เปิด Agent.
+Normal uninstallเก็บ `%LOCALAPPDATA%\DebtFlow\SipAgent` และ certificateไว้; `/PURGECERT=1` กับ
+`/PURGEDATA=1` เป็น destructive opt-in แยกกัน. Rollbackใช้ operator script
+`scripts/invoke-installer-rollback.ps1` เท่านั้น.
+
+แผนและ contract โดยละเอียดอยู่ที่
+[Inno Setup installer implementation plan](docs/2026-10-11-sip-agent-inno-setup-installer-plan.md).
+ผล implementation และ DoD evidence/pending gates อยู่ที่
+[Inno Setup installer result](docs/plan-results/2026-10-11-sip-agent-inno-setup-installer-result.md).
+Source implementationเสร็จแล้ว แต่ setup artifact/Windows installer matrix/PBX evidenceยังต้องรันบน Windows
+release environment ก่อนประกาศ installer หรือ Agent ว่า production-ready.
 
 เก็บ P5 D baseline/optimized CPU, memory, handlesและ threadsจาก Agentที่กำลังทำงานด้วย:
 

@@ -36,6 +36,12 @@ public sealed class AgentCommandLineTests
         Assert.Equal(
             AgentLaunchCommand.PrintReleaseMetadata,
             AgentCommandLine.Parse(["--print-release-metadata"]));
+        Assert.Equal(
+            AgentLaunchCommand.QueryMaintenance,
+            AgentCommandLine.Parse(["--query-maintenance"]));
+        Assert.Equal(
+            AgentLaunchCommand.PrepareUpdate,
+            AgentCommandLine.Parse(["--prepare-update"]));
     }
 
     [Theory]
@@ -43,6 +49,9 @@ public sealed class AgentCommandLineTests
     [InlineData("--remove-local-certificate", "--background")]
     [InlineData("--repair-local-certificate", "--allowed-origin", "https://portal.example")]
     [InlineData("--repair-local-certificate", "--remove-local-certificate")]
+    [InlineData("--prepare-update", "--background")]
+    [InlineData("--prepare-update", "--storage-preflight")]
+    [InlineData("--query-maintenance", "--prepare-update")]
     public void Rejects_maintenance_flags_combined_with_runtime_arguments(params string[] args)
     {
         AgentConfigurationException exception = Assert.Throws<AgentConfigurationException>(

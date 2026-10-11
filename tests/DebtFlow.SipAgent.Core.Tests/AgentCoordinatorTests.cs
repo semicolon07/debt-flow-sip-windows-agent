@@ -603,6 +603,39 @@ public sealed class AgentCoordinatorTests
     }
 
     [Fact]
+    public async Task InstallerShutdownWithActiveCall_IsRefusedWithoutHangingUp()
+    {
+        await using CoordinatorFixture fixture = await CoordinatorFixture.CreateAsync();
+        await fixture.RegisterAsync();
+        await fixture.Coordinator.StartCallAsync(
+            new CallStartCommand(NewId(), NewId(), "0812345678", "diagnostic-only"),
+            CancellationToken.None);
+        await fixture.Runtime.EmitAsync(new SipSignal(SipSignalType.CallConnected, 200));
+
+        bool shutdownStarted = await fixture.Coordinator.TryShutdownIfIdleAsync(CancellationToken.None);
+
+        Assert.False(shutdownStarted);
+        Assert.Equal(0, fixture.Runtime.HangupCount);
+        Assert.Equal(0, fixture.Runtime.StopRegistrationCount);
+        Assert.Single((await fixture.Coordinator.GetSnapshotAsync(CancellationToken.None)).ActiveCalls);
+    }
+
+    [Fact]
+    public async Task InstallerShutdownWhenIdle_StopsRegistration()
+    {
+        await using CoordinatorFixture fixture = await CoordinatorFixture.CreateAsync();
+        await fixture.RegisterAsync();
+
+        bool shutdownStarted = await fixture.Coordinator.TryShutdownIfIdleAsync(CancellationToken.None);
+
+        Assert.True(shutdownStarted);
+        Assert.Equal(1, fixture.Runtime.StopRegistrationCount);
+        AgentSnapshotPayload snapshot = await fixture.Coordinator.GetSnapshotAsync(CancellationToken.None);
+        Assert.Empty(snapshot.ActiveCalls);
+        Assert.Equal("unconfigured", snapshot.RegistrationState);
+    }
+
+    [Fact]
     public async Task OutboxFailureBeforeOutboundCall_DegradesWithoutStartingSipOrLeavingActiveCall()
     {
         string directory = Path.Combine(Path.GetTempPath(), $"sip-agent-outbox-{Guid.NewGuid():N}");

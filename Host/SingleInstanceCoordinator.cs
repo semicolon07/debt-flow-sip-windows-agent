@@ -8,6 +8,7 @@ namespace DebtFlow.SipAgent.Host;
 
 public sealed class SingleInstanceCoordinator : IAsyncDisposable
 {
+    private static readonly TimeSpan ConnectTimeout = TimeSpan.FromSeconds(2);
     private readonly Mutex _mutex;
     private readonly string _pipeName;
     private readonly CancellationTokenSource _shutdown = new();
@@ -22,6 +23,8 @@ public sealed class SingleInstanceCoordinator : IAsyncDisposable
 
     public bool IsPrimary { get; }
     public event Action? ActivationRequested;
+    public event Func<CancellationToken, Task<AgentInstanceResponse>>? QueryMaintenanceRequested;
+    public event Func<CancellationToken, Task<AgentInstanceResponse>>? PrepareUpdateRequested;
 
     public static SingleInstanceCoordinator Create()
     {
@@ -57,9 +60,50 @@ public sealed class SingleInstanceCoordinator : IAsyncDisposable
             PipeDirection.Out,
             PipeOptions.Asynchronous,
             TokenImpersonationLevel.Identification);
-        await client.ConnectAsync(2000, cancellationToken);
-        await client.WriteAsync(new byte[] { 1 }, cancellationToken);
+        await client.ConnectAsync((int)ConnectTimeout.TotalMilliseconds, cancellationToken);
+        await client.WriteAsync(new byte[] { AgentInstanceProtocol.LegacyActivateSignal }, cancellationToken);
         await client.FlushAsync(cancellationToken);
+    }
+
+    public async Task<AgentInstanceResponse> RequestPrepareUpdateAsync(CancellationToken cancellationToken)
+        => await RequestMaintenanceAsync(AgentInstanceCommand.PrepareUpdate, cancellationToken);
+
+    public async Task<AgentInstanceResponse> RequestQueryMaintenanceAsync(CancellationToken cancellationToken)
+        => await RequestMaintenanceAsync(AgentInstanceCommand.QueryMaintenance, cancellationToken);
+
+    private async Task<AgentInstanceResponse> RequestMaintenanceAsync(
+        AgentInstanceCommand command,
+        CancellationToken cancellationToken)
+    {
+        if (IsPrimary)
+        {
+            return new AgentInstanceResponse(AgentInstanceResponseStatus.Ready);
+        }
+
+        using var client = new NamedPipeClientStream(
+            ".",
+            _pipeName,
+            PipeDirection.InOut,
+            PipeOptions.Asynchronous,
+            TokenImpersonationLevel.Identification);
+        await client.ConnectAsync((int)ConnectTimeout.TotalMilliseconds, cancellationToken);
+        byte[] request = AgentInstanceProtocol.EncodeRequest(command);
+        await client.WriteAsync(request, cancellationToken);
+        await client.FlushAsync(cancellationToken);
+
+        var response = new byte[AgentInstanceProtocol.FrameLength];
+        try
+        {
+            await client.ReadExactlyAsync(response, cancellationToken);
+        }
+        catch (EndOfStreamException)
+        {
+            return new AgentInstanceResponse(AgentInstanceResponseStatus.ProtocolUnsupported);
+        }
+
+        return AgentInstanceProtocol.TryDecodeResponse(response, out AgentInstanceResponseStatus status)
+            ? new AgentInstanceResponse(status)
+            : new AgentInstanceResponse(AgentInstanceResponseStatus.ProtocolUnsupported);
     }
 
     public async ValueTask DisposeAsync()
@@ -88,26 +132,95 @@ public sealed class SingleInstanceCoordinator : IAsyncDisposable
             {
                 await using var server = new NamedPipeServerStream(
                     _pipeName,
-                    PipeDirection.In,
+                    PipeDirection.InOut,
                     1,
                     PipeTransmissionMode.Byte,
                     PipeOptions.Asynchronous | PipeOptions.CurrentUserOnly);
                 await server.WaitForConnectionAsync(cancellationToken);
-                var signal = new byte[1];
-                if (await server.ReadAsync(signal, cancellationToken) == 1)
+                var firstByte = new byte[1];
+                if (await server.ReadAsync(firstByte, cancellationToken) != 1)
                 {
-                    try
-                    {
-                        ActivationRequested?.Invoke();
-                    }
-                    catch (Exception exception) when (OperationalExceptionPolicy.IsNonFatal(exception))
-                    {
-                    }
+                    continue;
                 }
+
+                if (firstByte[0] == AgentInstanceProtocol.LegacyActivateSignal)
+                {
+                    InvokeActivation();
+                    continue;
+                }
+
+                var request = new byte[AgentInstanceProtocol.FrameLength];
+                request[0] = firstByte[0];
+                try
+                {
+                    await server.ReadExactlyAsync(request.AsMemory(1), cancellationToken);
+                }
+                catch (EndOfStreamException)
+                {
+                    continue;
+                }
+
+                AgentInstanceResponseStatus status = AgentInstanceResponseStatus.ProtocolUnsupported;
+                if (AgentInstanceProtocol.TryDecodeRequest(request, out AgentInstanceCommand command))
+                {
+                    status = command switch
+                    {
+                        AgentInstanceCommand.Activate => InvokeActivation(),
+                        AgentInstanceCommand.QueryMaintenance => await InvokeMaintenanceAsync(
+                            QueryMaintenanceRequested,
+                            cancellationToken),
+                        AgentInstanceCommand.PrepareUpdate => await InvokePrepareUpdateAsync(cancellationToken),
+                        _ => AgentInstanceResponseStatus.ProtocolUnsupported
+                    };
+                }
+
+                byte[] response = AgentInstanceProtocol.EncodeResponse(status);
+                await server.WriteAsync(response, cancellationToken);
+                await server.FlushAsync(cancellationToken);
             }
             catch (IOException) when (!cancellationToken.IsCancellationRequested)
             {
             }
+        }
+    }
+
+    private AgentInstanceResponseStatus InvokeActivation()
+    {
+        try
+        {
+            ActivationRequested?.Invoke();
+            return AgentInstanceResponseStatus.Ready;
+        }
+        catch (Exception exception) when (OperationalExceptionPolicy.IsNonFatal(exception))
+        {
+            return AgentInstanceResponseStatus.ShutdownFailed;
+        }
+    }
+
+    private async Task<AgentInstanceResponseStatus> InvokePrepareUpdateAsync(CancellationToken cancellationToken)
+        => await InvokeMaintenanceAsync(PrepareUpdateRequested, cancellationToken);
+
+    private static async Task<AgentInstanceResponseStatus> InvokeMaintenanceAsync(
+        Func<CancellationToken, Task<AgentInstanceResponse>>? handler,
+        CancellationToken cancellationToken)
+    {
+        if (handler == null || handler.GetInvocationList().Length != 1)
+        {
+            return AgentInstanceResponseStatus.ProtocolUnsupported;
+        }
+
+        try
+        {
+            AgentInstanceResponse response = await handler(cancellationToken);
+            return response.Status;
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception exception) when (OperationalExceptionPolicy.IsNonFatal(exception))
+        {
+            return AgentInstanceResponseStatus.ShutdownFailed;
         }
     }
 }

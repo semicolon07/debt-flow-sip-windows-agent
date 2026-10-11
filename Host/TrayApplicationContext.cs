@@ -128,6 +128,8 @@ public sealed class TrayApplicationContext : ApplicationContext
         };
         _timer.Tick += (_, _) => RunUiTask(RefreshStatusAsync, "status_refresh");
         _singleInstance.ActivationRequested += OnActivationRequested;
+        _singleInstance.QueryMaintenanceRequested += OnQueryMaintenanceRequestedAsync;
+        _singleInstance.PrepareUpdateRequested += OnPrepareUpdateRequestedAsync;
         SystemEvents.SessionEnding += OnSessionEnding;
 
         if (!_options.IsOperational)
@@ -154,6 +156,8 @@ public sealed class TrayApplicationContext : ApplicationContext
         {
             SystemEvents.SessionEnding -= OnSessionEnding;
             _singleInstance.ActivationRequested -= OnActivationRequested;
+            _singleInstance.QueryMaintenanceRequested -= OnQueryMaintenanceRequestedAsync;
+            _singleInstance.PrepareUpdateRequested -= OnPrepareUpdateRequestedAsync;
             _timer.Dispose();
             _notifyIcon.Visible = false;
             _notifyIcon.Dispose();
@@ -301,6 +305,99 @@ public sealed class TrayApplicationContext : ApplicationContext
     private void OnActivationRequested() => _uiContext.Post(
         _ => Notify("second_instance", TrayText.Get("SecondInstance")),
         null);
+
+    private Task<AgentInstanceResponse> OnQueryMaintenanceRequestedAsync(CancellationToken cancellationToken)
+    {
+        var completion = new TaskCompletionSource<AgentInstanceResponse>(TaskCreationOptions.RunContinuationsAsynchronously);
+        _uiContext.Post(async _ =>
+        {
+            try
+            {
+                AgentSnapshotPayload snapshot = await GetSnapshotWithTimeoutAsync();
+                completion.TrySetResult(new AgentInstanceResponse(
+                    snapshot.ActiveCalls.Count > 0
+                        ? AgentInstanceResponseStatus.ActiveCall
+                        : AgentInstanceResponseStatus.Ready));
+            }
+            catch (Exception exception) when (OperationalExceptionPolicy.IsNonFatal(exception))
+            {
+                _logger.LogWarning(
+                    "installer_maintenance_query_failed {ErrorType}",
+                    exception.GetType().Name);
+                completion.TrySetResult(new AgentInstanceResponse(AgentInstanceResponseStatus.ShutdownFailed));
+            }
+        }, null);
+        return completion.Task.WaitAsync(cancellationToken);
+    }
+
+    private Task<AgentInstanceResponse> OnPrepareUpdateRequestedAsync(CancellationToken cancellationToken)
+    {
+        var completion = new TaskCompletionSource<AgentInstanceResponse>(TaskCreationOptions.RunContinuationsAsynchronously);
+        _uiContext.Post(async _ =>
+        {
+            try
+            {
+                completion.TrySetResult(await PrepareUpdateAsync());
+            }
+            catch (Exception exception) when (OperationalExceptionPolicy.IsNonFatal(exception))
+            {
+                _logger.LogWarning(
+                    "installer_shutdown_failed {ErrorType}",
+                    exception.GetType().Name);
+                completion.TrySetResult(new AgentInstanceResponse(AgentInstanceResponseStatus.ShutdownFailed));
+            }
+        }, null);
+        return completion.Task.WaitAsync(cancellationToken);
+    }
+
+    private async Task<AgentInstanceResponse> PrepareUpdateAsync()
+    {
+        if (_exitStarted)
+        {
+            return new AgentInstanceResponse(AgentInstanceResponseStatus.ShutdownInProgress);
+        }
+
+        _logger.LogInformation("installer_update_requested");
+        _logger.LogInformation("installer_shutdown_started");
+        _exitStarted = true;
+        _timer.Stop();
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        try
+        {
+            bool shutdownStarted = await _coordinator.TryShutdownIfIdleAsync(timeout.Token);
+            if (!shutdownStarted)
+            {
+                _exitStarted = false;
+                _timer.Start();
+                _logger.LogInformation("installer_update_blocked_active_call");
+                return new AgentInstanceResponse(AgentInstanceResponseStatus.ActiveCall);
+            }
+
+            AgentSnapshotPayload shutdownSnapshot = await GetSnapshotWithTimeoutAsync();
+            if (shutdownSnapshot.ActiveCalls.Count > 0 ||
+                !string.Equals(shutdownSnapshot.RegistrationState, "unconfigured", StringComparison.Ordinal))
+            {
+                _exitStarted = false;
+                _timer.Start();
+                _logger.LogWarning("installer_shutdown_failed state_not_quiescent");
+                return new AgentInstanceResponse(AgentInstanceResponseStatus.ShutdownFailed);
+            }
+        }
+        catch (Exception exception) when (OperationalExceptionPolicy.IsNonFatal(exception))
+        {
+            _exitStarted = false;
+            _timer.Start();
+            _logger.LogWarning(
+                "installer_shutdown_failed {ErrorType}",
+                exception.GetType().Name);
+            return new AgentInstanceResponse(AgentInstanceResponseStatus.ShutdownFailed);
+        }
+
+        _logger.LogInformation("installer_shutdown_completed");
+        MaintenanceRequest = AgentMaintenanceRequest.PrepareUpdate;
+        ExitThread();
+        return new AgentInstanceResponse(AgentInstanceResponseStatus.ShutdownInProgress);
+    }
 
     private void UpdateStartup()
     {

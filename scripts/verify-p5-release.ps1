@@ -158,7 +158,26 @@ try {
     $hash = Get-FileHash -LiteralPath $artifactPath -Algorithm SHA256
     Set-Content -LiteralPath "$artifactPath.sha256" `
         -Value "$($hash.Hash.ToLowerInvariant()) *$artifactName" -Encoding ASCII
-    Write-Host "P5 release artifact created: $artifactPath"
+
+    & (Join-Path $PSScriptRoot "build-installer.ps1") `
+        -PackageDirectory $publishDirectory `
+        -OutputDirectory $runRoot `
+        -Version $version `
+        -GitCommit $gitCommit `
+        -Tag $tag `
+        -LogPath (Join-Path $logDirectory "inno-compile.log")
+    if ($LASTEXITCODE -ne 0) { throw "installer_build_failed" }
+
+    $installerPath = Join-Path $runRoot "debt-flow-sip-agent-$version-win-x64-setup.exe"
+    & (Join-Path $PSScriptRoot "verify-installer-windows.ps1") `
+        -InstallerPath $installerPath `
+        -ExpectedVersion $version `
+        -OutputDirectory (Join-Path $verificationRoot "installer") 2>&1 |
+        Tee-Object -FilePath (Join-Path $logDirectory "installer-verify.log")
+    if ($LASTEXITCODE -ne 0) { throw "installer_verification_failed" }
+
+    Write-Host "P5 portable artifact created: $artifactPath"
+    Write-Host "P5 installer artifact created: $installerPath"
 }
 finally {
     Pop-Location

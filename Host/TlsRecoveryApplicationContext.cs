@@ -8,7 +8,8 @@ public enum AgentMaintenanceRequest
 {
     None,
     RepairCertificate,
-    RemoveCertificate
+    RemoveCertificate,
+    PrepareUpdate
 }
 
 public sealed class TlsDiagnosticExporter
@@ -93,16 +94,21 @@ public sealed class TlsRecoveryApplicationContext : ApplicationContext
             Visible = true
         };
         _singleInstance.ActivationRequested += OnActivationRequested;
+        _singleInstance.QueryMaintenanceRequested += OnQueryMaintenanceRequestedAsync;
+        _singleInstance.PrepareUpdateRequested += OnPrepareUpdateRequestedAsync;
         ShowFailure();
     }
 
     public bool RetryRequested { get; private set; }
+    public AgentMaintenanceRequest MaintenanceRequest { get; private set; }
 
     protected override void Dispose(bool disposing)
     {
         if (disposing)
         {
             _singleInstance.ActivationRequested -= OnActivationRequested;
+            _singleInstance.QueryMaintenanceRequested -= OnQueryMaintenanceRequestedAsync;
+            _singleInstance.PrepareUpdateRequested -= OnPrepareUpdateRequestedAsync;
             _notifyIcon.Visible = false;
             _notifyIcon.Dispose();
         }
@@ -215,4 +221,28 @@ public sealed class TlsRecoveryApplicationContext : ApplicationContext
     }
 
     private void OnActivationRequested() => _uiContext.Post(_ => ShowFailure(), null);
+
+    private Task<AgentInstanceResponse> OnQueryMaintenanceRequestedAsync(CancellationToken cancellationToken) =>
+        Task.FromResult(new AgentInstanceResponse(
+            _operationRunning
+                ? AgentInstanceResponseStatus.ShutdownFailed
+                : AgentInstanceResponseStatus.Ready));
+
+    private Task<AgentInstanceResponse> OnPrepareUpdateRequestedAsync(CancellationToken cancellationToken)
+    {
+        var completion = new TaskCompletionSource<AgentInstanceResponse>(TaskCreationOptions.RunContinuationsAsynchronously);
+        _uiContext.Post(_ =>
+        {
+            if (_operationRunning)
+            {
+                completion.TrySetResult(new AgentInstanceResponse(AgentInstanceResponseStatus.ShutdownFailed));
+                return;
+            }
+
+            MaintenanceRequest = AgentMaintenanceRequest.PrepareUpdate;
+            ExitThread();
+            completion.TrySetResult(new AgentInstanceResponse(AgentInstanceResponseStatus.ShutdownInProgress));
+        }, null);
+        return completion.Task.WaitAsync(cancellationToken);
+    }
 }

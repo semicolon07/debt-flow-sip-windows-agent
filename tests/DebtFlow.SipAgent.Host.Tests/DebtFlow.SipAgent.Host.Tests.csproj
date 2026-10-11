@@ -17,4 +17,9 @@
   <ItemGroup>
     <ProjectReference Include="../../softphone-native-client.csproj" />
   </ItemGroup>
+  <ItemGroup>
+    <None Include="../../installer/DebtFlow.SipAgent.iss"
+          Link="Installer/DebtFlow.SipAgent.iss"
+          CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
 </Project>

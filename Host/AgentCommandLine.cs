@@ -6,7 +6,9 @@ public enum AgentLaunchCommand
     RepairLocalCertificate,
     RemoveLocalCertificate,
     StoragePreflight,
-    PrintReleaseMetadata
+    PrintReleaseMetadata,
+    QueryMaintenance,
+    PrepareUpdate
 }
 
 public static class AgentCommandLine
@@ -18,7 +20,9 @@ public static class AgentCommandLine
             ["--repair-local-certificate"] = AgentLaunchCommand.RepairLocalCertificate,
             ["--remove-local-certificate"] = AgentLaunchCommand.RemoveLocalCertificate,
             ["--storage-preflight"] = AgentLaunchCommand.StoragePreflight,
-            ["--print-release-metadata"] = AgentLaunchCommand.PrintReleaseMetadata
+            ["--print-release-metadata"] = AgentLaunchCommand.PrintReleaseMetadata,
+            ["--query-maintenance"] = AgentLaunchCommand.QueryMaintenance,
+            ["--prepare-update"] = AgentLaunchCommand.PrepareUpdate
         };
         string[] selected = args.Where(commands.ContainsKey).ToArray();
         if (selected.Length == 0) return AgentLaunchCommand.Run;

@@ -15,13 +15,24 @@ jobs:
       - uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4
         with:
           dotnet-version: 10.0.x
+      - name: Install pinned Inno Setup compiler
+        shell: pwsh
+        run: >-
+          winget install --id JRSoftware.InnoSetup.7 -e -s winget
+          --version 7.1.0 --scope user --silent
+          --accept-package-agreements --accept-source-agreements
       - shell: pwsh
         run: ./scripts/verify-p5-release.ps1 -OutputRoot artifacts/p5-release
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+      - if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: debt-flow-sip-agent-win-x64
+          if-no-files-found: error
           path: |
             artifacts/p5-release/**/debt-flow-sip-agent-*-win-x64.zip
             artifacts/p5-release/**/debt-flow-sip-agent-*-win-x64.zip.sha256
+            artifacts/p5-release/**/debt-flow-sip-agent-*-win-x64-setup.exe
+            artifacts/p5-release/**/debt-flow-sip-agent-*-win-x64-setup.exe.sha256
+            artifacts/p5-release/**/installer-manifest.json
             artifacts/p5-release/**/verification/**/*.json
             artifacts/p5-release/**/logs/**

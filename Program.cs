@@ -58,6 +58,16 @@ public static class Program
             return StoragePreflight.ExitCode(result);
         }
 
+        if (command == AgentLaunchCommand.QueryMaintenance)
+        {
+            return QueryMaintenanceAsync().GetAwaiter().GetResult();
+        }
+
+        if (command == AgentLaunchCommand.PrepareUpdate)
+        {
+            return PrepareUpdateAsync().GetAwaiter().GetResult();
+        }
+
         try
         {
             AgentStorageSecurity.EnsureRestricted(AgentStoragePaths.RootDirectory);
@@ -200,6 +210,10 @@ public static class Program
                     new TlsDiagnosticExporter(),
                     AgentStoragePaths.LogDirectory);
                 System.Windows.Forms.Application.Run(recovery);
+                if (recovery.MaintenanceRequest == AgentMaintenanceRequest.PrepareUpdate)
+                {
+                    return 0;
+                }
                 if (recovery.RetryRequested) continue;
                 return 4;
             }
@@ -218,6 +232,7 @@ public static class Program
             if (runtime.ExitCode != 0) return runtime.ExitCode;
             AgentMaintenanceRequest request = runtime.MaintenanceRequest;
             if (request == AgentMaintenanceRequest.None) return 0;
+            if (request == AgentMaintenanceRequest.PrepareUpdate) return 0;
             LocalTlsCertificateResult result = request == AgentMaintenanceRequest.RepairCertificate
                 ? await certificateManager.RepairAsync(CancellationToken.None)
                 : await certificateManager.RemoveAsync(CancellationToken.None);
@@ -256,6 +271,118 @@ public static class Program
         string? response = Console.ReadLine()?.Trim();
         return string.Equals(response, "y", StringComparison.OrdinalIgnoreCase) ||
             string.Equals(response, "yes", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static async Task<int> PrepareUpdateAsync()
+    {
+        DateTimeOffset deadline = DateTimeOffset.UtcNow.AddSeconds(20);
+        bool shutdownObserved = false;
+        while (DateTimeOffset.UtcNow < deadline)
+        {
+            await using SingleInstanceCoordinator singleInstance = SingleInstanceCoordinator.Create();
+            if (singleInstance.IsPrimary)
+            {
+                Console.WriteLine(shutdownObserved ? "update_ready" : "already_stopped");
+                return 0;
+            }
+
+            if (shutdownObserved)
+            {
+                await Task.Delay(200);
+                continue;
+            }
+
+            try
+            {
+                TimeSpan remaining = deadline - DateTimeOffset.UtcNow;
+                if (remaining <= TimeSpan.Zero)
+                {
+                    break;
+                }
+                using var timeout = new CancellationTokenSource(
+                    remaining < TimeSpan.FromSeconds(5) ? remaining : TimeSpan.FromSeconds(5));
+                AgentInstanceResponse response = await singleInstance.RequestPrepareUpdateAsync(timeout.Token);
+                switch (response.Status)
+                {
+                    case AgentInstanceResponseStatus.Ready:
+                    case AgentInstanceResponseStatus.ShutdownInProgress:
+                        shutdownObserved = true;
+                        break;
+                    case AgentInstanceResponseStatus.ActiveCall:
+                        Console.Error.WriteLine("update_blocked_active_call");
+                        return AgentUpdateExitCodes.ActiveCall;
+                    case AgentInstanceResponseStatus.ShutdownFailed:
+                        Console.Error.WriteLine("update_shutdown_failed");
+                        return AgentUpdateExitCodes.ShutdownFailed;
+                    case AgentInstanceResponseStatus.ProtocolUnsupported:
+                        Console.Error.WriteLine("update_protocol_unsupported");
+                        return AgentUpdateExitCodes.ProtocolUnsupported;
+                    default:
+                        Console.Error.WriteLine("update_ipc_unavailable");
+                        return AgentUpdateExitCodes.IpcUnavailable;
+                }
+            }
+            catch (Exception exception) when (
+                exception is IOException or UnauthorizedAccessException or TimeoutException or OperationCanceledException)
+            {
+                if (!shutdownObserved)
+                {
+                    Console.Error.WriteLine("update_ipc_unavailable");
+                    return AgentUpdateExitCodes.IpcUnavailable;
+                }
+            }
+
+            await Task.Delay(200);
+        }
+
+        Console.Error.WriteLine("update_shutdown_failed");
+        return AgentUpdateExitCodes.ShutdownFailed;
+    }
+
+    private static async Task<int> QueryMaintenanceAsync()
+    {
+        await using SingleInstanceCoordinator singleInstance = SingleInstanceCoordinator.Create();
+        if (singleInstance.IsPrimary)
+        {
+            Console.WriteLine("maintenance_ready");
+            return 0;
+        }
+
+        try
+        {
+            using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+            AgentInstanceResponse response = await singleInstance.RequestQueryMaintenanceAsync(timeout.Token);
+            return WriteMaintenanceResult(response.Status);
+        }
+        catch (Exception exception) when (
+            exception is IOException or UnauthorizedAccessException or TimeoutException or OperationCanceledException)
+        {
+            Console.Error.WriteLine("update_ipc_unavailable");
+            return AgentUpdateExitCodes.IpcUnavailable;
+        }
+    }
+
+    private static int WriteMaintenanceResult(AgentInstanceResponseStatus status)
+    {
+        switch (status)
+        {
+            case AgentInstanceResponseStatus.Ready:
+                Console.WriteLine("maintenance_ready");
+                return 0;
+            case AgentInstanceResponseStatus.ActiveCall:
+                Console.Error.WriteLine("update_blocked_active_call");
+                return AgentUpdateExitCodes.ActiveCall;
+            case AgentInstanceResponseStatus.ShutdownFailed:
+            case AgentInstanceResponseStatus.ShutdownInProgress:
+                Console.Error.WriteLine("update_shutdown_failed");
+                return AgentUpdateExitCodes.ShutdownFailed;
+            case AgentInstanceResponseStatus.ProtocolUnsupported:
+                Console.Error.WriteLine("update_protocol_unsupported");
+                return AgentUpdateExitCodes.ProtocolUnsupported;
+            default:
+                Console.Error.WriteLine("update_ipc_unavailable");
+                return AgentUpdateExitCodes.IpcUnavailable;
+        }
     }
 
     private static async Task<RuntimeExecutionResult> RunRuntimeAsync(

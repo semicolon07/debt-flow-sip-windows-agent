@@ -282,6 +282,9 @@ public sealed class AgentCoordinator : IAsyncDisposable
     public Task ShutdownAsync(CancellationToken cancellationToken) =>
         EnqueueAsync(ShutdownCoreAsync, cancellationToken, cancelExecution: true);
 
+    public Task<bool> TryShutdownIfIdleAsync(CancellationToken cancellationToken) =>
+        EnqueueAsync(TryShutdownIfIdleCoreAsync, cancellationToken, cancelExecution: true);
+
     public Task MarkDegradedAsync(string code, CancellationToken cancellationToken) =>
         EnqueueAsync(token => MarkDegradedCoreAsync(code, token), cancellationToken);
 
@@ -1015,6 +1018,17 @@ public sealed class AgentCoordinator : IAsyncDisposable
         {
             AgentPerformanceTelemetry.RecordBackgroundTaskFault("shutdown_incomplete");
         }
+    }
+
+    private async Task<bool> TryShutdownIfIdleCoreAsync(CancellationToken cancellationToken)
+    {
+        if (_call is { State: not CallState.Ended })
+        {
+            return false;
+        }
+
+        await ShutdownCoreAsync(cancellationToken);
+        return true;
     }
 
     private async Task MarkDegradedCoreAsync(string code, CancellationToken cancellationToken)
