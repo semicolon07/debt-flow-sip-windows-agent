@@ -25,7 +25,7 @@ public sealed class SipCallTerminationResolverTests
     }
 
     [Fact]
-    public void Resolve_WhenDialogueIsMissing_DoesNotInventRemoteHangup()
+    public void Resolve_WhenDialogueIsMissing_ReturnsActiveCall()
     {
         var active = new SipCallHandle("runtime-active", 2, "public-active");
 
@@ -34,7 +34,7 @@ public sealed class SipCallTerminationResolverTests
             new Dictionary<string, SipCallHandle>(),
             active);
 
-        Assert.Null(resolved);
+        Assert.Same(active, resolved);
     }
 
     [Fact]

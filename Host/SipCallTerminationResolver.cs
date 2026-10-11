@@ -9,12 +9,13 @@ internal static class SipCallTerminationResolver
         IReadOnlyDictionary<string, SipCallHandle> mappedCalls,
         SipCallHandle? activeCall)
     {
-        if (activeCall == null || string.IsNullOrWhiteSpace(sipCallId))
+        if (activeCall == null)
         {
             return null;
         }
 
-        if (mappedCalls.TryGetValue(sipCallId, out SipCallHandle? mappedCall) &&
+        if (!string.IsNullOrWhiteSpace(sipCallId) &&
+            mappedCalls.TryGetValue(sipCallId, out SipCallHandle? mappedCall) &&
             IsSameCall(mappedCall, activeCall))
         {
             return mappedCall;
