@@ -214,10 +214,14 @@ public sealed class AgentCoordinatorTests
     }
 
     [Fact]
-    public async Task Configure_InvalidSipHostIp_IsRejectedBeforeRuntime()
+    public async Task Configure_InvalidSipHost_IsRejectedBeforeRuntime()
     {
         await using CoordinatorFixture fixture = await CoordinatorFixture.CreateAsync();
-        string[] invalidHosts = ["sip.example.test", "192.0.2.10:5060", "[2001:db8::10]", "fe80::1%12"];
+        string[] invalidHosts =
+        [
+            "192.0.2.10:5060", "sip.example.test:5060", "[2001:db8::10]", "fe80::1%12",
+            "_sip._udp.example.test"
+        ];
 
         foreach (string host in invalidHosts)
         {
@@ -229,6 +233,18 @@ public sealed class AgentCoordinatorTests
         }
 
         Assert.Equal(0, fixture.Runtime.ConfigureCount);
+    }
+
+    [Fact]
+    public async Task Configure_AsciiHostname_IsAcceptedBeforeRuntimeResolution()
+    {
+        await using CoordinatorFixture fixture = await CoordinatorFixture.CreateAsync();
+
+        await fixture.Coordinator.ConfigureAsync(
+            new ConfigureCommand(NewId(), "PBX.Branch.Example.", 5060, "user", "password"),
+            CancellationToken.None);
+
+        Assert.Equal(1, fixture.Runtime.ConfigureCount);
     }
 
     [Fact]

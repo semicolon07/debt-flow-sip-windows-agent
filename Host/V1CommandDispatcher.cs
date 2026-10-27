@@ -1,5 +1,4 @@
 using System.Text.Json;
-using System.Net;
 using DebtFlow.SipAgent.Application;
 using DebtFlow.SipAgent.Protocol;
 
@@ -407,11 +406,8 @@ public sealed class V1CommandDispatcher(
 
     private static object CanonicalizeConfigure(ConfigureCommand command)
     {
-        string host = command.Host.Trim();
         string username = command.Username.Trim();
-        if (!IPAddress.TryParse(host, out IPAddress? address) ||
-            !string.Equals(host, address.ToString(), StringComparison.OrdinalIgnoreCase) ||
-            address.AddressFamily == System.Net.Sockets.AddressFamily.InterNetworkV6 && address.ScopeId != 0 ||
+        if (!SipHost.TryCanonicalize(command.Host, out string host) ||
             command.Port is < 1 or > 65535 ||
             username.Length is 0 or > 128 ||
             command.Password.Length is 0 or > 512)
@@ -422,7 +418,7 @@ public sealed class V1CommandDispatcher(
         return new
         {
             commandId = command.CommandId,
-            host = address.ToString(),
+            host,
             command.Port,
             username,
             command.Password,

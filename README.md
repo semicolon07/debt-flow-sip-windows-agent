@@ -24,6 +24,13 @@ Tray แสดง Agent, Portal, SIP, Call และ Audio status พร้อ�
 Start with Windows และ Exit. SIP host/account/password รับจาก Portal ผ่าน WebSocket เท่านั้น
 และไม่ถูกบันทึกใน config, registry, SQLite หรือ log
 
+Multi-profile target 26/10/2026คง WebSocket protocol V1และไม่ส่ง profile metadataเข้า Agent แต่ขยาย SIP hostจาก
+IP literalเป็น canonical IPv4 literalหรือ ASCII hostnameที่ resolve IPv4 A recordตอน register/reconnect. รุ่นแรก
+reject IPv6 literal, AAAA-only, SRVและ NAPTR. Sourceวันที่ 27/10/2026 implement validation, IPv4 A resolutionทุก
+registration/retryและ testsแล้ว โดยยังต้องผ่าน Windows/Issabel interoperability. เมื่อ Portalที่ onlineได้รับ administrative
+Disable มันจะสั่ง Agent hangup/unregisterภายใน healthy 10-second SLA; ถ้า Portal/API disconnected Agentยังใช้ owner
+disconnect leaseเดิมและไม่มี outbound remote-control channel.
+
 ครั้งแรก Agent ขอ consent ไทย/อังกฤษแล้วสร้าง self-signed certificate สำหรับ `localhost`,
 `127.0.0.1` และ `::1` ด้วย CNG key แบบ non-exportable เฉพาะ Windows user. Certificate อยู่ใน
 `CurrentUser\My` และ public trust copy อยู่ใน `CurrentUser\Root`; metadata อยู่ที่

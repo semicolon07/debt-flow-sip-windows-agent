@@ -6,14 +6,14 @@ namespace DebtFlow.SipAgent.Host.Tests;
 public sealed class SipEndpointFormatterTests
 {
     [Fact]
-    public void FormatRegistrar_UsesCanonicalIpv4AndBracketedIpv6()
+    public void FormatRegistrar_UsesCanonicalIpv4AndHostname()
     {
         (string Host, int Port, string Expected)[] cases =
         [
             ("192.0.2.10", 5060, "192.0.2.10"),
             ("192.0.2.10", 5070, "192.0.2.10:5070"),
-            ("2001:db8::10", 5060, "[2001:db8::10]"),
-            ("2001:db8::10", 5070, "[2001:db8::10]:5070")
+            ("PBX.Branch.Example.", 5060, "pbx.branch.example"),
+            ("pbx.branch.example", 5070, "pbx.branch.example:5070")
         ];
 
         foreach ((string host, int port, string expected) in cases)
@@ -21,6 +21,16 @@ public sealed class SipEndpointFormatterTests
             Assert.Equal(
                 expected,
                 SipEndpointFormatter.FormatRegistrar(new SipConfiguration(host, port, "user", "password")));
+        }
+    }
+
+    [Fact]
+    public void FormatRegistrar_RejectsIpv6AndEmbeddedPort()
+    {
+        foreach (string host in new[] { "2001:db8::10", "[2001:db8::10]", "pbx.example:5060" })
+        {
+            Assert.Throws<ArgumentException>(() =>
+                SipEndpointFormatter.FormatRegistrar(new SipConfiguration(host, 5060, "user", "password")));
         }
     }
 

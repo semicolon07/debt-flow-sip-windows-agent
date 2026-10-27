@@ -60,6 +60,7 @@ public sealed class SipRuntime : ISipRuntime
     private AudioExtrasSource? _fallbackAudioSource;
     private SipCallHandle? _mediaCallHandle;
     private SipConfiguration? _configuration;
+    private SipConfiguration? _resolvedConfiguration;
     private CancellationTokenSource? _audioNotificationDebounce;
     private int? _cachedPlaybackDevice;
     private bool _playbackDeviceCacheValid;
@@ -151,23 +152,28 @@ public sealed class SipRuntime : ISipRuntime
         ObjectDisposedException.ThrowIf(_disposed, this);
         cancellationToken.ThrowIfCancellationRequested();
         _configuration = configuration;
+        _resolvedConfiguration = null;
         _useTcp = false;
         _registrationGeneration++;
         return Task.CompletedTask;
     }
 
-    public Task StartRegistrationAsync(long generation, CancellationToken cancellationToken)
+    public async Task StartRegistrationAsync(long generation, CancellationToken cancellationToken)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
         cancellationToken.ThrowIfCancellationRequested();
         SipConfiguration configuration = RequireConfiguration();
+        _resolvedConfiguration = null;
+        IPAddress address = await SipHostResolver.ResolveIPv4Async(configuration.Host, cancellationToken);
+        SipConfiguration resolvedConfiguration = configuration with { Host = address.ToString() };
+        _resolvedConfiguration = resolvedConfiguration;
         _registrationAgent?.Stop();
         _registrationGeneration = generation;
         var registrationAgent = new SIPRegistrationUserAgent(
             _transport,
-            configuration.Username,
-            configuration.Password,
-            SipEndpointFormatter.FormatRegistrar(configuration, _useTcp),
+            resolvedConfiguration.Username,
+            resolvedConfiguration.Password,
+            SipEndpointFormatter.FormatRegistrar(resolvedConfiguration, _useTcp),
             180);
         _registrationAgent = registrationAgent;
 
@@ -205,7 +211,6 @@ public sealed class SipRuntime : ISipRuntime
 
         Emit(new SipSignal(SipSignalType.RegistrationRegistering, RegistrationGeneration: generation));
         _registrationAgent.Start();
-        return Task.CompletedTask;
     }
 
     public Task StopRegistrationAsync(long generation, CancellationToken cancellationToken)
@@ -215,6 +220,7 @@ public sealed class SipRuntime : ISipRuntime
         _registrationAgent?.Stop();
         _registrationAgent = null;
         _configuration = null;
+        _resolvedConfiguration = null;
         return Task.CompletedTask;
     }
 
@@ -224,7 +230,7 @@ public sealed class SipRuntime : ISipRuntime
         CancellationToken cancellationToken)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
-        SipConfiguration configuration = RequireConfiguration();
+        SipConfiguration configuration = RequireResolvedConfiguration();
         SetActiveCall(call);
         lock (_callGate)
         {
@@ -624,6 +630,7 @@ public sealed class SipRuntime : ISipRuntime
         _transport.SIPResponseInTraceEvent -= OnSipResponseReceived;
         _transport.Shutdown();
         _configuration = null;
+        _resolvedConfiguration = null;
         await _backgroundTasks.DrainAsync(TimeSpan.FromSeconds(2));
         _signals.Writer.TryComplete();
         _mediaGate.Dispose();
@@ -1622,7 +1629,7 @@ public sealed class SipRuntime : ISipRuntime
 
     private bool IsExpectedSipPeer(SIPRequest request)
     {
-        SipConfiguration? configuration = _configuration;
+        SipConfiguration? configuration = _resolvedConfiguration;
         IPAddress? remote = request.RemoteSIPEndPoint?.Address;
         if (configuration == null || remote == null || !IPAddress.TryParse(configuration.Host, out IPAddress? expected))
         {
@@ -1996,5 +2003,8 @@ public sealed class SipRuntime : ISipRuntime
 
     private SipConfiguration RequireConfiguration() =>
         _configuration ?? throw new InvalidOperationException("SIP runtime is not configured.");
+
+    private SipConfiguration RequireResolvedConfiguration() =>
+        _resolvedConfiguration ?? throw new InvalidOperationException("SIP runtime is not registered.");
 
 }

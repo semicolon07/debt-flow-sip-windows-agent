@@ -1,7 +1,5 @@
 using System.Text.Json;
 using System.Threading.Channels;
-using System.Net;
-using System.Net.Sockets;
 using System.Diagnostics;
 using DebtFlow.SipAgent.Protocol;
 
@@ -1874,10 +1872,7 @@ public sealed class AgentCoordinator : IAsyncDisposable
 
     private static SipConfiguration ValidateConfigure(ConfigureCommand command)
     {
-        string host = command.Host.Trim();
-        if (!IPAddress.TryParse(host, out IPAddress? address) ||
-            !string.Equals(host, address.ToString(), StringComparison.OrdinalIgnoreCase) ||
-            address.AddressFamily == AddressFamily.InterNetworkV6 && address.ScopeId != 0 ||
+        if (!SipHost.TryCanonicalize(command.Host, out string host) ||
             command.Port is < 1 or > 65535 ||
             string.IsNullOrWhiteSpace(command.Username) || command.Username.Length > 128 ||
             string.IsNullOrEmpty(command.Password) || command.Password.Length > 512)
@@ -1886,7 +1881,7 @@ public sealed class AgentCoordinator : IAsyncDisposable
         }
 
         return new SipConfiguration(
-            address.ToString(),
+            host,
             command.Port,
             command.Username.Trim(),
             command.Password);

@@ -9,6 +9,28 @@ namespace DebtFlow.SipAgent.Host.Tests;
 public sealed class V1CommandDispatcherTests
 {
     [Fact]
+    public async Task ConfigureHostname_CanonicalizesWithoutChangingV1CommandShape()
+    {
+        await using DispatcherFixture fixture = await DispatcherFixture.CreateAsync();
+        string commandId = ProtocolCodec.NewId();
+
+        byte[] first = await fixture.Dispatcher.DispatchAsync(
+            Envelope(
+                "session.configure",
+                new ConfigureCommand(commandId, "PBX.Branch.Example.", 5060, "100", "secret")),
+            CancellationToken.None);
+        byte[] replay = await fixture.Dispatcher.DispatchAsync(
+            Envelope(
+                "session.configure",
+                new ConfigureCommand(commandId, "pbx.branch.example", 5060, "100", "secret")),
+            CancellationToken.None);
+
+        Assert.True(Result(first).Accepted);
+        Assert.True(Result(replay).Accepted);
+        Assert.NotEqual("command_duplicate_conflict", Result(replay).ErrorCode);
+    }
+
+    [Fact]
     public async Task SameCommandId_WithDifferentCanonicalPayload_ReturnsConflict()
     {
         await using DispatcherFixture fixture = await DispatcherFixture.CreateAsync();
